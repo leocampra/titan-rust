@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# `titan/` e `lua/` (repositórios de referência) ficam fora deste diretório, mas
+# `build/` é gerado aqui pelo titanc e não deve ser tratado como membro.
+exclude = ["build"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/leonardo/titan-rust"
+
+[workspace.dependencies]
+titan-runtime = { path = "crates/titan-runtime" }

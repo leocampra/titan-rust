@@ -1,0 +1,7 @@
+[package]
+name = "titan-runtime"
+description = "Runtime mínimo da linguagem Titan: funções da stdlib usadas pelo código Rust gerado."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

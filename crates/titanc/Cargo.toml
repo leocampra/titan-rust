@@ -1,0 +1,10 @@
+[package]
+name = "titanc"
+description = "Compilador da linguagem Titan: traduz .titan para Rust nativo."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+titan-runtime.workspace = true
