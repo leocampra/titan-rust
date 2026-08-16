@@ -5,6 +5,12 @@
 //! argumentos e reporta que a compilação ainda não está implementada, sempre com
 //! mensagens em português e sem entrar em pânico.
 
+// `enum_variant_names`: os nós mantêm o prefixo do `ast.lua` (`ExpString`,
+// `StatCall`, ...) de propósito, para que o Titan original continue servindo
+// de referência viva — ver PRD.md, tarefa T1.
+#[allow(dead_code, clippy::enum_variant_names)]
+mod ast;
+
 use std::process::ExitCode;
 
 const USO: &str = "uso: titanc <arquivo.titan>";
