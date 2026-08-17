@@ -13,6 +13,8 @@ mod ast;
 #[allow(dead_code)]
 mod checker;
 #[allow(dead_code)]
+mod codegen;
+#[allow(dead_code)]
 mod lexer;
 #[allow(dead_code)]
 mod parser;
