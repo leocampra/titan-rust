@@ -10,6 +10,10 @@
 // de referência viva — ver PRD.md, tarefa T1.
 #[allow(dead_code, clippy::enum_variant_names)]
 mod ast;
+#[allow(dead_code)]
+mod lexer;
+#[allow(dead_code)]
+mod types;
 
 use std::process::ExitCode;
 

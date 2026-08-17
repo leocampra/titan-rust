@@ -1,0 +1,4 @@
+function main(args: {string}): integer
+    print("Olá, mundo!")
+    return 0
+end
