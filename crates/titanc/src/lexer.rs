@@ -6,7 +6,10 @@
 //! da Fase 0 (T3 do PRD.md): palavras-chave `function local return end true
 //! false nil`, as reservadas de tipo `boolean integer float string value`,
 //! literais inteiros/float, strings curtas com escapes e long strings
-//! `[[...]]`, os símbolos `( ) { } , : ; ..`, e comentários `--` / `--[[ ]]`.
+//! `[[...]]`, os símbolos `( ) { } , : ; .. =`, e comentários `--` / `--[[ ]]`.
+//! O símbolo `=` foi acrescentado na T4 (`parser.rs`), para suportar
+//! `local x [: T] = exp` — o `lexer.lua` original já o reconhece, T3 só não
+//! precisava dele ainda.
 
 use crate::ast::Loc;
 
@@ -50,6 +53,7 @@ pub enum TokenKind {
     Colon,
     Semicolon,
     Concat, // ..
+    Assign, // =
 
     Eof,
 }
@@ -458,7 +462,7 @@ impl<'a> Lexer<'a> {
             });
         }
 
-        // Símbolos suportados nesta fase: ( ) { } , : ; ..
+        // Símbolos suportados nesta fase: ( ) { } , : ; .. =
         let kind = match c {
             '(' => {
                 self.advance();
@@ -492,6 +496,10 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 self.advance();
                 TokenKind::Concat
+            }
+            '=' => {
+                self.advance();
+                TokenKind::Assign
             }
             other => {
                 return Err(LexError {
@@ -729,7 +737,7 @@ mod tests {
     #[test]
     fn simbolos_suportados_na_fase() {
         assert_eq!(
-            kinds("(){},:;.."),
+            kinds("(){},:;..="),
             vec![
                 TokenKind::LParen,
                 TokenKind::RParen,
@@ -739,6 +747,7 @@ mod tests {
                 TokenKind::Colon,
                 TokenKind::Semicolon,
                 TokenKind::Concat,
+                TokenKind::Assign,
                 TokenKind::Eof,
             ]
         );
