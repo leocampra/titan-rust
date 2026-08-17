@@ -11,6 +11,8 @@
 #[allow(dead_code, clippy::enum_variant_names)]
 mod ast;
 #[allow(dead_code)]
+mod checker;
+#[allow(dead_code)]
 mod lexer;
 #[allow(dead_code)]
 mod parser;
