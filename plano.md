@@ -563,3 +563,67 @@ O Redox seria a primeira plataforma de referência para essa visão.
 Não seria apenas uma nova linguagem.
 
 Seria uma tentativa de criar um **novo modelo de desenvolvimento de software em que capacidades como IA, segurança, dados e hardware são serviços nativos e padronizados da plataforma.**
+
+---
+
+# Fase 1 — Núcleo da linguagem
+
+A Fase 0 está concluída: existe um compilador novo, escrito em Rust, que leva
+`examples/hello.titan` até um executável nativo, com o pipeline completo
+(`lexer → parser → checker → codegen → driver`) e testes verdes.
+
+A Fase 1 transforma esse pipeline num **núcleo de linguagem de verdade**: aritmética,
+comparação, lógica booleana, controle de fluxo (`if`/`while`/`for`) e atribuição — o
+suficiente para escrever algoritmos reais (fatorial, fibonacci) em Titan e compilá-los
+para Rust nativo.
+
+Um ponto de partida favorável descoberto no fechamento da Fase 0: a AST em `ast.rs` já foi
+definida **completa** (com `StatIf`, `StatWhile`, `StatFor`, `StatAssign`, `ExpBinop`,
+`ExpUnop`). A Fase 1 não precisa criar nós novos — ela ensina o parser a produzi-los, o
+checker a verificá-los e o codegen a traduzi-los.
+
+## O que a fase cobre
+
+```text
+Operadores aritméticos    + - * / % ^
+Operadores relacionais    == ~= < > <= >=
+Operadores lógicos        and or not
+Unários                   - (negação)  not
+Controle de fluxo         if / elseif / else · while · for numérico
+Atribuição                x = exp (variável local já declarada)
+Concatenação ampliada     "texto" .. 42 (número vira string)
+```
+
+## Decisões de design fixadas
+
+1. **`for` apenas numérico** — `for x = start, finish[, inc] do ... end` com integer ou
+   float. `for-in` (iteradores) depende de construções da Fase 2+.
+2. **Atribuição single-target** — `nome = exp` para local já declarada. Multi-assign
+   (`a, b = 1, 2`), índice e campo ficam para fases futuras.
+3. **Sem bitwise, sem `//`, sem `#`** — o conjunto de operadores é o essencial do núcleo;
+   bitwise e divisão inteira podem voltar numa fase posterior.
+4. **`..` coage número para string** — como o Titan original (`trytostr`), `"x: " .. 42`
+   funciona; a conversão vira `to_string()` no Rust gerado.
+5. **`for` exige tipos idênticos** — `start`, `finish` e `inc` devem bater exatamente com
+   o tipo da variável de controle, fiel ao checker original (sem coerção implícita no laço).
+6. **Mutabilidade rastreada no checker** — o Rust gerado usa `let mut` apenas nas variáveis
+   de fato reatribuídas, mantendo o código gerado limpo (sem warnings do rustc).
+7. **`and`/`or` boolean estrito** — os dois lados devem ser boolean e o resultado é boolean
+   (mapeiam para `&&`/`||`). Divergência deliberada do truthy/falsy do Lua/Titan original,
+   que só faz sentido quando `Value`/`Option` entrarem em uso (fases futuras).
+
+## O que continua fora
+
+Records, maps, arrays manipuláveis, `import`/`foreign import`, métodos, retornos múltiplos,
+`Option`/`?`, `repeat`/`until`, `break`/`continue` — tudo continua rejeitado pelo compilador
+com mensagem clara em português, nunca com panic. **Redox segue fora de escopo** — o alvo é
+Linux nativo via cargo, e nada na arquitetura fecha a porta para um `--target` futuro.
+
+A decisão mais delicada do projeto (modelo de memória em Rust para tipos compostos) continua
+adiada para a Fase 2, e a Fase 1 é desenhada para não antecipá-la: nenhuma construção nova
+assume que valores são `Copy` além dos primitivos.
+
+A lista de tarefas executável da Fase 1 (T10–T18) está no `PRD.md`.
+
+
+
