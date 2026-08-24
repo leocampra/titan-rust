@@ -1,7 +1,7 @@
 //! Análise semântica e verificação de tipos do Titan.
 //!
 //! Espelha a estratégia de `titan/titan-compiler/checker.lua` (1662 linhas),
-//! reduzida ao subconjunto da Fase 0 (T5 do PRD.md):
+//! reduzida ao subconjunto das Fases 0 e 1 (T5 e T12 do PRD.md):
 //!
 //! - **Duas passadas**, como o Titan: (1) coleta as assinaturas top-level,
 //!   permitindo chamada antes da declaração; (2) verifica os corpos,
@@ -12,18 +12,26 @@
 //!   palavra-chave.
 //! - A assinatura de `main` é validada: `main(args: {string}): integer`
 //!   (`checker.lua:1593-1607`, `checker.has_main`).
+//! - Statements da Fase 1: `if`/`while` com condição `boolean`
+//!   (`checker.lua:365-368` e `447-457`), `for` numérico espelhando
+//!   `checkfor` (`checker.lua:239-288`) e atribuição single-target
+//!   (`checker.lua:378-410`).
+//! - **Rastreio de mutabilidade** (decisão 6 da Fase 1): cada `local` recebe
+//!   um id; atribuições registram o id do símbolo resolvido (mesmo espírito
+//!   do `var._decl._assigned = true` do original) e um fix-up ao final do
+//!   corpo da função seta `mutable` nos `TypedStat::Decl` correspondentes —
+//!   o codegen (T14) emite `let mut` só quando há reatribuição.
 //!
 //! Como `ast::Exp` é um valor imutável (ao contrário do Lua, que anexa
 //! `_type` dinamicamente ao nó), o checker produz uma **AST tipada paralela**
 //! (`TypedProgram` e companhia) em vez de mutar a árvore original — é o que
 //! `codegen.rs` (T6) vai consumir.
 //!
-//! Tudo fora do subconjunto da Fase 0 (`if`/`while`/`for`, records, maps,
-//! arrays manipuláveis, `import`, `foreign import`, métodos, operadores
-//! aritméticos, retornos múltiplos, `Option`/`?`) produz um erro semântico
-//! claro — nunca panic.
+//! Tudo fora do subconjunto (records, maps, arrays manipuláveis, `import`,
+//! `foreign import`, métodos, retornos múltiplos, `repeat`, `Option`/`?`)
+//! produz um erro semântico claro — nunca panic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Args, Exp, Loc, Program, Stat, TopLevel, Var};
 use crate::types::Type;
@@ -49,9 +57,40 @@ impl std::error::Error for CheckError {}
 
 // ---- Símbolos em pilha (`symtab.lua`) ----------------------------------
 
-/// Pilha de escopos léxicos. Cada bloco é um `HashMap` de nome → tipo.
+/// Identificador único de uma declaração `local`, usado pelo rastreio de
+/// mutabilidade (decisão 6 da Fase 1).
+type DeclId = usize;
+
+/// Como um nome foi introduzido no escopo — decide o que uma atribuição a
+/// ele significa.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SymbolKind {
+    /// Função top-level ou do runtime (`print`). Atribuição é rejeitada
+    /// ("trying to assign to a function", `checker.lua:401`).
+    Global,
+    /// Parâmetro de função. O original permite atribuir, mas aqui não há
+    /// rastreio de `mut` para parâmetros (o fix-up só alcança
+    /// `TypedStat::Decl`), e o Rust gerado não compilaria — rejeitado com
+    /// erro claro até uma fase futura rastrear parâmetros também.
+    Param,
+    /// Variável de controle de `for`. Atribuição é permitida sem rastreio:
+    /// ela é sempre `mut` no template desaçucarado do T15.
+    ForVar,
+    /// Local declarada com `local`; atribuições registram o `DeclId` para o
+    /// fix-up de mutabilidade ao final do corpo da função.
+    Local { decl_id: DeclId },
+}
+
+/// Entrada da tabela de símbolos: o tipo e a origem do nome.
+#[derive(Debug, Clone, PartialEq)]
+struct Symbol {
+    ty: Type,
+    kind: SymbolKind,
+}
+
+/// Pilha de escopos léxicos. Cada bloco é um `HashMap` de nome → símbolo.
 struct SymTab {
-    blocks: Vec<HashMap<String, Type>>,
+    blocks: Vec<HashMap<String, Symbol>>,
 }
 
 impl SymTab {
@@ -69,14 +108,14 @@ impl SymTab {
         self.blocks.pop();
     }
 
-    fn add_symbol(&mut self, name: &str, ty: Type) {
+    fn add_symbol(&mut self, name: &str, ty: Type, kind: SymbolKind) {
         self.blocks
             .last_mut()
             .expect("symtab sempre tem pelo menos um bloco")
-            .insert(name.to_string(), ty);
+            .insert(name.to_string(), Symbol { ty, kind });
     }
 
-    fn find_symbol(&self, name: &str) -> Option<&Type> {
+    fn find_symbol(&self, name: &str) -> Option<&Symbol> {
         self.blocks.iter().rev().find_map(|block| block.get(name))
     }
 }
@@ -109,6 +148,13 @@ pub enum TypedStat {
         name: String,
         ty: Type,
         value: TypedExp,
+        /// Id interno da declaração, usado só pelo fix-up de mutabilidade —
+        /// torna a correspondência atribuição → declaração explícita (e
+        /// robusta a shadowing) em vez de depender da ordem de travessia.
+        decl_id: usize,
+        /// `true` quando alguma atribuição alcança esta declaração; o
+        /// codegen (T14) emite `let mut` somente nesse caso.
+        mutable: bool,
     },
     Call {
         loc: Loc,
@@ -118,6 +164,40 @@ pub enum TypedStat {
         loc: Loc,
         exps: Vec<TypedExp>,
     },
+    If {
+        loc: Loc,
+        thens: Vec<TypedThen>,
+        elsestat: Option<Box<TypedStat>>,
+    },
+    While {
+        loc: Loc,
+        condition: TypedExp,
+        block: Box<TypedStat>,
+    },
+    For {
+        loc: Loc,
+        name: String,
+        ty: Type,
+        start: TypedExp,
+        finish: TypedExp,
+        /// Sempre presente: quando omitido no fonte, vira `1`/`1.0` conforme
+        /// o tipo da variável (como `checkfor`, `checker.lua:258-268`).
+        inc: TypedExp,
+        block: Box<TypedStat>,
+    },
+    Assign {
+        loc: Loc,
+        name: String,
+        value: TypedExp,
+    },
+}
+
+/// Ramo `then` já verificado de um `TypedStat::If`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedThen {
+    pub loc: Loc,
+    pub condition: TypedExp,
+    pub block: TypedStat,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +224,12 @@ pub enum TypedExpKind {
 struct Checker {
     st: SymTab,
     errors: Vec<CheckError>,
+    /// Próximo id de declaração `local` — os ids são globais e únicos, então
+    /// não precisam de reset entre funções.
+    next_decl_id: DeclId,
+    /// Ids das declarações que receberam alguma atribuição (mesmo espírito
+    /// do `var._decl._assigned = true` do original, `checker.lua:404`).
+    assigned: HashSet<DeclId>,
 }
 
 impl Checker {
@@ -157,10 +243,13 @@ impl Checker {
                 params: vec![Type::String],
                 rettypes: vec![Type::Nil],
             },
+            SymbolKind::Global,
         );
         Checker {
             st,
             errors: Vec::new(),
+            next_decl_id: 0,
+            assigned: HashSet::new(),
         }
     }
 
@@ -200,6 +289,7 @@ impl Checker {
                         params: param_types,
                         rettypes: ret_types,
                     },
+                    SymbolKind::Global,
                 );
             }
             TopLevel::TopLevelVar { loc, .. } => {
@@ -337,9 +427,13 @@ impl Checker {
                 block,
                 ..
             } => {
-                let Some(Type::Function {
-                    params: param_types,
-                    rettypes: ret_types,
+                let Some(Symbol {
+                    ty:
+                        Type::Function {
+                            params: param_types,
+                            rettypes: ret_types,
+                        },
+                    ..
                 }) = self.st.find_symbol(name).cloned()
                 else {
                     // Assinatura já rejeitada na passada 1.
@@ -348,14 +442,19 @@ impl Checker {
 
                 self.st.open_block();
                 for (param, ty) in params.iter().zip(param_types.iter()) {
-                    self.st.add_symbol(&param.name, ty.clone());
+                    self.st
+                        .add_symbol(&param.name, ty.clone(), SymbolKind::Param);
                 }
 
                 let body = self.check_stat(block, &ret_types);
 
                 self.st.close_block();
 
-                let body = body?;
+                let mut body = body?;
+                // Fix-up de mutabilidade (decisão 6): agora que todas as
+                // atribuições do corpo foram vistas, marca as declarações
+                // reatribuídas.
+                fixup_mutability(&mut body, &self.assigned);
                 let named_params = params
                     .iter()
                     .zip(param_types)
@@ -429,13 +528,18 @@ impl Checker {
                     None => value.ty.clone(),
                 };
 
-                self.st.add_symbol(&decl.name, ty.clone());
+                let decl_id = self.next_decl_id;
+                self.next_decl_id += 1;
+                self.st
+                    .add_symbol(&decl.name, ty.clone(), SymbolKind::Local { decl_id });
 
                 Some(TypedStat::Decl {
                     loc: *loc,
                     name: decl.name.clone(),
                     ty,
                     value,
+                    decl_id,
+                    mutable: false,
                 })
             }
             Stat::StatCall { loc, callexp } => {
@@ -486,27 +590,259 @@ impl Checker {
                     exps: typed_exps,
                 })
             }
-            Stat::StatIf { loc, .. } => {
-                self.error(*loc, "`if` não é suportado nesta fase.");
-                None
+            Stat::StatIf {
+                loc,
+                thens,
+                elsestat,
+            } => {
+                // Defensivo: o parser (T11) sempre produz ao menos um ramo.
+                if thens.is_empty() {
+                    self.error(*loc, "um `if` precisa de ao menos uma condição.");
+                    return None;
+                }
+                let mut typed_thens = Vec::with_capacity(thens.len());
+                let mut ok = true;
+                for then in thens {
+                    let condition = self.check_condition(&then.condition, "if");
+                    let block = self.check_stat(&then.block, rettypes);
+                    match (condition, block) {
+                        (Some(condition), Some(block)) => typed_thens.push(TypedThen {
+                            loc: then.loc,
+                            condition,
+                            block,
+                        }),
+                        _ => ok = false,
+                    }
+                }
+                let typed_else = match elsestat {
+                    Some(stat) => match self.check_stat(stat, rettypes) {
+                        Some(typed) => Some(Box::new(typed)),
+                        None => {
+                            ok = false;
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if !ok {
+                    return None;
+                }
+                Some(TypedStat::If {
+                    loc: *loc,
+                    thens: typed_thens,
+                    elsestat: typed_else,
+                })
             }
-            Stat::StatWhile { loc, .. } => {
-                self.error(*loc, "`while` não é suportado nesta fase.");
-                None
+            Stat::StatWhile {
+                loc,
+                condition,
+                block,
+            } => {
+                let condition = self.check_condition(condition, "while");
+                let block = self.check_stat(block, rettypes);
+                Some(TypedStat::While {
+                    loc: *loc,
+                    condition: condition?,
+                    block: Box::new(block?),
+                })
             }
             Stat::StatRepeat { loc, .. } => {
                 self.error(*loc, "`repeat` não é suportado nesta fase.");
                 None
             }
-            Stat::StatFor { loc, .. } => {
-                self.error(*loc, "`for` não é suportado nesta fase.");
-                None
-            }
-            Stat::StatAssign { loc, .. } => {
-                self.error(*loc, "atribuição (`x = exp`) não é suportada nesta fase.");
-                None
+            Stat::StatFor {
+                loc,
+                decl,
+                start,
+                finish,
+                inc,
+                block,
+            } => self.check_for(*loc, decl, start, finish, inc.as_deref(), block, rettypes),
+            Stat::StatAssign { loc, vars, exps } => {
+                if vars.len() != 1 || exps.len() != 1 {
+                    // Defensivo: o parser (T11) só produz single-target.
+                    self.error(
+                        *loc,
+                        "atribuição múltipla (`a, b = ...`) não é suportada nesta fase.",
+                    );
+                    return None;
+                }
+                self.check_assign(*loc, &vars[0], &exps[0])
             }
         }
+    }
+
+    /// Condição de `if`/`elseif`/`while`: precisa ser `Boolean` (ou `Value`,
+    /// via `compatible` — gradual typing), como o `checkexp(cond, ...,
+    /// types.Boolean())` do original.
+    fn check_condition(&mut self, exp: &Exp, contexto: &str) -> Option<TypedExp> {
+        let typed = self.check_exp(exp)?;
+        if !Type::Boolean.compatible(&typed.ty) {
+            self.error(
+                typed.loc,
+                format!(
+                    "a condição do `{contexto}` precisa ser boolean, encontrado {}.",
+                    type_name(&typed.ty)
+                ),
+            );
+            return None;
+        }
+        Some(typed)
+    }
+
+    /// `for` numérico, espelhando `checkfor` (`checker.lua:239-288`):
+    /// expressões verificadas **antes** de declarar a variável (elas não
+    /// podem referenciá-la), tipo da variável vindo da anotação ou inferido
+    /// de `start`, e — decisão 5 da Fase 1 — `start`/`finish`/`inc` com tipo
+    /// **idêntico** ao da variável (sem coerção int→float).
+    #[allow(clippy::too_many_arguments)]
+    fn check_for(
+        &mut self,
+        loc: Loc,
+        decl: &ast::Decl,
+        start: &Exp,
+        finish: &Exp,
+        inc: Option<&Exp>,
+        block: &Stat,
+        rettypes: &[Type],
+    ) -> Option<TypedStat> {
+        let typed_start = self.check_exp(start)?;
+        let typed_finish = self.check_exp(finish)?;
+        let typed_inc = match inc {
+            Some(exp) => Some(self.check_exp(exp)?),
+            None => None,
+        };
+
+        let var_ty = match &decl.r#type {
+            Some(annotated) => self.resolve_type(annotated)?,
+            None => typed_start.ty.clone(),
+        };
+
+        if !matches!(var_ty, Type::Integer | Type::Float) {
+            self.error(
+                decl.loc,
+                format!(
+                    "a variável de controle do `for` precisa ser integer ou float, encontrado {}.",
+                    type_name(&var_ty)
+                ),
+            );
+            return None;
+        }
+
+        let mut ok = true;
+        for (typed, papel) in [
+            (&typed_start, "valor inicial"),
+            (&typed_finish, "limite"),
+        ]
+        .into_iter()
+        .chain(typed_inc.iter().map(|t| (t, "passo")))
+        {
+            if !typed.ty.equals(&var_ty) {
+                self.error(
+                    typed.loc,
+                    format!(
+                        "o {papel} do `for` precisa ter o mesmo tipo da variável de controle ({}), encontrado {}.",
+                        type_name(&var_ty),
+                        type_name(&typed.ty)
+                    ),
+                );
+                ok = false;
+            }
+        }
+        if !ok {
+            return None;
+        }
+
+        // `inc` omitido vira `1`/`1.0` conforme o tipo, com o `loc` do
+        // limite (como `ast.ExpInteger(node.finish.loc, 1)` no original).
+        let typed_inc = typed_inc.unwrap_or_else(|| TypedExp {
+            loc: typed_finish.loc,
+            ty: var_ty.clone(),
+            kind: match var_ty {
+                Type::Integer => TypedExpKind::Integer(1),
+                _ => TypedExpKind::Float(1.0),
+            },
+        });
+
+        // A variável de controle vive num bloco próprio que não vaza para
+        // fora do laço (o corpo `StatBlock` abre o seu por cima).
+        self.st.open_block();
+        self.st
+            .add_symbol(&decl.name, var_ty.clone(), SymbolKind::ForVar);
+        let typed_block = self.check_stat(block, rettypes);
+        self.st.close_block();
+
+        Some(TypedStat::For {
+            loc,
+            name: decl.name.clone(),
+            ty: var_ty,
+            start: typed_start,
+            finish: typed_finish,
+            inc: typed_inc,
+            block: Box::new(typed_block?),
+        })
+    }
+
+    /// Atribuição single-target `nome = exp` (`checker.lua:378-410`).
+    fn check_assign(&mut self, loc: Loc, var: &Var, exp: &Exp) -> Option<TypedStat> {
+        let Var::VarName {
+            loc: var_loc, name, ..
+        } = var
+        else {
+            // Defensivo: o parser (T11) só produz `VarName` como alvo.
+            self.error(
+                loc,
+                "atribuição a índice ou campo não é suportada nesta fase.",
+            );
+            return None;
+        };
+
+        let Some(symbol) = self.st.find_symbol(name).cloned() else {
+            self.error(*var_loc, format!("'{name}' não foi declarado."));
+            return None;
+        };
+
+        match symbol.kind {
+            // Globais nesta fase são sempre funções (`print` e as top-level)
+            // — "trying to assign to a function", `checker.lua:401`.
+            SymbolKind::Global => {
+                self.error(*var_loc, "não é possível atribuir a uma função.");
+                return None;
+            }
+            SymbolKind::Param => {
+                self.error(
+                    *var_loc,
+                    format!("não é possível atribuir ao parâmetro '{name}' nesta fase."),
+                );
+                return None;
+            }
+            // `ForVar` é sempre `mut` no template do T15 (nada a rastrear);
+            // `Local` é registrada mais abaixo, após a atribuição validar.
+            SymbolKind::ForVar | SymbolKind::Local { .. } => {}
+        }
+
+        let value = self.check_exp(exp)?;
+        if !symbol.ty.compatible(&value.ty) {
+            self.error(
+                value.loc,
+                format!(
+                    "atribuição incompatível para '{name}': esperado {}, encontrado {}.",
+                    type_name(&symbol.ty),
+                    type_name(&value.ty)
+                ),
+            );
+            return None;
+        }
+
+        if let SymbolKind::Local { decl_id } = symbol.kind {
+            self.assigned.insert(decl_id);
+        }
+
+        Some(TypedStat::Assign {
+            loc,
+            name: name.clone(),
+            value,
+        })
     }
 
     fn check_exp(&mut self, exp: &Exp) -> Option<TypedExp> {
@@ -603,9 +939,9 @@ impl Checker {
     fn check_var(&mut self, _loc: &Loc, var: &Var) -> Option<TypedExp> {
         match var {
             Var::VarName { loc, name } => match self.st.find_symbol(name).cloned() {
-                Some(ty) => Some(TypedExp {
+                Some(symbol) => Some(TypedExp {
                     loc: *loc,
-                    ty,
+                    ty: symbol.ty,
                     kind: TypedExpKind::Var(name.clone()),
                 }),
                 None => {
@@ -648,12 +984,12 @@ impl Checker {
             return None;
         };
 
-        let Some(callee_type) = self.st.find_symbol(name).cloned() else {
+        let Some(symbol) = self.st.find_symbol(name).cloned() else {
             self.error(*loc, format!("função '{name}' não foi declarada."));
             return None;
         };
 
-        let Type::Function { params, rettypes } = callee_type else {
+        let Type::Function { params, rettypes } = symbol.ty else {
             self.error(*loc, format!("'{name}' não é uma função."));
             return None;
         };
@@ -709,6 +1045,39 @@ impl Checker {
                 args: typed_args,
             },
         })
+    }
+}
+
+/// Fix-up de mutabilidade (decisão 6 da Fase 1): percorre o corpo tipado da
+/// função marcando `mutable = true` nas declarações cujo `decl_id` recebeu
+/// alguma atribuição. Shadowing é respeitado naturalmente — o id registrado
+/// veio do símbolo resolvido na pilha de escopos.
+fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
+    match stat {
+        TypedStat::Block { stats, .. } => {
+            for s in stats {
+                fixup_mutability(s, assigned);
+            }
+        }
+        TypedStat::Decl {
+            decl_id, mutable, ..
+        } => {
+            *mutable = assigned.contains(decl_id);
+        }
+        TypedStat::If {
+            thens, elsestat, ..
+        } => {
+            for then in thens {
+                fixup_mutability(&mut then.block, assigned);
+            }
+            if let Some(stat) = elsestat {
+                fixup_mutability(stat, assigned);
+            }
+        }
+        TypedStat::While { block, .. } | TypedStat::For { block, .. } => {
+            fixup_mutability(block, assigned);
+        }
+        TypedStat::Call { .. } | TypedStat::Return { .. } | TypedStat::Assign { .. } => {}
     }
 }
 
@@ -841,9 +1210,9 @@ mod tests {
     }
 
     #[test]
-    fn if_fora_do_subconjunto_produz_erro_claro_sem_panic() {
-        // O parser (T4) já não reconhece `if`, então a AST precisa ser
-        // montada à mão para exercitar a rejeição do checker diretamente.
+    fn atribuicao_multipla_montada_a_mao_produz_erro_defensivo() {
+        // O parser (T11) nunca produz multi-assign — AST montada à mão para
+        // exercitar a rejeição defensiva do checker (PRD.md, T12).
         let loc = Loc { line: 1, col: 1 };
         let program: Program = vec![TopLevel::TopLevelFunc {
             loc,
@@ -861,16 +1230,28 @@ mod tests {
             rettypes: vec![ast::Type::TypeInteger { loc }],
             block: Stat::StatBlock {
                 loc,
-                stats: vec![Stat::StatIf {
+                stats: vec![Stat::StatAssign {
                     loc,
-                    thens: vec![],
-                    elsestat: None,
+                    vars: vec![
+                        Var::VarName {
+                            loc,
+                            name: "a".to_string(),
+                        },
+                        Var::VarName {
+                            loc,
+                            name: "b".to_string(),
+                        },
+                    ],
+                    exps: vec![
+                        Exp::ExpInteger { loc, value: 1 },
+                        Exp::ExpInteger { loc, value: 2 },
+                    ],
                 }],
             },
         }];
 
         let errs = check(&program).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("`if`")));
+        assert!(errs.iter().any(|e| e.message.contains("atribuição múltipla")));
     }
 
     #[test]
@@ -915,5 +1296,254 @@ end"#;
                 assert!(errs.iter().all(|e| e.message.contains("main")));
             }
         }
+    }
+
+    // ---- Fase 1 (T12): if / while / for / atribuição --------------------
+
+    /// Verifica `source` e devolve os statements tipados do corpo da
+    /// primeira função.
+    fn typed_body_stats(source: &str) -> Vec<TypedStat> {
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let TypedTopLevel::Func { body, .. } = &typed[0];
+        let TypedStat::Block { stats, .. } = body else {
+            panic!("esperava TypedStat::Block como corpo");
+        };
+        stats.clone()
+    }
+
+    #[test]
+    fn aceita_if_while_for_e_atribuicao() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer = 0\n\
+             \x20   if true then\n\
+             \x20       x = 1\n\
+             \x20   else\n\
+             \x20       x = 2\n\
+             \x20   end\n\
+             \x20   while false do\n\
+             \x20       x = 3\n\
+             \x20   end\n\
+             \x20   for i = 1, 10 do\n\
+             \x20       x = 4\n\
+             \x20   end\n\
+             \x20   return x\n\
+             end",
+        );
+
+        let TypedStat::If {
+            thens, elsestat, ..
+        } = &stats[1]
+        else {
+            panic!("esperava TypedStat::If, obteve {:?}", stats[1]);
+        };
+        assert_eq!(thens.len(), 1);
+        assert_eq!(thens[0].condition.ty, Type::Boolean);
+        assert!(elsestat.is_some());
+
+        let TypedStat::While { condition, .. } = &stats[2] else {
+            panic!("esperava TypedStat::While, obteve {:?}", stats[2]);
+        };
+        assert_eq!(condition.ty, Type::Boolean);
+
+        let TypedStat::For { ty, inc, .. } = &stats[3] else {
+            panic!("esperava TypedStat::For, obteve {:?}", stats[3]);
+        };
+        assert_eq!(*ty, Type::Integer);
+        assert!(matches!(inc.kind, TypedExpKind::Integer(1)));
+    }
+
+    #[test]
+    fn condicao_de_if_nao_boolean_produz_erro() {
+        let source =
+            "function main(args: {string}): integer\n    if 42 then\n    end\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("condição") && e.message.contains("boolean"))
+        );
+    }
+
+    #[test]
+    fn condicao_de_while_nao_boolean_produz_erro() {
+        let source = "function main(args: {string}): integer\n    while \"oi\" do\n    end\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("condição") && e.message.contains("boolean"))
+        );
+    }
+
+    #[test]
+    fn for_com_variavel_nao_numerica_produz_erro() {
+        let source = "function main(args: {string}): integer\n    for x = \"a\", 10 do\n    end\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("integer ou float")));
+    }
+
+    #[test]
+    fn for_com_tipos_nao_identicos_produz_erro() {
+        // Decisão 5 da Fase 1: sem coerção int→float no `for`.
+        let source = "function main(args: {string}): integer\n    for x = 1, 10.0 do\n    end\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("mesmo tipo")));
+    }
+
+    #[test]
+    fn for_float_ganha_inc_default_float() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   for f = 1.5, 2.5 do\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::For { ty, inc, .. } = &stats[0] else {
+            panic!("esperava TypedStat::For");
+        };
+        assert_eq!(*ty, Type::Float);
+        assert_eq!(inc.ty, Type::Float);
+        assert!(matches!(inc.kind, TypedExpKind::Float(v) if v == 1.0));
+    }
+
+    #[test]
+    fn variavel_do_for_nao_vaza_do_laco() {
+        let source = "function main(args: {string}): integer\n\
+             \x20   for i = 1, 10 do\n\
+             \x20   end\n\
+             \x20   i = 5\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("'i' não foi declarado")));
+    }
+
+    #[test]
+    fn atribuir_a_variavel_de_controle_do_for_e_permitido() {
+        // O original também permite (a variável é uma declaração comum);
+        // no template do T15 ela é sempre `mut`, sem rastreio.
+        let source = "function main(args: {string}): integer\n\
+             \x20   for i = 1, 10 do\n\
+             \x20       i = 5\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn atribuicao_sem_declaracao_produz_erro() {
+        let source = "function main(args: {string}): integer\n    x = 10\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("'x' não foi declarado")));
+    }
+
+    #[test]
+    fn atribuir_a_funcao_produz_erro() {
+        let source = "function main(args: {string}): integer\n    print = 1\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("não é possível atribuir a uma função"))
+        );
+    }
+
+    #[test]
+    fn atribuir_a_parametro_produz_erro_nesta_fase() {
+        // Divergência documentada do original (que permite): parâmetros não
+        // têm rastreio de `mut`, e o Rust gerado não compilaria.
+        let source = "function f(x: integer): integer\n\
+             \x20   x = 1\n\
+             \x20   return x\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("parâmetro")));
+    }
+
+    #[test]
+    fn atribuicao_com_tipo_incompativel_produz_erro() {
+        let source = "function main(args: {string}): integer\n\
+             \x20   local x: integer = 0\n\
+             \x20   x = \"oi\"\n\
+             \x20   return x\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("atribuição incompatível"))
+        );
+    }
+
+    #[test]
+    fn mutabilidade_marca_somente_locais_reatribuidos() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer = 0\n\
+             \x20   local y: integer = 1\n\
+             \x20   while true do\n\
+             \x20       x = 2\n\
+             \x20   end\n\
+             \x20   return y\n\
+             end",
+        );
+        let TypedStat::Decl { name, mutable, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl");
+        };
+        assert_eq!(name, "x");
+        assert!(*mutable, "x é reatribuída dentro do while → mutable");
+
+        let TypedStat::Decl { name, mutable, .. } = &stats[1] else {
+            panic!("esperava TypedStat::Decl");
+        };
+        assert_eq!(name, "y");
+        assert!(!*mutable, "y nunca é reatribuída → imutável");
+    }
+
+    #[test]
+    fn shadowing_marca_somente_a_declaracao_interna() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer = 1\n\
+             \x20   if true then\n\
+             \x20       local x: integer = 2\n\
+             \x20       x = 3\n\
+             \x20   end\n\
+             \x20   return x\n\
+             end",
+        );
+        let TypedStat::Decl { mutable, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl externa");
+        };
+        assert!(!*mutable, "a externa nunca é atingida — o `x = 3` resolve para a interna");
+
+        let TypedStat::If { thens, .. } = &stats[1] else {
+            panic!("esperava TypedStat::If");
+        };
+        let TypedStat::Block { stats: inner, .. } = &thens[0].block else {
+            panic!("esperava TypedStat::Block no ramo then");
+        };
+        let TypedStat::Decl { mutable, .. } = &inner[0] else {
+            panic!("esperava TypedStat::Decl interna");
+        };
+        assert!(*mutable, "a interna é a atingida pelo `x = 3`");
     }
 }

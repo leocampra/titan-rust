@@ -127,9 +127,11 @@ const CASOS_NEGATIVOS: &[CasoNegativo] = &[
         trecho_esperado: "retorno incompatível",
     },
     CasoNegativo {
-        nome: "if_nao_suportado",
-        fonte: "function main(args: {string}): integer\n    if true then\n    end\n    return 0\nend",
-        trecho_esperado: "",
+        // O `if` passou a ser aceito na Fase 1 (T12); o caso negativo agora
+        // exercita a atribuição a variável não declarada.
+        nome: "atribuicao_sem_declarar",
+        fonte: "function main(args: {string}): integer\n    x = 10\n    return 0\nend",
+        trecho_esperado: "não foi declarado",
     },
     CasoNegativo {
         nome: "end_faltando",
