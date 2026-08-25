@@ -3,13 +3,18 @@
 //! a CLI como um usuário faria — `cargo test` aciona o `cargo build` do
 //! binário automaticamente antes de rodar este arquivo.
 //!
-//! Duas frentes:
+//! Três frentes:
 //! - caminho feliz: compila `examples/hello.titan` e confere **stdout e exit
 //!   code** do executável gerado (critério de aceite do PRD.md, T8);
 //! - suíte de negativos de T4/T5 rodando pelo pipeline completo: cada
 //!   construção fora do subconjunto da Fase 0 precisa produzir uma mensagem
 //!   de erro clara na saída do `titanc`, nunca um panic (sem "thread
-//!   'main' panicked").
+//!   'main' panicked");
+//! - suíte consolidada da Fase 1 (PRD.md, T16): tudo que **segue** fora de
+//!   escopo após `if`/`while`/`for`/atribuição/operadores serem aceitos —
+//!   `v[i]`, `{...}`, retornos múltiplos, métodos, `import`, `repeat`,
+//!   `break`, bitwise, `//`, `#`, `Option` — continua rejeitado com erro
+//!   claro, incluindo arquivos `.titan` reais do Titan original.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -150,42 +155,185 @@ const CASOS_NEGATIVOS: &[CasoNegativo] = &[
     },
 ];
 
+/// Compila `caso.fonte` pelo binário real e confere a tripla que define um
+/// "erro claro": falha sem panic, stderr com o trecho esperado, nenhum
+/// `build/` deixado para trás.
+fn verifica_caso_negativo(caso: &CasoNegativo, label: &str) {
+    let out_dir = temp_dir(&format!("{label}-{}", caso.nome));
+    let source_path = write_source(&out_dir, "caso.titan", caso.fonte);
+
+    let output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .unwrap_or_else(|e| panic!("[{}] falha ao invocar titanc: {e}", caso.nome));
+
+    assert_never_panics(&output);
+    assert!(
+        !output.status.success(),
+        "[{}] esperava falha, titanc reportou sucesso",
+        caso.nome
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.trim().is_empty(),
+        "[{}] esperava mensagem de erro em stderr, veio vazio",
+        caso.nome
+    );
+    assert!(
+        stderr.contains(caso.trecho_esperado),
+        "[{}] esperava stderr contendo '{}', obteve: {stderr}",
+        caso.nome,
+        caso.trecho_esperado
+    );
+    assert!(
+        !out_dir.join("build").exists(),
+        "[{}] erro não deveria deixar build/ para trás",
+        caso.nome
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 #[test]
 fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
     for caso in CASOS_NEGATIVOS {
-        let out_dir = temp_dir(&format!("negativo-{}", caso.nome));
-        let source_path = write_source(&out_dir, "caso.titan", caso.fonte);
+        verifica_caso_negativo(caso, "negativo");
+    }
+}
+
+/// Fora de escopo da Fase 1 (PRD.md, T16): a fase ensinou o pipeline a
+/// aceitar `if`/`while`/`for`/atribuição e operadores — esta tabela garante
+/// que ela não afrouxou nada além do pretendido. Cada construção que segue
+/// fora do subconjunto é rejeitada em alguma etapa (léxica, sintática ou de
+/// tipos) com erro claro, nunca panic.
+const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
+    CasoNegativo {
+        nome: "indexacao_de_array",
+        fonte: "function main(args: {string}): integer\n    print(args[1])\n    return 0\nend",
+        trecho_esperado: "caractere inesperado '['",
+    },
+    CasoNegativo {
+        nome: "construtor_de_array",
+        fonte: "function main(args: {string}): integer\n    local t = {1, 2}\n    return 0\nend",
+        trecho_esperado: "Esperava uma expressão",
+    },
+    CasoNegativo {
+        nome: "retornos_multiplos",
+        fonte: "function main(args: {string}): integer\n    return 1, 2\nend",
+        trecho_esperado: "erro de sintaxe",
+    },
+    CasoNegativo {
+        nome: "chamada_de_metodo",
+        fonte: "function main(args: {string}): integer\n    local p = ponto:dist()\n    return 0\nend",
+        trecho_esperado: "erro de sintaxe",
+    },
+    CasoNegativo {
+        nome: "import_de_modulo",
+        fonte: "local m = import \"foo\"\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "declaração de topo",
+    },
+    CasoNegativo {
+        nome: "repeat_until",
+        fonte: "function main(args: {string}): integer\n    repeat print(\"x\") until true\n    return 0\nend",
+        trecho_esperado: "Esperava um comando",
+    },
+    CasoNegativo {
+        nome: "break_fora_de_escopo",
+        fonte: "function main(args: {string}): integer\n    while true do\n        break\n    end\n    return 0\nend",
+        trecho_esperado: "Esperava um comando",
+    },
+    CasoNegativo {
+        nome: "bitwise_and",
+        fonte: "function main(args: {string}): integer\n    local a = 1 & 2\n    return 0\nend",
+        trecho_esperado: "caractere inesperado '&'",
+    },
+    CasoNegativo {
+        nome: "bitwise_or",
+        fonte: "function main(args: {string}): integer\n    local a = 1 | 2\n    return 0\nend",
+        trecho_esperado: "caractere inesperado '|'",
+    },
+    CasoNegativo {
+        nome: "bitwise_not_isolado",
+        fonte: "function main(args: {string}): integer\n    local a = ~2\n    return 0\nend",
+        trecho_esperado: "'~' isolado",
+    },
+    CasoNegativo {
+        nome: "shift_esquerda",
+        fonte: "function main(args: {string}): integer\n    local a = 1 << 2\n    return 0\nend",
+        trecho_esperado: "Esperava uma expressão",
+    },
+    CasoNegativo {
+        nome: "shift_direita",
+        fonte: "function main(args: {string}): integer\n    local a = 1 >> 2\n    return 0\nend",
+        trecho_esperado: "Esperava uma expressão",
+    },
+    CasoNegativo {
+        nome: "divisao_inteira",
+        fonte: "function main(args: {string}): integer\n    local a = 1 // 2\n    return 0\nend",
+        trecho_esperado: "Esperava uma expressão",
+    },
+    CasoNegativo {
+        nome: "operador_length",
+        fonte: "function main(args: {string}): integer\n    local a = #args\n    return 0\nend",
+        trecho_esperado: "caractere inesperado '#'",
+    },
+    CasoNegativo {
+        nome: "tipo_option",
+        fonte: "function main(args: {string}): integer\n    local a: integer? = nil\n    return 0\nend",
+        trecho_esperado: "caractere inesperado '?'",
+    },
+];
+
+#[test]
+fn construcoes_fora_de_escopo_da_fase_1_produzem_erro_claro_sem_panic() {
+    for caso in CASOS_FORA_DE_ESCOPO_FASE_1 {
+        verifica_caso_negativo(caso, "fora-de-escopo");
+    }
+}
+
+/// Regressão com arquivos `.titan` **reais** do Titan original (PRD.md,
+/// T16) — a referência somente leitura em `../titan/`. Eles usam `import`,
+/// `#`, `v[i]`, `{}` e records, tudo fora do subconjunto: o titanc precisa
+/// rejeitá-los com erro claro, nunca panic.
+#[test]
+fn arquivos_reais_do_titan_original_produzem_erro_claro_sem_panic() {
+    let titan_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../titan");
+    if !titan_dir.exists() {
+        // A referência é um repositório de terceiros fora deste workspace;
+        // sem ela presente não há o que exercitar.
+        eprintln!("aviso: {} ausente — regressão pulada", titan_dir.display());
+        return;
+    }
+
+    for relativo in ["examples/artisanal.titan", "testfiles/sieve.titan"] {
+        let source_path = titan_dir.join(relativo);
+        assert!(
+            source_path.exists(),
+            "esperava arquivo de referência em {source_path:?}"
+        );
+        let out_dir = temp_dir(&format!(
+            "titan-original-{}",
+            relativo.replace('/', "-").replace('.', "-")
+        ));
 
         let output = Command::new(titanc_bin())
             .arg("--out")
             .arg(&out_dir)
             .arg(&source_path)
             .output()
-            .unwrap_or_else(|e| panic!("[{}] falha ao invocar titanc: {e}", caso.nome));
+            .unwrap_or_else(|e| panic!("[{relativo}] falha ao invocar titanc: {e}"));
 
         assert_never_panics(&output);
         assert!(
             !output.status.success(),
-            "[{}] esperava falha, titanc reportou sucesso",
-            caso.nome
-        );
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !stderr.trim().is_empty(),
-            "[{}] esperava mensagem de erro em stderr, veio vazio",
-            caso.nome
+            "[{relativo}] esperava falha, titanc reportou sucesso"
         );
         assert!(
-            stderr.contains(caso.trecho_esperado),
-            "[{}] esperava stderr contendo '{}', obteve: {stderr}",
-            caso.nome,
-            caso.trecho_esperado
-        );
-        assert!(
-            !out_dir.join("build").exists(),
-            "[{}] erro não deveria deixar build/ para trás",
-            caso.nome
+            !String::from_utf8_lossy(&output.stderr).trim().is_empty(),
+            "[{relativo}] esperava mensagem de erro em stderr, veio vazio"
         );
 
         let _ = std::fs::remove_dir_all(&out_dir);
