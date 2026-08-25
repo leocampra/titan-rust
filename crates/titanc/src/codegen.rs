@@ -147,6 +147,20 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize) {
             }
             out.push_str(";\n");
         }
+        // O checker (T12) já aceita estes statements, mas a geração de
+        // código deles chega nas T14/T15. Até lá o Rust gerado carrega um
+        // `compile_error!` explicativo — a build do programa falha com
+        // mensagem clara em vez de emitir código silenciosamente errado
+        // (e o titanc segue sem panic).
+        TypedStat::If { .. }
+        | TypedStat::While { .. }
+        | TypedStat::For { .. }
+        | TypedStat::Assign { .. } => {
+            indent(out, depth);
+            out.push_str(
+                "compile_error!(\"if/while/for/atribuição ainda não têm geração de código (chega nas tarefas T14/T15)\");\n",
+            );
+        }
     }
 }
 
