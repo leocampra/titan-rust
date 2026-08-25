@@ -195,16 +195,64 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize) {
             out.push_str(&emit_slot_value(&value.ty, value));
             out.push_str(";\n");
         }
-        // O checker (T12) já aceita `for`, mas seu desaçucaramento para
-        // `while` chega na T15. Até lá o Rust gerado carrega um
-        // `compile_error!` explicativo — a build do programa falha com
-        // mensagem clara em vez de emitir código silenciosamente errado
-        // (e o titanc segue sem panic).
-        TypedStat::For { .. } => {
+        // `for` numérico sempre desaçucarado para `while`, nunca `Range` do
+        // Rust: `.step_by` não aceita passo negativo nem float, e `Range<f64>`
+        // não implementa `Iterator`. Um único template cobre integer/float,
+        // `inc` omitido (o checker já materializou `1`/`1.0`), `inc` negativo
+        // e `inc` só conhecido em runtime (PRD T15; ADR na T18). Sem caminho
+        // otimizado para `inc = 1` literal nesta fase — otimização futura.
+        TypedStat::For {
+            name,
+            ty,
+            start,
+            finish,
+            inc,
+            block,
+            ..
+        } => {
+            let t = rust_type_name(ty);
+            let inner = depth + 1;
+            // Bloco externo: a variável de controle e as auxiliares não vazam
+            // para fora do laço (semântica Titan) — e laços aninhados apenas
+            // sombreiam as auxiliares do laço externo. O prefixo `titan_`
+            // segue a convenção de mangling existente.
             indent(out, depth);
-            out.push_str(
-                "compile_error!(\"`for` ainda não tem geração de código (chega na tarefa T15)\");\n",
-            );
+            out.push_str("{\n");
+            indent(out, inner);
+            out.push_str(&format!(
+                "let mut {name}: {t} = {};\n",
+                emit_delimited_exp(start)
+            ));
+            indent(out, inner);
+            out.push_str(&format!(
+                "let titan_for_finish: {t} = {};\n",
+                emit_delimited_exp(finish)
+            ));
+            indent(out, inner);
+            out.push_str(&format!(
+                "let titan_for_inc: {t} = {};\n",
+                emit_delimited_exp(inc)
+            ));
+            // A direção do laço é computada uma única vez, antes de entrar.
+            indent(out, inner);
+            out.push_str(&format!(
+                "let titan_for_asc: bool = titan_for_inc > 0 as {t};\n"
+            ));
+            indent(out, inner);
+            out.push_str(&format!(
+                "while (titan_for_asc && {name} <= titan_for_finish)\n"
+            ));
+            indent(out, inner + 1);
+            out.push_str(&format!(
+                "|| (!titan_for_asc && {name} >= titan_for_finish) {{\n"
+            ));
+            emit_block_stats(out, block, inner + 1);
+            indent(out, inner + 1);
+            out.push_str(&format!("{name} += titan_for_inc;\n"));
+            indent(out, inner);
+            out.push_str("}\n");
+            indent(out, depth);
+            out.push_str("}\n");
         }
     }
 }
@@ -398,15 +446,23 @@ fn format_string_literal(v: &str) -> String {
 }
 
 /// `..` do Titan é N-ário; `titan_runtime::concat` é binário — encadeia par a
-/// par, associando à esquerda.
+/// par, associando à esquerda. O acumulador vira `String` a partir do
+/// primeiro par, então os pares seguintes o recebem por `&` (deref-coercion
+/// `&String → &str`).
 fn emit_concat(exps: &[TypedExp]) -> String {
     let mut parts = exps.iter();
     let first = parts
         .next()
         .expect("checker garante ExpConcat com ao menos um operando");
     let mut acc = concat_operand(first);
+    let mut acc_is_owned = false;
     for e in parts {
-        acc = format!("titan_runtime::concat({acc}, {})", concat_operand(e));
+        let borrow = if acc_is_owned { "&" } else { "" };
+        acc = format!(
+            "titan_runtime::concat({borrow}{acc}, {})",
+            concat_operand(e)
+        );
+        acc_is_owned = true;
     }
     acc
 }
@@ -599,7 +655,7 @@ mod tests {
 end"#;
         let rust = generate_source(source);
         assert!(rust.contains(
-            "let a: String = titan_runtime::concat(titan_runtime::concat(\"x\", \"y\"), \"z\");"
+            "let a: String = titan_runtime::concat(&titan_runtime::concat(\"x\", \"y\"), \"z\");"
         ));
         assert!(rust.contains("titan_runtime::print(&a);"));
     }
@@ -806,6 +862,108 @@ end"#;
         );
         assert_eq!(linhas[2], "pow: 1024");
         assert_eq!(linhas[3], "impar maior que 4");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    // ---- T15: StatFor desaçucarado para while ---------------------------
+
+    #[test]
+    fn for_emite_template_while_desacucarado() {
+        let source = r#"function main(args: {string}): integer
+    for i = 1, 5 do
+        print("x" .. i)
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("let mut i: i64 = 1;"));
+        assert!(rust.contains("let titan_for_finish: i64 = 5;"));
+        assert!(rust.contains("let titan_for_inc: i64 = 1;"));
+        assert!(rust.contains("let titan_for_asc: bool = titan_for_inc > 0 as i64;"));
+        assert!(rust.contains("while (titan_for_asc && i <= titan_for_finish)"));
+        assert!(rust.contains("|| (!titan_for_asc && i >= titan_for_finish) {"));
+        assert!(rust.contains("i += titan_for_inc;"));
+        // Nunca o Range do Rust (`.step_by` não cobre passo negativo/float).
+        assert!(!rust.contains(".."));
+        assert!(!rust.contains("step_by"));
+    }
+
+    #[test]
+    fn for_float_usa_o_mesmo_template_com_f64() {
+        let source = r#"function main(args: {string}): integer
+    for x = 0.0, 1.0, 0.25 do
+        print("passo")
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("let mut x: f64 = 0.0;"));
+        assert!(rust.contains("let titan_for_finish: f64 = 1.0;"));
+        assert!(rust.contains("let titan_for_inc: f64 = 0.25;"));
+        assert!(rust.contains("let titan_for_asc: bool = titan_for_inc > 0 as f64;"));
+        assert!(rust.contains("x += titan_for_inc;"));
+    }
+
+    #[test]
+    fn for_compila_e_roda_todos_os_casos_do_criterio() {
+        let source = r#"function conta(inicio: integer, fim: integer, passo: integer): integer
+    local n: integer = 0
+    for i = inicio, fim, passo do
+        n = n + 1
+    end
+    return n
+end
+
+function main(args: {string}): integer
+    for i = 1, 5 do
+        print("a" .. i)
+    end
+    for i = 5, 1, -1 do
+        print("b" .. i)
+    end
+    for i = 1, 10, 2 do
+        print("c" .. i)
+    end
+    local cont: integer = 0
+    for x = 0.0, 1.0, 0.25 do
+        cont = cont + 1
+    end
+    print("cont: " .. cont)
+    print("d: " .. conta(10, 1, -3))
+    for i = 1, 2 do
+        for j = 1, 2 do
+            print("n" .. i .. j)
+        end
+    end
+    for i = 1, 0 do
+        print("nunca")
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        let (avisos, output) = compila_e_executa(&rust, "for-t15");
+
+        assert!(
+            !avisos.contains("unused_parens"),
+            "parênteses redundantes no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert!(
+            !avisos.contains("unused_mut"),
+            "`let mut` desnecessário no Rust gerado:\n{avisos}\n{rust}"
+        );
+
+        // Linha a linha: `for i = 1, 5` crescente (a1..a5) ·
+        // `for i = 5, 1, -1` decrescente (b5..b1) · `for i = 1, 10, 2`
+        // (c1,c3,c5,c7,c9) · `for x = 0.0, 1.0, 0.25` float conferido por
+        // contagem (cont: 5) · passo negativo só conhecido em runtime, via
+        // parâmetro (d: 4) · laços aninhados, auxiliares internas apenas
+        // sombreiam (n11..n22) · `for i = 1, 0` zero iterações (sem "nunca").
+        let esperado = "a1\na2\na3\na4\na5\n\
+                        b5\nb4\nb3\nb2\nb1\n\
+                        c1\nc3\nc5\nc7\nc9\n\
+                        cont: 5\nd: 4\n\
+                        n11\nn12\nn21\nn22\n";
+        assert_eq!(String::from_utf8_lossy(&output.stdout), esperado);
         assert_eq!(output.status.code(), Some(0));
     }
 }
