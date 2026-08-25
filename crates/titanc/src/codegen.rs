@@ -76,9 +76,17 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel) {
     out.push_str("fn ");
     out.push_str(&mangle_fn_name(name));
     out.push('(');
+    let used = referenced_names(body);
     let param_list: Vec<String> = params
         .iter()
-        .map(|(name, ty)| format!("{name}: {}", rust_param_type_name(ty)))
+        .map(|(name, ty)| {
+            let rust_name = if used.contains(name.as_str()) {
+                name.clone()
+            } else {
+                format!("_{name}")
+            };
+            format!("{rust_name}: {}", rust_param_type_name(ty))
+        })
         .collect();
     out.push_str(&param_list.join(", "));
     out.push(')');
@@ -92,6 +100,91 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel) {
     out.push_str(" {\n");
     emit_block_stats(out, body, 1);
     out.push_str("}\n");
+}
+
+/// Nomes lidos em algum ponto do corpo (`TypedExpKind::Var`), usado para
+/// decidir se um parâmetro sai como `nome` ou `_nome` na assinatura — Rust
+/// avisa (`unused_variables`) sobre parâmetros nunca lidos, e a Fase 0/1
+/// tem programas legítimos que declaram `args: {string}` sem usá-lo.
+fn referenced_names(stat: &TypedStat) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    collect_referenced_names_stat(stat, &mut names);
+    names
+}
+
+fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections::HashSet<String>) {
+    match stat {
+        TypedStat::Block { stats, .. } => {
+            for s in stats {
+                collect_referenced_names_stat(s, names);
+            }
+        }
+        TypedStat::Decl { value, .. } => collect_referenced_names_exp(value, names),
+        TypedStat::Call { call, .. } => collect_referenced_names_exp(call, names),
+        TypedStat::Return { exps, .. } => {
+            for e in exps {
+                collect_referenced_names_exp(e, names);
+            }
+        }
+        TypedStat::If {
+            thens, elsestat, ..
+        } => {
+            for then in thens {
+                collect_referenced_names_exp(&then.condition, names);
+                collect_referenced_names_stat(&then.block, names);
+            }
+            if let Some(elsestat) = elsestat {
+                collect_referenced_names_stat(elsestat, names);
+            }
+        }
+        TypedStat::While {
+            condition, block, ..
+        } => {
+            collect_referenced_names_exp(condition, names);
+            collect_referenced_names_stat(block, names);
+        }
+        TypedStat::For {
+            start,
+            finish,
+            inc,
+            block,
+            ..
+        } => {
+            collect_referenced_names_exp(start, names);
+            collect_referenced_names_exp(finish, names);
+            collect_referenced_names_exp(inc, names);
+            collect_referenced_names_stat(block, names);
+        }
+        TypedStat::Assign { value, .. } => collect_referenced_names_exp(value, names),
+    }
+}
+
+fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::HashSet<String>) {
+    match &exp.kind {
+        TypedExpKind::Var(name) => {
+            names.insert(name.clone());
+        }
+        TypedExpKind::Call { args, .. } => {
+            for a in args {
+                collect_referenced_names_exp(a, names);
+            }
+        }
+        TypedExpKind::Concat(parts) => {
+            for p in parts {
+                collect_referenced_names_exp(p, names);
+            }
+        }
+        TypedExpKind::Binop { lhs, rhs, .. } => {
+            collect_referenced_names_exp(lhs, names);
+            collect_referenced_names_exp(rhs, names);
+        }
+        TypedExpKind::Unop { exp, .. } => collect_referenced_names_exp(exp, names),
+        TypedExpKind::Nil
+        | TypedExpKind::Bool(_)
+        | TypedExpKind::Integer(_)
+        | TypedExpKind::Float(_)
+        | TypedExpKind::String(_) => {}
+    }
 }
 
 /// Emite os comandos de um `TypedStat::Block` (o único formato de corpo de
@@ -577,7 +670,9 @@ mod tests {
 
         let rust = generate_source(&source);
 
-        assert!(rust.contains("pub fn titan_main(args: &[String]) -> i64 {"));
+        // `args` não é lido no corpo de `hello.titan` — sai `_args` para o
+        // Rust gerado não emitir `unused_variables`.
+        assert!(rust.contains("pub fn titan_main(_args: &[String]) -> i64 {"));
         assert!(rust.contains("titan_runtime::print(\"Olá, mundo!\");"));
         assert!(rust.contains("return 0;"));
         assert!(rust.contains("fn main() {"));
@@ -641,7 +736,8 @@ mod tests {
         .expect("examples/hello.titan deve existir");
         let rust = generate_source(&source);
 
-        let (_avisos, output) = compila_e_executa(&rust, "hello");
+        let (avisos, output) = compila_e_executa(&rust, "hello");
+        assert!(avisos.is_empty(), "warnings no Rust gerado:\n{avisos}\n{rust}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "Olá, mundo!\n");
         assert_eq!(output.status.code(), Some(0));
     }
@@ -673,6 +769,26 @@ end"#;
         assert!(rust.contains("fn titan_ajuda() -> i64 {"));
         assert!(!rust.contains("pub fn titan_ajuda"));
         assert!(rust.contains("return titan_ajuda();"));
+    }
+
+    /// Parâmetro nunca lido no corpo sai `_nome` na assinatura, para o Rust
+    /// gerado não emitir `unused_variables` — caso comum de `main(args:
+    /// {string})` quando o programa não usa `args` (`hello.titan`,
+    /// `nucleo.titan`). Quando o parâmetro É lido (mesmo só repassado para
+    /// outra chamada), mantém o nome original.
+    #[test]
+    fn parametro_nao_usado_sai_com_underscore_e_usado_mantem_o_nome() {
+        let source = r#"function conta(a: {string}): integer
+    return 0
+end
+
+function main(args: {string}): integer
+    return conta(args)
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("fn titan_conta(_a: &[String]) -> i64 {"));
+        assert!(rust.contains("fn titan_main(args: &[String]) -> i64 {"));
+        assert!(rust.contains("return titan_conta(args);"));
     }
 
     // ---- T14: If/While/Assign/Binop/Unop --------------------------------
@@ -838,17 +954,10 @@ end"#;
         let rust = generate_source(source);
         let (avisos, output) = compila_e_executa(&rust, "nucleo-t14");
 
-        // Critério da fase: Rust gerado sem `let mut` sobrando nem
-        // parênteses redundantes (o aviso pré-existente de `args` não usado
-        // não é objeto da T14).
-        assert!(
-            !avisos.contains("unused_parens"),
-            "parênteses redundantes no Rust gerado:\n{avisos}\n{rust}"
-        );
-        assert!(
-            !avisos.contains("unused_mut"),
-            "`let mut` desnecessário no Rust gerado:\n{avisos}\n{rust}"
-        );
+        // Critério da fase: Rust gerado sem nenhum warning do rustc — nem
+        // `let mut` sobrando, nem parênteses redundantes, nem `args` não
+        // usado (corrigido via `_`-prefixing de parâmetros não lidos).
+        assert!(avisos.is_empty(), "warnings no Rust gerado:\n{avisos}\n{rust}");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let linhas: Vec<&str> = stdout.lines().collect();
@@ -943,14 +1052,7 @@ end"#;
         let rust = generate_source(source);
         let (avisos, output) = compila_e_executa(&rust, "for-t15");
 
-        assert!(
-            !avisos.contains("unused_parens"),
-            "parênteses redundantes no Rust gerado:\n{avisos}\n{rust}"
-        );
-        assert!(
-            !avisos.contains("unused_mut"),
-            "`let mut` desnecessário no Rust gerado:\n{avisos}\n{rust}"
-        );
+        assert!(avisos.is_empty(), "warnings no Rust gerado:\n{avisos}\n{rust}");
 
         // Linha a linha: `for i = 1, 5` crescente (a1..a5) ·
         // `for i = 5, 1, -1` decrescente (b5..b1) · `for i = 1, 10, 2`

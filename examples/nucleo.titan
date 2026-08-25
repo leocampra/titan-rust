@@ -1,0 +1,32 @@
+function fatorial(n: integer): integer
+    if n <= 1 then
+        return 1
+    end
+    local resultado: integer = 1
+    local i: integer = 2
+    while i <= n do
+        resultado = resultado * i
+        i = i + 1
+    end
+    return resultado
+end
+
+function fibonacci(n: integer): integer
+    if n <= 1 then
+        return n
+    end
+    local a: integer = 0
+    local b: integer = 1
+    for j = 2, n do
+        local prox: integer = a + b
+        a = b
+        b = prox
+    end
+    return b
+end
+
+function main(args: {string}): integer
+    print("Fatorial de 5: " .. fatorial(5))
+    print("Fibonacci de 10: " .. fibonacci(10))
+    return 0
+end

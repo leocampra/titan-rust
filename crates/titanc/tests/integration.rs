@@ -6,6 +6,9 @@
 //! Três frentes:
 //! - caminho feliz: compila `examples/hello.titan` e confere **stdout e exit
 //!   code** do executável gerado (critério de aceite do PRD.md, T8);
+//! - caminho feliz da Fase 1 (PRD.md, T17): compila `examples/nucleo.titan`
+//!   — aritmética, `if`, `while`, `for` e atribuição em funções reais
+//!   (fatorial e fibonacci) — e confere stdout completo e exit code;
 //! - suíte de negativos de T4/T5 rodando pelo pipeline completo: cada
 //!   construção fora do subconjunto da Fase 0 precisa produzir uma mensagem
 //!   de erro clara na saída do `titanc`, nunca um panic (sem "thread
@@ -84,6 +87,73 @@ fn compila_e_executa_hello_titan_conferindo_stdout_e_exit_code() {
 }
 
 #[test]
+fn compila_e_executa_nucleo_titan_conferindo_stdout_e_exit_code() {
+    let out_dir = temp_dir("nucleo");
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(examples_dir().join("nucleo.titan"))
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar nucleo.titan: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("nucleo");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary).output().expect("executa ./nucleo");
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "Fatorial de 5: 120\nFibonacci de 10: 55\n"
+    );
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// A verificação do T17 pede o `--emit-rust` do `nucleo.titan` "sem warnings
+/// de mut" — a decisão 6 da Fase 1 exige `let mut` apenas nas variáveis
+/// reatribuídas. Conferimos as duas direções: quem é reatribuída
+/// (`resultado`, `i`, `a`, `b`) sai `mut`; quem não é (`prox`) sai sem.
+#[test]
+fn emit_rust_de_nucleo_marca_mut_apenas_nas_variaveis_reatribuidas() {
+    let out_dir = temp_dir("emit-rust-nucleo");
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(examples_dir().join("nucleo.titan"))
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&output);
+    assert!(
+        output.status.success(),
+        "titanc --emit-rust falhou para nucleo.titan: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for reatribuida in ["resultado", "i", "a", "b"] {
+        assert!(
+            stdout.contains(&format!("let mut {reatribuida}: i64")),
+            "esperava `let mut {reatribuida}` no Rust gerado:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("let prox: i64"),
+        "`prox` nunca é reatribuída — não deveria ser `mut`:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
 fn emit_rust_imprime_o_rust_gerado_sem_compilar() {
     let out_dir = temp_dir("emit-rust");
 
@@ -98,7 +168,9 @@ fn emit_rust_imprime_o_rust_gerado_sem_compilar() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("fn titan_main(args: &[String]) -> i64"));
+    // `args` não é lido no corpo de `hello.titan` — sai `_args` para o Rust
+    // gerado não emitir `unused_variables`.
+    assert!(stdout.contains("fn titan_main(_args: &[String]) -> i64"));
     assert!(stdout.contains("titan_runtime::print(\"Olá, mundo!\");"));
     assert!(
         !out_dir.join("build").exists(),
