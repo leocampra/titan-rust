@@ -6,8 +6,10 @@ como **especificação de referência** de gramática, AST e sistema de tipos �
 como base de código. Veja [`PRD.md`](PRD.md) para o plano de tarefas completo e
 [`docs/arquitetura.md`](docs/arquitetura.md) para o porquê das decisões abaixo.
 
-Estado atual: **Fase 0 ("Hello World")** — um subconjunto mínimo da linguagem,
-o suficiente para levar `examples/hello.titan` até um executável nativo.
+Estado atual: **Fase 1 ("Núcleo da linguagem")** — além do hello world da
+Fase 0, o compilador já cobre operadores aritméticos/relacionais/lógicos,
+`if`/`while`/`for` numérico e atribuição, o suficiente para levar
+`examples/nucleo.titan` (fatorial e fibonacci) até um executável nativo.
 
 ## Como compilar
 
@@ -29,6 +31,17 @@ echo $?
 # → 0
 ```
 
+## Como rodar o exemplo da Fase 1 (núcleo da linguagem)
+
+```bash
+./target/release/titanc examples/nucleo.titan
+./nucleo
+# → Fatorial de 5: 120
+# → Fibonacci de 10: 55
+echo $?
+# → 0
+```
+
 O `titanc` lê o `.titan`, gera um projeto Cargo temporário em `build/<nome>/`,
 compila-o com `cargo build --release` e copia o binário resultante para o
 diretório atual como `<nome>`.
@@ -36,7 +49,7 @@ diretório atual como `<nome>`.
 Para inspecionar o Rust gerado sem compilar:
 
 ```bash
-./target/release/titanc --emit-rust examples/hello.titan
+./target/release/titanc --emit-rust examples/nucleo.titan
 ```
 
 ### CLI
@@ -79,19 +92,35 @@ comportamento bate.
 O que **não** foi reaproveitado, e por quê, está em
 [`docs/arquitetura.md`](docs/arquitetura.md) e em
 [`docs/adr/0001-compilador-novo-em-rust.md`](docs/adr/0001-compilador-novo-em-rust.md).
+Duas decisões da Fase 1 divergem deliberadamente do comportamento do Titan
+original — o `for` numérico desaçucarado para `while`
+([ADR 0004](docs/adr/0004-for-desacucarado-para-while.md)) e `and`/`or`
+exigindo booleano estrito em vez de truthy/falsy
+([ADR 0005](docs/adr/0005-and-or-boolean-estrito.md)).
 
 `titan/` e `lua/` (usado para checar comportamento de referência do Lua) são
 **somente leitura** neste repositório — repositórios de terceiros, nunca
 editados.
 
+## O que já está implementado
+
+Fase 0 (hello world) + Fase 1 (núcleo da linguagem):
+
+- `function`/`local function`, `local x [: T] = exp`, `return`.
+- Operadores aritméticos `+ - * / % ^`, relacionais `== ~= < > <= >=`,
+  lógicos `and or not`, unário `-`/`not`; `..` (concatenação, coage
+  número→string).
+- Controle de fluxo: `if`/`elseif`/`else`, `while`, `for` numérico
+  (`for x = start, finish[, inc] do ... end`).
+- Atribuição single-target: `nome = exp` para local já declarada.
+
 ## O que não está implementado ainda
 
-A Fase 0 cobre só o suficiente para compilar e rodar o hello world. Ficam para
-fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
+Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
-- Controle de fluxo: `if`, `while`, `for`, `repeat`.
-- Operadores aritméticos, relacionais e lógicos; operador unário.
-- Retornos múltiplos e atribuição (`x = exp`).
+- `repeat`/`until`, `break`/`continue`, `for`-in.
+- Retornos múltiplos.
+- Bitwise (`& | ~ << >>`), `//`, `#`.
 - Tipos compostos manipuláveis: arrays, maps, records; inicializadores `{...}`.
 - `import` e `foreign import`.
 - Métodos e chamadas de método.
@@ -109,7 +138,8 @@ titan-rust/
 │   ├── titanc/          # o compilador: lexer, parser, checker, codegen, driver, CLI
 │   └── titan-runtime/   # runtime mínimo (print, concat) chamado pelo Rust gerado
 ├── examples/
-│   └── hello.titan
+│   ├── hello.titan
+│   └── nucleo.titan
 ├── docs/
 │   ├── arquitetura.md
 │   └── adr/
