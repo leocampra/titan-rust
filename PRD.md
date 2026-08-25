@@ -658,7 +658,7 @@ Rejeitar com erro claro (nunca panic): records, maps, arrays manipuláveis (`v[i
 | Fase | Escopo | Estado |
 |---|---|---|
 | **0. Hello world** | pipeline completo, subconjunto mínimo | ✅ **Concluída** |
-| **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ⏳ **Esta fase** (T10–T18) |
+| **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
 | 2. Tipos compostos | arrays, maps, records, strings dinâmicas — ownership/borrow mordem aqui | Pendente |
 | 3. Capability Runtimes | AI, Crypto, Data (`titan-ai`, `titan-crypto`…) | Pendente |
 | 4. Self-hosting / LSP | compilador escrito na própria linguagem | Pendente |
