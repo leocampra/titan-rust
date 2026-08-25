@@ -10,6 +10,11 @@
 //! O símbolo `=` foi acrescentado na T4 (`parser.rs`), para suportar
 //! `local x [: T] = exp` — o `lexer.lua` original já o reconhece, T3 só não
 //! precisava dele ainda.
+//!
+//! A Fase 1 (T10 do PRD.md) acrescenta os operadores aritméticos
+//! `+ - * / % ^`, os relacionais `== ~= < > <= >=` e as palavras-chave de
+//! controle de fluxo e lógicas `and or not if then elseif else while do for`.
+//! `~` só existe em `~=` — isolado é erro léxico (sem bitwise nesta fase).
 
 use crate::ast::Loc;
 
@@ -37,6 +42,18 @@ pub enum TokenKind {
     False,
     Nil,
 
+    // Palavras-chave lógicas e de controle de fluxo (Fase 1)
+    And,
+    Or,
+    Not,
+    If,
+    Then,
+    Elseif,
+    Else,
+    While,
+    Do,
+    For,
+
     // Reservadas de tipo (`lexer.lua:170`)
     KwBoolean,
     KwInteger,
@@ -54,6 +71,22 @@ pub enum TokenKind {
     Semicolon,
     Concat, // ..
     Assign, // =
+
+    // Operadores aritméticos (Fase 1)
+    Plus,    // +
+    Minus,   // -
+    Star,    // *
+    Slash,   // /
+    Percent, // %
+    Caret,   // ^
+
+    // Operadores relacionais (Fase 1)
+    Eq, // ==
+    Ne, // ~=
+    Lt, // <
+    Gt, // >
+    Le, // <=
+    Ge, // >=
 
     Eof,
 }
@@ -416,6 +449,16 @@ impl<'a> Lexer<'a> {
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "nil" => TokenKind::Nil,
+            "and" => TokenKind::And,
+            "or" => TokenKind::Or,
+            "not" => TokenKind::Not,
+            "if" => TokenKind::If,
+            "then" => TokenKind::Then,
+            "elseif" => TokenKind::Elseif,
+            "else" => TokenKind::Else,
+            "while" => TokenKind::While,
+            "do" => TokenKind::Do,
+            "for" => TokenKind::For,
             "boolean" => TokenKind::KwBoolean,
             "integer" => TokenKind::KwInteger,
             "float" => TokenKind::KwFloat,
@@ -462,7 +505,9 @@ impl<'a> Lexer<'a> {
             });
         }
 
-        // Símbolos suportados nesta fase: ( ) { } , : ; .. =
+        // Símbolos suportados: ( ) { } , : ; .. = e os operadores da Fase 1
+        // (+ - * / % ^ == ~= < > <= >=). Ambiguidades resolvidas com o mesmo
+        // lookahead de 1 char já usado para `.` vs `..`.
         let kind = match c {
             '(' => {
                 self.advance();
@@ -497,9 +542,71 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Concat
             }
+            '+' => {
+                self.advance();
+                TokenKind::Plus
+            }
+            // Um `-` que chega aqui nunca inicia `--`: `skip_trivia` já teria
+            // consumido o comentário.
+            '-' => {
+                self.advance();
+                TokenKind::Minus
+            }
+            '*' => {
+                self.advance();
+                TokenKind::Star
+            }
+            '/' => {
+                self.advance();
+                TokenKind::Slash
+            }
+            '%' => {
+                self.advance();
+                TokenKind::Percent
+            }
+            '^' => {
+                self.advance();
+                TokenKind::Caret
+            }
+            '=' if self.peek2() == Some('=') => {
+                self.advance();
+                self.advance();
+                TokenKind::Eq
+            }
             '=' => {
                 self.advance();
                 TokenKind::Assign
+            }
+            '<' if self.peek2() == Some('=') => {
+                self.advance();
+                self.advance();
+                TokenKind::Le
+            }
+            '<' => {
+                self.advance();
+                TokenKind::Lt
+            }
+            '>' if self.peek2() == Some('=') => {
+                self.advance();
+                self.advance();
+                TokenKind::Ge
+            }
+            '>' => {
+                self.advance();
+                TokenKind::Gt
+            }
+            '~' if self.peek2() == Some('=') => {
+                self.advance();
+                self.advance();
+                TokenKind::Ne
+            }
+            // `~` só existe em `~=` — sem bitwise nesta fase.
+            '~' => {
+                return Err(LexError {
+                    message: "'~' isolado não é um operador; use '~=' para desigualdade."
+                        .to_string(),
+                    loc,
+                });
             }
             other => {
                 return Err(LexError {
@@ -771,5 +878,194 @@ mod tests {
     fn numero_malformado_por_identificador_colado() {
         let err = lex("1337require").unwrap_err();
         assert!(err.message.contains("malformado"));
+    }
+
+    // ---- Fase 1 (T10): operadores e keywords de controle de fluxo ----
+
+    #[test]
+    fn reconhece_operadores_aritmeticos() {
+        assert_eq!(
+            kinds("+ - * / % ^"),
+            vec![
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+                TokenKind::Percent,
+                TokenKind::Caret,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn reconhece_operadores_relacionais() {
+        assert_eq!(
+            kinds("== ~= < > <= >="),
+            vec![
+                TokenKind::Eq,
+                TokenKind::Ne,
+                TokenKind::Lt,
+                TokenKind::Gt,
+                TokenKind::Le,
+                TokenKind::Ge,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn reconhece_keywords_logicas_e_de_controle_de_fluxo() {
+        assert_eq!(
+            kinds("and or not if then elseif else while do for"),
+            vec![
+                TokenKind::And,
+                TokenKind::Or,
+                TokenKind::Not,
+                TokenKind::If,
+                TokenKind::Then,
+                TokenKind::Elseif,
+                TokenKind::Else,
+                TokenKind::While,
+                TokenKind::Do,
+                TokenKind::For,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_nova_nao_casa_prefixo_de_identificador() {
+        // Mesma garantia do teste `localx`: `forma` não é `for` + `ma`.
+        assert_eq!(
+            kinds("forma iface ander"),
+            vec![
+                TokenKind::Name("forma".to_string()),
+                TokenKind::Name("iface".to_string()),
+                TokenKind::Name("ander".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn distingue_assign_de_eq() {
+        assert_eq!(
+            kinds("x = y == z"),
+            vec![
+                TokenKind::Name("x".to_string()),
+                TokenKind::Assign,
+                TokenKind::Name("y".to_string()),
+                TokenKind::Eq,
+                TokenKind::Name("z".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn distingue_menor_de_menor_igual() {
+        assert_eq!(
+            kinds("a < b <= c"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::Lt,
+                TokenKind::Name("b".to_string()),
+                TokenKind::Le,
+                TokenKind::Name("c".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn distingue_maior_de_maior_igual() {
+        assert_eq!(
+            kinds("a > b >= c"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::Gt,
+                TokenKind::Name("b".to_string()),
+                TokenKind::Ge,
+                TokenKind::Name("c".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn operadores_colados_sem_espaco() {
+        assert_eq!(
+            kinds("a<=b~=c==d"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::Le,
+                TokenKind::Name("b".to_string()),
+                TokenKind::Ne,
+                TokenKind::Name("c".to_string()),
+                TokenKind::Eq,
+                TokenKind::Name("d".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn concat_segue_intacto_apos_novos_operadores() {
+        assert_eq!(
+            kinds(r#""a" .. "b""#),
+            vec![
+                TokenKind::String("a".to_string()),
+                TokenKind::Concat,
+                TokenKind::String("b".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn menos_nao_confunde_com_comentario() {
+        assert_eq!(
+            kinds("1 - 2 -- comentário\n- 3"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Minus,
+                TokenKind::Integer(2),
+                TokenKind::Minus,
+                TokenKind::Integer(3),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn expressao_aritmetica_completa() {
+        assert_eq!(
+            kinds("(1 + 2) * 3 ^ 4 % 5 / 6"),
+            vec![
+                TokenKind::LParen,
+                TokenKind::Integer(1),
+                TokenKind::Plus,
+                TokenKind::Integer(2),
+                TokenKind::RParen,
+                TokenKind::Star,
+                TokenKind::Integer(3),
+                TokenKind::Caret,
+                TokenKind::Integer(4),
+                TokenKind::Percent,
+                TokenKind::Integer(5),
+                TokenKind::Slash,
+                TokenKind::Integer(6),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn til_isolado_produz_erro_lexico_com_posicao() {
+        let err = lex("a ~ b").unwrap_err();
+        assert!(err.message.contains("'~'"));
+        assert!(err.message.contains("'~='"));
+        assert_eq!(err.loc, Loc { line: 1, col: 3 });
     }
 }
