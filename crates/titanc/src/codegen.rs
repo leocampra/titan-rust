@@ -177,6 +177,13 @@ fn emit_exp(exp: &TypedExp) -> String {
         TypedExpKind::Var(name) => name.clone(),
         TypedExpKind::Concat(exps) => emit_concat(exps),
         TypedExpKind::Call { callee, args } => emit_call(callee, args),
+        // O checker (T13) já aceita operadores binários/unários, mas a
+        // geração de código deles chega na T14 — mesmo padrão do
+        // `compile_error!` dos statements do T12.
+        TypedExpKind::Binop { .. } | TypedExpKind::Unop { .. } => {
+            "compile_error!(\"operadores ainda não têm geração de código (chega na tarefa T14)\")"
+                .to_string()
+        }
     }
 }
 
@@ -201,14 +208,22 @@ fn emit_concat(exps: &[TypedExp]) -> String {
     let first = parts
         .next()
         .expect("checker garante ExpConcat com ao menos um operando");
-    let mut acc = coerce_to_borrowed_str(first);
+    let mut acc = concat_operand(first);
     for e in parts {
-        acc = format!(
-            "titan_runtime::concat({acc}, {})",
-            coerce_to_borrowed_str(e)
-        );
+        acc = format!("titan_runtime::concat({acc}, {})", concat_operand(e));
     }
     acc
+}
+
+/// Operando de `..`: o checker (T13) já aceita `Integer`/`Float` (decisão 4
+/// da Fase 1), mas a conversão número→string chega na T14 — até lá, mesmo
+/// padrão do `compile_error!` dos statements sem codegen.
+fn concat_operand(exp: &TypedExp) -> String {
+    if matches!(exp.ty, Type::Integer | Type::Float) {
+        return "compile_error!(\"número em `..` ainda não tem geração de código (chega na tarefa T14)\")"
+            .to_string();
+    }
+    coerce_to_borrowed_str(exp)
 }
 
 fn emit_call(callee: &str, args: &[TypedExp]) -> String {

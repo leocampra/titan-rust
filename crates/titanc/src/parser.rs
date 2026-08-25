@@ -940,7 +940,10 @@ end"#,
              \x20   end\n\
              end",
         );
-        let Stat::StatIf { thens, elsestat, .. } = &stats[0] else {
+        let Stat::StatIf {
+            thens, elsestat, ..
+        } = &stats[0]
+        else {
             panic!("esperava StatIf, obteve {:?}", stats[0]);
         };
         assert_eq!(thens.len(), 2);
@@ -957,7 +960,10 @@ end"#,
         let stats = stats_da_primeira_funcao(
             "function f(a: boolean): integer\n    if a then\n    end\n    return 0\nend",
         );
-        let Stat::StatIf { thens, elsestat, .. } = &stats[0] else {
+        let Stat::StatIf {
+            thens, elsestat, ..
+        } = &stats[0]
+        else {
             panic!("esperava StatIf");
         };
         assert_eq!(thens.len(), 1);
@@ -1010,7 +1016,11 @@ end"#,
             "function f(): integer\n    for i = 1, 10 do\n    end\n    return 0\nend",
         );
         let Stat::StatFor {
-            decl, start, finish, inc, ..
+            decl,
+            start,
+            finish,
+            inc,
+            ..
         } = &stats[0]
         else {
             panic!("esperava StatFor, obteve {:?}", stats[0]);
@@ -1065,13 +1075,15 @@ end"#,
 
     #[test]
     fn for_sem_limite_final_produz_erro_claro() {
-        let err = parse_source("function f(): integer\n    for x = 1 do\n    end\nend").unwrap_err();
+        let err =
+            parse_source("function f(): integer\n    for x = 1 do\n    end\nend").unwrap_err();
         assert!(err.message.contains("','"), "obteve: {}", err.message);
     }
 
     #[test]
     fn atribuir_a_chamada_produz_erro_claro() {
-        let err = parse_source("function f(): integer\n    f() = 1\n    return 0\nend").unwrap_err();
+        let err =
+            parse_source("function f(): integer\n    f() = 1\n    return 0\nend").unwrap_err();
         assert!(
             err.message.contains("atribuir a uma chamada de função"),
             "obteve: {}",
@@ -1081,8 +1093,8 @@ end"#,
 
     #[test]
     fn operador_sem_operando_produz_erro_claro() {
-        let err = parse_source("function f(): integer\n    local x: integer = 1 + = 2\nend")
-            .unwrap_err();
+        let err =
+            parse_source("function f(): integer\n    local x: integer = 1 + = 2\nend").unwrap_err();
         assert!(err.message.contains("expressão"), "obteve: {}", err.message);
     }
 

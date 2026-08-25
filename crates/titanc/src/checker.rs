@@ -1,7 +1,7 @@
 //! Análise semântica e verificação de tipos do Titan.
 //!
 //! Espelha a estratégia de `titan/titan-compiler/checker.lua` (1662 linhas),
-//! reduzida ao subconjunto das Fases 0 e 1 (T5 e T12 do PRD.md):
+//! reduzida ao subconjunto das Fases 0 e 1 (T5, T12 e T13 do PRD.md):
 //!
 //! - **Duas passadas**, como o Titan: (1) coleta as assinaturas top-level,
 //!   permitindo chamada antes da declaração; (2) verifica os corpos,
@@ -16,6 +16,11 @@
 //!   (`checker.lua:365-368` e `447-457`), `for` numérico espelhando
 //!   `checkfor` (`checker.lua:239-288`) e atribuição single-target
 //!   (`checker.lua:378-410`).
+//! - Operadores da Fase 1 (T13): regras de tipo espelhando
+//!   `checker.lua:910-1122` (sem bitwise/gradual typing), com a coerção
+//!   int→float centralizada em `numeric_result`. O checker **não** emite nó
+//!   de cast: o codegen decide o `as f64` comparando o tipo do operando com
+//!   o tipo do resultado.
 //! - **Rastreio de mutabilidade** (decisão 6 da Fase 1): cada `local` recebe
 //!   um id; atribuições registram o id do símbolo resolvido (mesmo espírito
 //!   do `var._decl._assigned = true` do original) e um fix-up ao final do
@@ -182,7 +187,9 @@ pub enum TypedStat {
         finish: TypedExp,
         /// Sempre presente: quando omitido no fonte, vira `1`/`1.0` conforme
         /// o tipo da variável (como `checkfor`, `checker.lua:258-268`).
-        inc: TypedExp,
+        /// `Box` para a variante não inflar o `TypedStat` inteiro
+        /// (clippy `large_enum_variant`).
+        inc: Box<TypedExp>,
         block: Box<TypedStat>,
     },
     Assign {
@@ -215,8 +222,73 @@ pub enum TypedExpKind {
     Float(f64),
     String(String),
     Var(String),
-    Call { callee: String, args: Vec<TypedExp> },
+    Call {
+        callee: String,
+        args: Vec<TypedExp>,
+    },
     Concat(Vec<TypedExp>),
+    Binop {
+        op: BinOp,
+        lhs: Box<TypedExp>,
+        rhs: Box<TypedExp>,
+    },
+    Unop {
+        op: UnOp,
+        exp: Box<TypedExp>,
+    },
+}
+
+/// Operador binário já resolvido (T13). Enum, não `String`, para o `match`
+/// do codegen ser exaustivo; a conversão a partir da grafia do fonte
+/// acontece uma única vez, em `check_binop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+}
+
+impl BinOp {
+    /// Grafia do operador no fonte Titan — as mesmas strings que o parser
+    /// coloca em `ExpBinop.op`. `None` para operadores fora do subconjunto
+    /// (bitwise, `//`), que viram erro claro no chamador.
+    fn from_source(op: &str) -> Option<BinOp> {
+        Some(match op {
+            "+" => BinOp::Add,
+            "-" => BinOp::Sub,
+            "*" => BinOp::Mul,
+            "/" => BinOp::Div,
+            "%" => BinOp::Mod,
+            "^" => BinOp::Pow,
+            "==" => BinOp::Eq,
+            "~=" => BinOp::Ne,
+            "<" => BinOp::Lt,
+            ">" => BinOp::Gt,
+            "<=" => BinOp::Le,
+            ">=" => BinOp::Ge,
+            "and" => BinOp::And,
+            "or" => BinOp::Or,
+            _ => return None,
+        })
+    }
+}
+
+/// Operador unário já resolvido (T13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+    Not,
 }
 
 // ---- Checker -------------------------------------------------------------
@@ -730,12 +802,9 @@ impl Checker {
         }
 
         let mut ok = true;
-        for (typed, papel) in [
-            (&typed_start, "valor inicial"),
-            (&typed_finish, "limite"),
-        ]
-        .into_iter()
-        .chain(typed_inc.iter().map(|t| (t, "passo")))
+        for (typed, papel) in [(&typed_start, "valor inicial"), (&typed_finish, "limite")]
+            .into_iter()
+            .chain(typed_inc.iter().map(|t| (t, "passo")))
         {
             if !typed.ty.equals(&var_ty) {
                 self.error(
@@ -778,7 +847,7 @@ impl Checker {
             ty: var_ty,
             start: typed_start,
             finish: typed_finish,
-            inc: typed_inc,
+            inc: Box::new(typed_inc),
             block: Box::new(typed_block?),
         })
     }
@@ -879,11 +948,18 @@ impl Checker {
                 for e in exps {
                     match self.check_exp(e) {
                         Some(typed) => {
-                            if !matches!(typed.ty, Type::String | Type::Value) {
+                            // Decisão 4 da Fase 1: `..` coage número→string
+                            // (espírito do `trytostr` do original) — a
+                            // conversão em si fica no codegen. `Boolean` e
+                            // `Nil` seguem rejeitados.
+                            if !matches!(
+                                typed.ty,
+                                Type::String | Type::Integer | Type::Float | Type::Value
+                            ) {
                                 self.error(
                                     typed.loc,
                                     format!(
-                                        "operando de `..` precisa ser string, encontrado {}.",
+                                        "operando de `..` precisa ser string, integer ou float, encontrado {}.",
                                         type_name(&typed.ty)
                                     ),
                                 );
@@ -911,17 +987,8 @@ impl Checker {
                 );
                 None
             }
-            Exp::ExpUnop { loc, .. } => {
-                self.error(*loc, "operador unário não é suportado nesta fase.");
-                None
-            }
-            Exp::ExpBinop { loc, .. } => {
-                self.error(
-                    *loc,
-                    "operador binário aritmético/lógico não é suportado nesta fase.",
-                );
-                None
-            }
+            Exp::ExpUnop { loc, op, exp } => self.check_unop(*loc, op, exp),
+            Exp::ExpBinop { loc, lhs, op, rhs } => self.check_binop(*loc, op, lhs, rhs),
             Exp::ExpCast { loc, .. } => {
                 self.error(*loc, "cast de tipo (`as`) não é suportado nesta fase.");
                 None
@@ -934,6 +1001,186 @@ impl Checker {
                 None
             }
         }
+    }
+
+    /// Regras de tipo dos operadores binários (T13), espelhando
+    /// `checker.lua:910-1122` sem bitwise nem gradual typing.
+    fn check_binop(&mut self, loc: Loc, op_str: &str, lhs: &Exp, rhs: &Exp) -> Option<TypedExp> {
+        let Some(op) = BinOp::from_source(op_str) else {
+            self.error(
+                loc,
+                format!("operador `{op_str}` não é suportado nesta fase."),
+            );
+            return None;
+        };
+
+        let lhs = self.check_exp(lhs)?;
+        let rhs = self.check_exp(rhs)?;
+
+        let ty = match op {
+            // Ambos numéricos; int/int → int, qualquer float promove a float.
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
+                if !self.check_numeric_operands(op_str, &lhs, &rhs) {
+                    return None;
+                }
+                numeric_result(&lhs.ty, &rhs.ty)
+            }
+            // `/` e `^` sempre coagem ambos para float — mesmo int/int
+            // (`checker.lua:975-994`).
+            BinOp::Div | BinOp::Pow => {
+                if !self.check_numeric_operands(op_str, &lhs, &rhs) {
+                    return None;
+                }
+                Type::Float
+            }
+            // Igualdade: número com número (com coerção int→float),
+            // string/string ou boolean/boolean.
+            BinOp::Eq | BinOp::Ne => {
+                let both_numeric = is_numeric(&lhs.ty) && is_numeric(&rhs.ty);
+                let same_primitive =
+                    lhs.ty.equals(&rhs.ty) && matches!(lhs.ty, Type::String | Type::Boolean);
+                if !(both_numeric || same_primitive) {
+                    self.error(
+                        loc,
+                        format!(
+                            "não é possível comparar {} com {} usando `{op_str}`.",
+                            type_name(&lhs.ty),
+                            type_name(&rhs.ty)
+                        ),
+                    );
+                    return None;
+                }
+                Type::Boolean
+            }
+            // Ordem: número com número (com coerção) ou string com string —
+            // nunca boolean (`checker.lua:1010-1043`).
+            BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                let both_numeric = is_numeric(&lhs.ty) && is_numeric(&rhs.ty);
+                let both_string = lhs.ty.equals(&Type::String) && rhs.ty.equals(&Type::String);
+                if !(both_numeric || both_string) {
+                    self.error(
+                        loc,
+                        format!(
+                            "`{op_str}` compara número com número ou string com string, encontrado {} e {}.",
+                            type_name(&lhs.ty),
+                            type_name(&rhs.ty)
+                        ),
+                    );
+                    return None;
+                }
+                Type::Boolean
+            }
+            // Decisão 7 da Fase 1: `and`/`or` boolean estrito nos dois lados,
+            // resultado boolean (viram `&&`/`||` no codegen). Divergência
+            // deliberada do truthy/falsy do original (`checker.lua:996-1008`):
+            // sem `Value`/`Option` em uso nesta fase, o tipo-união que o Lua
+            // devolveria não tem representação útil aqui.
+            BinOp::And | BinOp::Or => {
+                let mut ok = true;
+                for side in [&lhs, &rhs] {
+                    if !side.ty.equals(&Type::Boolean) {
+                        self.error(
+                            side.loc,
+                            format!(
+                                "operando de `{op_str}` precisa ser boolean, encontrado {}.",
+                                type_name(&side.ty)
+                            ),
+                        );
+                        ok = false;
+                    }
+                }
+                if !ok {
+                    return None;
+                }
+                Type::Boolean
+            }
+        };
+
+        Some(TypedExp {
+            loc,
+            ty,
+            kind: TypedExpKind::Binop {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+        })
+    }
+
+    /// Reporta um erro por lado não-numérico de um operador aritmético,
+    /// apontando o `loc` do operando culpado.
+    fn check_numeric_operands(&mut self, op_str: &str, lhs: &TypedExp, rhs: &TypedExp) -> bool {
+        let mut ok = true;
+        for side in [lhs, rhs] {
+            if !is_numeric(&side.ty) {
+                self.error(
+                    side.loc,
+                    format!(
+                        "operando de `{op_str}` precisa ser numérico (integer ou float), encontrado {}.",
+                        type_name(&side.ty)
+                    ),
+                );
+                ok = false;
+            }
+        }
+        ok
+    }
+
+    /// Regras de tipo dos operadores unários (T13): `-` numérico preserva o
+    /// tipo do operando; `not` é boolean → boolean (`checker.lua:1100-1122`).
+    fn check_unop(&mut self, loc: Loc, op_str: &str, exp: &Exp) -> Option<TypedExp> {
+        let op = match op_str {
+            "-" => UnOp::Neg,
+            "not" => UnOp::Not,
+            // O parser (T11) só produz `-` e `not`; defensivo para AST
+            // montada à mão (`#`, `~`).
+            _ => {
+                self.error(
+                    loc,
+                    format!("operador unário `{op_str}` não é suportado nesta fase."),
+                );
+                return None;
+            }
+        };
+
+        let exp = self.check_exp(exp)?;
+        let ty = match op {
+            UnOp::Neg => {
+                if !is_numeric(&exp.ty) {
+                    self.error(
+                        exp.loc,
+                        format!(
+                            "operando de `-` unário precisa ser numérico (integer ou float), encontrado {}.",
+                            type_name(&exp.ty)
+                        ),
+                    );
+                    return None;
+                }
+                exp.ty.clone()
+            }
+            UnOp::Not => {
+                if !exp.ty.equals(&Type::Boolean) {
+                    self.error(
+                        exp.loc,
+                        format!(
+                            "operando de `not` precisa ser boolean, encontrado {}.",
+                            type_name(&exp.ty)
+                        ),
+                    );
+                    return None;
+                }
+                Type::Boolean
+            }
+        };
+
+        Some(TypedExp {
+            loc,
+            ty,
+            kind: TypedExpKind::Unop {
+                op,
+                exp: Box::new(exp),
+            },
+        })
     }
 
     fn check_var(&mut self, _loc: &Loc, var: &Var) -> Option<TypedExp> {
@@ -1078,6 +1325,24 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
             fixup_mutability(block, assigned);
         }
         TypedStat::Call { .. } | TypedStat::Return { .. } | TypedStat::Assign { .. } => {}
+    }
+}
+
+/// `true` para os tipos que participam da aritmética e da coerção int→float.
+fn is_numeric(ty: &Type) -> bool {
+    matches!(ty, Type::Integer | Type::Float)
+}
+
+/// Coerção numérica int→float centralizada (T13): o tipo resultante de
+/// combinar dois operandos **já validados** como numéricos — `Integer` só
+/// quando os dois lados são `Integer`; qualquer `Float` promove o resultado
+/// a `Float`. O checker não emite nó de cast: o codegen compara o tipo do
+/// operando com o do resultado para decidir o `as f64`.
+fn numeric_result(lhs: &Type, rhs: &Type) -> Type {
+    if lhs.equals(&Type::Integer) && rhs.equals(&Type::Integer) {
+        Type::Integer
+    } else {
+        Type::Float
     }
 }
 
@@ -1251,7 +1516,10 @@ mod tests {
         }];
 
         let errs = check(&program).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("atribuição múltipla")));
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("atribuição múltipla"))
+        );
     }
 
     #[test]
@@ -1423,7 +1691,10 @@ end"#;
              \x20   return 0\n\
              end";
         let errs = check_source(source).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("'i' não foi declarado")));
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'i' não foi declarado"))
+        );
     }
 
     #[test]
@@ -1451,7 +1722,10 @@ end"#;
     fn atribuicao_sem_declaracao_produz_erro() {
         let source = "function main(args: {string}): integer\n    x = 10\n    return 0\nend";
         let errs = check_source(source).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("'x' não foi declarado")));
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'x' não foi declarado"))
+        );
     }
 
     #[test]
@@ -1533,7 +1807,10 @@ end"#;
         let TypedStat::Decl { mutable, .. } = &stats[0] else {
             panic!("esperava TypedStat::Decl externa");
         };
-        assert!(!*mutable, "a externa nunca é atingida — o `x = 3` resolve para a interna");
+        assert!(
+            !*mutable,
+            "a externa nunca é atingida — o `x = 3` resolve para a interna"
+        );
 
         let TypedStat::If { thens, .. } = &stats[1] else {
             panic!("esperava TypedStat::If");
@@ -1545,5 +1822,270 @@ end"#;
             panic!("esperava TypedStat::Decl interna");
         };
         assert!(*mutable, "a interna é a atingida pelo `x = 3`");
+    }
+
+    // ---- Fase 1 (T13): operadores binários/unários e coerção ------------
+
+    /// Verifica `local r = <exp_src>` e devolve a expressão tipada.
+    fn typed_value_of(exp_src: &str) -> TypedExp {
+        let source = format!(
+            "function main(args: {{string}}): integer\n    local r = {exp_src}\n    return 0\nend"
+        );
+        let stats = typed_body_stats(&source);
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl, obteve {:?}", stats[0]);
+        };
+        value.clone()
+    }
+
+    /// Verifica `local r = <exp_src>` esperando falha e devolve os erros.
+    fn exp_errors_of(exp_src: &str) -> Vec<CheckError> {
+        let source = format!(
+            "function main(args: {{string}}): integer\n    local r = {exp_src}\n    return 0\nend"
+        );
+        check_source(&source).unwrap_err()
+    }
+
+    #[test]
+    fn aritmetica_int_int_resulta_integer() {
+        for exp in ["1 + 2", "5 - 1", "3 * 4", "7 % 3"] {
+            let typed = typed_value_of(exp);
+            assert_eq!(typed.ty, Type::Integer, "tipo de `{exp}`");
+            assert!(
+                matches!(typed.kind, TypedExpKind::Binop { .. }),
+                "esperava Binop para `{exp}`"
+            );
+        }
+        let typed = typed_value_of("1 + 2");
+        assert!(matches!(
+            typed.kind,
+            TypedExpKind::Binop { op: BinOp::Add, .. }
+        ));
+    }
+
+    #[test]
+    fn aritmetica_com_um_lado_float_coage_para_float() {
+        for exp in ["1 + 2.0", "2.0 * 3", "1.5 - 0.5", "7.0 % 3"] {
+            assert_eq!(typed_value_of(exp).ty, Type::Float, "tipo de `{exp}`");
+        }
+    }
+
+    #[test]
+    fn divisao_e_potencia_resultam_sempre_float() {
+        // `/` e `^` coagem ambos os lados mesmo quando int/int.
+        for exp in ["10 / 3", "2 ^ 10", "1.5 / 0.5"] {
+            assert_eq!(typed_value_of(exp).ty, Type::Float, "tipo de `{exp}`");
+        }
+        assert!(matches!(
+            typed_value_of("2 ^ 10").kind,
+            TypedExpKind::Binop { op: BinOp::Pow, .. }
+        ));
+    }
+
+    #[test]
+    fn aritmetica_com_operando_nao_numerico_produz_erro() {
+        let errs = exp_errors_of("1 + \"a\"");
+        assert!(errs.iter().any(|e| e.message.contains("numérico")));
+
+        // Os dois lados errados → um erro por lado.
+        let errs = exp_errors_of("true + false");
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.message.contains("numérico"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn igualdade_de_tipos_comparaveis_resulta_boolean() {
+        for exp in ["1 == 1.0", "\"a\" ~= \"b\"", "true == false"] {
+            assert_eq!(typed_value_of(exp).ty, Type::Boolean, "tipo de `{exp}`");
+        }
+        assert!(matches!(
+            typed_value_of("1 ~= 2").kind,
+            TypedExpKind::Binop { op: BinOp::Ne, .. }
+        ));
+    }
+
+    #[test]
+    fn igualdade_entre_tipos_diferentes_produz_erro() {
+        let errs = exp_errors_of("1 == \"a\"");
+        assert!(errs.iter().any(|e| {
+            e.message
+                .contains("não é possível comparar integer com string")
+        }));
+    }
+
+    #[test]
+    fn ordem_aceita_numeros_com_coercao_e_strings() {
+        for exp in ["1 < 2.0", "2 >= 2", "\"a\" < \"b\""] {
+            assert_eq!(typed_value_of(exp).ty, Type::Boolean, "tipo de `{exp}`");
+        }
+    }
+
+    #[test]
+    fn ordem_com_boolean_ou_tipos_misturados_produz_erro() {
+        for exp in ["true < false", "\"a\" < 1"] {
+            let errs = exp_errors_of(exp);
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("número com número ou string com string")),
+                "esperava erro de ordem para `{exp}`"
+            );
+        }
+    }
+
+    #[test]
+    fn and_or_boolean_estrito() {
+        // Decisão 7: os dois lados boolean, resultado boolean.
+        for exp in ["true and false", "true or false", "1 < 2 and 3 < 4"] {
+            assert_eq!(typed_value_of(exp).ty, Type::Boolean, "tipo de `{exp}`");
+        }
+
+        let errs = exp_errors_of("1 and 2");
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.message.contains("precisa ser boolean"))
+                .count(),
+            2,
+            "um erro por lado não-boolean"
+        );
+        let errs = exp_errors_of("true or 1");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("precisa ser boolean"))
+        );
+    }
+
+    #[test]
+    fn menos_unario_preserva_o_tipo_do_operando() {
+        assert_eq!(typed_value_of("-1").ty, Type::Integer);
+        assert_eq!(typed_value_of("-1.5").ty, Type::Float);
+        // `- -1` aninhado segue integer.
+        let typed = typed_value_of("- -1");
+        assert_eq!(typed.ty, Type::Integer);
+        assert!(matches!(
+            typed.kind,
+            TypedExpKind::Unop { op: UnOp::Neg, .. }
+        ));
+    }
+
+    #[test]
+    fn not_e_boolean_para_boolean() {
+        assert_eq!(typed_value_of("not true").ty, Type::Boolean);
+        assert_eq!(typed_value_of("not not false").ty, Type::Boolean);
+    }
+
+    #[test]
+    fn unario_com_tipo_errado_produz_erro() {
+        let errs = exp_errors_of("-\"a\"");
+        assert!(errs.iter().any(|e| e.message.contains("numérico")));
+
+        let errs = exp_errors_of("not 1");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("precisa ser boolean"))
+        );
+    }
+
+    #[test]
+    fn concat_coage_numeros_para_string() {
+        // Decisão 4: `"x: " .. 42` funciona — o número vira string no codegen.
+        for exp in ["\"x: \" .. 42", "\"y: \" .. 1.5", "1 .. \"!\""] {
+            let typed = typed_value_of(exp);
+            assert_eq!(typed.ty, Type::String, "tipo de `{exp}`");
+            assert!(matches!(typed.kind, TypedExpKind::Concat(_)));
+        }
+    }
+
+    #[test]
+    fn concat_com_boolean_ou_nil_produz_erro() {
+        for exp in ["true .. \"x\"", "\"x\" .. nil"] {
+            let errs = exp_errors_of(exp);
+            assert!(
+                errs.iter().any(|e| e.message.contains("operando de `..`")),
+                "esperava erro de concat para `{exp}`"
+            );
+        }
+    }
+
+    #[test]
+    fn binop_relacional_serve_de_condicao_de_if_e_while() {
+        // Integração T12+T13: o resultado Boolean dos relacionais satisfaz
+        // a checagem de condição.
+        check_source(
+            "function main(args: {string}): integer\n\
+             \x20   if 1 < 2 then\n\
+             \x20       return 1\n\
+             \x20   end\n\
+             \x20   while 1 > 2 do\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn operadores_fora_do_subconjunto_montados_a_mao_produzem_erro() {
+        // O parser (T11) nunca produz `//` nem `#` — AST montada à mão para
+        // exercitar o braço defensivo `_` da conversão String → BinOp/UnOp.
+        let loc = Loc { line: 1, col: 1 };
+        let program: Program = vec![TopLevel::TopLevelFunc {
+            loc,
+            islocal: false,
+            name: "main".to_string(),
+            params: vec![Decl {
+                loc,
+                name: "args".to_string(),
+                r#type: Some(ast::Type::TypeArray {
+                    loc,
+                    subtype: Box::new(ast::Type::TypeString { loc }),
+                }),
+                option: false,
+            }],
+            rettypes: vec![ast::Type::TypeInteger { loc }],
+            block: Stat::StatBlock {
+                loc,
+                stats: vec![Stat::StatReturn {
+                    loc,
+                    exps: vec![
+                        Exp::ExpBinop {
+                            loc,
+                            lhs: Box::new(Exp::ExpInteger { loc, value: 1 }),
+                            op: "//".to_string(),
+                            rhs: Box::new(Exp::ExpInteger { loc, value: 2 }),
+                        },
+                        Exp::ExpUnop {
+                            loc,
+                            op: "#".to_string(),
+                            exp: Box::new(Exp::ExpString {
+                                loc,
+                                value: "a".to_string(),
+                            }),
+                        },
+                    ],
+                }],
+            },
+        }];
+
+        let errs = check(&program).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("operador `//` não é suportado"))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("operador unário `#` não é suportado"))
+        );
     }
 }
