@@ -10,6 +10,7 @@
 // de referência viva — ver PRD.md, tarefa T1.
 #[allow(dead_code, clippy::enum_variant_names)]
 mod ast;
+mod builtins;
 mod checker;
 mod codegen;
 mod driver;

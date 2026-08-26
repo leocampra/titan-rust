@@ -22,7 +22,9 @@
 //! Nada aqui assume que valores são `Copy` — ver aviso no PRD.md sobre a
 //! Fase 2.
 
-use crate::checker::{BinOp, TypedExp, TypedExpKind, TypedProgram, TypedStat, TypedTopLevel, UnOp};
+use crate::checker::{
+    BinOp, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedTopLevel, UnOp,
+};
 use crate::types::Type;
 
 const INDENT: &str = "    ";
@@ -65,7 +67,13 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel) {
         rettypes,
         body,
         ..
-    } = top;
+    } = top
+    else {
+        // T25 (estrutural): `checker::collect_signature` rejeita `record`
+        // com erro claro antes da passada 2 — `TypedTopLevel::Record` nunca
+        // chega ao codegen nesta fase. T26 é quem dá suporte real.
+        unreachable!("`TypedTopLevel::Record` fora do subconjunto de codegen suportado nesta fase")
+    };
 
     if *islocal {
         // `local function` não é visível fora do arquivo gerado.
@@ -155,7 +163,27 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             collect_referenced_names_exp(inc, names);
             collect_referenced_names_stat(block, names);
         }
-        TypedStat::Assign { value, .. } => collect_referenced_names_exp(value, names),
+        TypedStat::Assign { target, value, .. } => {
+            collect_referenced_names_lvalue(target, names);
+            collect_referenced_names_exp(value, names);
+        }
+    }
+}
+
+/// Alvo de atribuição (T25): `Name` não lê nada (é o próprio destino), mas
+/// `Index`/`Field` embutem uma expressão-base que pode referenciar um nome —
+/// sem produtor ainda (T29/T30), mas o `match` já precisa ser exaustivo.
+fn collect_referenced_names_lvalue(
+    target: &TypedLValue,
+    names: &mut std::collections::HashSet<String>,
+) {
+    match target {
+        TypedLValue::Name(_) => {}
+        TypedLValue::Index { base, index } => {
+            collect_referenced_names_exp(base, names);
+            collect_referenced_names_exp(index, names);
+        }
+        TypedLValue::Field { base, .. } => collect_referenced_names_exp(base, names),
     }
 }
 
@@ -179,6 +207,27 @@ fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::Ha
             collect_referenced_names_exp(rhs, names);
         }
         TypedExpKind::Unop { exp, .. } => collect_referenced_names_exp(exp, names),
+        TypedExpKind::Index { base, index } => {
+            collect_referenced_names_exp(base, names);
+            collect_referenced_names_exp(index, names);
+        }
+        TypedExpKind::Field { base, .. } => collect_referenced_names_exp(base, names),
+        TypedExpKind::ArrayLit(exps) => {
+            for e in exps {
+                collect_referenced_names_exp(e, names);
+            }
+        }
+        TypedExpKind::RecordLit { fields, .. } => {
+            for (_, e) in fields {
+                collect_referenced_names_exp(e, names);
+            }
+        }
+        TypedExpKind::MapLit(entries) => {
+            for (k, v) in entries {
+                collect_referenced_names_exp(k, names);
+                collect_referenced_names_exp(v, names);
+            }
+        }
         TypedExpKind::Nil
         | TypedExpKind::Bool(_)
         | TypedExpKind::Integer(_)
@@ -278,8 +327,17 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize) {
             indent(out, depth);
             out.push_str("}\n");
         }
-        TypedStat::Assign { name, value, .. } => {
+        TypedStat::Assign { target, value, .. } => {
             indent(out, depth);
+            let TypedLValue::Name(name) = target else {
+                // T25 (estrutural): `checker::check_assign` só constrói
+                // `TypedLValue::Name` nesta fase — `Index`/`Field` são
+                // rejeitados com erro claro antes de chegar aqui. T29/T30
+                // são quem dão suporte real.
+                unreachable!(
+                    "`TypedLValue::Index`/`Field` fora do subconjunto de codegen suportado nesta fase"
+                )
+            };
             out.push_str(name);
             out.push_str(" = ");
             // O tipo do valor serve de tipo do slot: o checker garantiu que
@@ -375,6 +433,17 @@ fn emit_exp(exp: &TypedExp) -> String {
         } => emit_pow(lhs, rhs),
         TypedExpKind::Binop { op, lhs, rhs } => format!("({})", emit_binop(*op, lhs, rhs, &exp.ty)),
         TypedExpKind::Unop { op, exp: operand } => format!("({})", emit_unop(*op, operand)),
+        // T25 (estrutural): sem produtor ainda nesta fase — o checker
+        // rejeita `v[i]`, `p.campo` e `{...}` com erro claro antes de o
+        // codegen ser alcançado. T29–T33 são quem dão suporte real.
+        TypedExpKind::Index { .. }
+        | TypedExpKind::Field { .. }
+        | TypedExpKind::ArrayLit(_)
+        | TypedExpKind::RecordLit { .. }
+        | TypedExpKind::MapLit(_) => unreachable!(
+            "nó `{:?}` fora do subconjunto de codegen suportado nesta fase",
+            exp.kind
+        ),
     }
 }
 
@@ -526,6 +595,11 @@ fn emit_unop(op: UnOp, operand: &TypedExp) -> String {
     match op {
         UnOp::Neg => format!("-{}", emit_exp(operand)),
         UnOp::Not => format!("!{}", emit_exp(operand)),
+        // T25 (estrutural): `check_unop` nunca produz `Len` nesta fase — o
+        // parser não emite `#` como operador aceito. Sem produtor ainda.
+        UnOp::Len => unreachable!(
+            "`UnOp::Len` fora do subconjunto de codegen suportado nesta fase"
+        ),
     }
 }
 
@@ -578,9 +652,9 @@ fn emit_concat(exps: &[TypedExp]) -> String {
 /// escondida do chamador). Reusa [`emit_owned_string`] para strings; o resto
 /// segue a posição delimitada normal.
 fn emit_call(callee: &str, args: &[TypedExp]) -> String {
-    if callee == "print" {
+    if let Some(builtin) = crate::builtins::lookup(callee) {
         let rendered_args: Vec<String> = args.iter().map(borrow_runtime_str).collect();
-        return format!("titan_runtime::print({})", rendered_args.join(", "));
+        return format!("{}({})", builtin.rust_path, rendered_args.join(", "));
     }
     let rendered_args: Vec<String> = args
         .iter()

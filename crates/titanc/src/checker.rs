@@ -138,7 +138,18 @@ pub enum TypedTopLevel {
         name: String,
         params: Vec<(String, Type)>,
         rettypes: Vec<Type>,
-        body: TypedStat,
+        /// `Box` para a variante não inflar `TypedTopLevel` inteiro (clippy
+        /// `large_enum_variant`) — mesmo espírito do `Box` em
+        /// `TypedStat::For.inc`.
+        body: Box<TypedStat>,
+    },
+    /// Declaração de `record` (T25 — estrutural: T26 é quem passa a aceitar
+    /// `record` na passada 1; até lá, `collect_signature` continua
+    /// rejeitando-o com erro claro, e esta variante nunca é construída).
+    Record {
+        loc: Loc,
+        name: String,
+        fields: Vec<(String, Type)>,
     },
 }
 
@@ -194,8 +205,25 @@ pub enum TypedStat {
     },
     Assign {
         loc: Loc,
-        name: String,
+        target: TypedLValue,
         value: TypedExp,
+    },
+}
+
+/// Alvo de uma atribuição já verificado (T25 — estrutural; T29/T30 são quem
+/// passam a construir `Index`/`Field`). `Name` é o único alvo que a passada 2
+/// constrói nesta fase — `v[i] = x` e `p.campo = x` seguem rejeitados em
+/// `check_assign` até essas tarefas.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedLValue {
+    Name(String),
+    Index {
+        base: Box<TypedExp>,
+        index: Box<TypedExp>,
+    },
+    Field {
+        base: Box<TypedExp>,
+        name: String,
     },
 }
 
@@ -236,6 +264,31 @@ pub enum TypedExpKind {
         op: UnOp,
         exp: Box<TypedExp>,
     },
+    /// `v[i]` (T25 — estrutural; T29 é quem passa a construir este nó em
+    /// `check_var`, que hoje rejeita `VarBracket` com erro claro).
+    Index {
+        base: Box<TypedExp>,
+        index: Box<TypedExp>,
+    },
+    /// `p.campo` (T25 — estrutural; T30 é quem passa a construir este nó em
+    /// `check_var`, que hoje rejeita `VarDot` com erro claro).
+    Field {
+        base: Box<TypedExp>,
+        name: String,
+    },
+    /// `{1, 2, 3}` desambiguado como array pelo checker (T25 — estrutural;
+    /// T31 constrói). Três nós de literal distintos, não um `InitList`
+    /// genérico, porque a desambiguação já aconteceu aqui — o codegen ganha
+    /// `match` exaustivo em vez de reinspecionar os campos.
+    ArrayLit(Vec<TypedExp>),
+    /// `Nome{x = 1, y = 2}` desambiguado como record (T25 — estrutural; T32
+    /// constrói).
+    RecordLit {
+        type_name: String,
+        fields: Vec<(String, TypedExp)>,
+    },
+    /// `{["a"] = 1}` desambiguado como map (T25 — estrutural; T33 constrói).
+    MapLit(Vec<(TypedExp, TypedExp)>),
 }
 
 /// Operador binário já resolvido (T13). Enum, não `String`, para o `match`
@@ -284,11 +337,14 @@ impl BinOp {
     }
 }
 
-/// Operador unário já resolvido (T13).
+/// Operador unário já resolvido (T13; `Len` acrescentado estruturalmente na
+/// T25 — `#v`/`#s`, sem produtor ainda: `check_unop` só mapeia `-`/`not` do
+/// parser).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
     Not,
+    Len,
 }
 
 // ---- Checker -------------------------------------------------------------
@@ -302,26 +358,35 @@ struct Checker {
     /// Ids das declarações que receberam alguma atribuição (mesmo espírito
     /// do `var._decl._assigned = true` do original, `checker.lua:404`).
     assigned: HashSet<DeclId>,
+    /// Tabela de tipos nomeados (T25 — estrutural; T26 é quem passa a
+    /// popular isto em `collect_signature`, que hoje rejeita `record` com
+    /// erro claro antes de chegar aqui). Não há tabela de tipos nomeados
+    /// hoje — só primitivas e compostos estruturais são resolvidos em
+    /// `resolve_type`.
+    records: HashMap<String, Type>,
 }
 
 impl Checker {
     fn new() -> Self {
         let mut st = SymTab::new();
-        // `print` vem do runtime, registrado no escopo global — não é
-        // palavra-chave (PRD.md, T5).
-        st.add_symbol(
-            "print",
-            Type::Function {
-                params: vec![Type::String],
-                rettypes: vec![Type::Nil],
-            },
-            SymbolKind::Global,
-        );
+        // Funções da stdlib vêm do runtime, registradas no escopo global —
+        // não são palavras-chave (PRD.md, T5; tabela unificada na T25).
+        for b in crate::builtins::BUILTINS {
+            st.add_symbol(
+                b.titan_name,
+                Type::Function {
+                    params: b.params.to_vec(),
+                    rettypes: vec![b.rettype.clone()],
+                },
+                SymbolKind::Global,
+            );
+        }
         Checker {
             st,
             errors: Vec::new(),
             next_decl_id: 0,
             assigned: HashSet::new(),
+            records: HashMap::new(),
         }
     }
 
@@ -417,7 +482,14 @@ impl Checker {
             ast::Type::TypeInteger { .. } => Some(Type::Integer),
             ast::Type::TypeFloat { .. } => Some(Type::Float),
             ast::Type::TypeString { .. } => Some(Type::String),
-            ast::Type::TypeValue { .. } => Some(Type::Value),
+            // T22 fez `value` chegar ao parser/checker, mas o codegen não
+            // sabe emiti-lo (cairia no `unreachable!` de
+            // `rust_type_name:625`, que é panic e violaria a convenção).
+            // Rejeitado explicitamente até uma fase futura dar suporte.
+            ast::Type::TypeValue { loc } => {
+                self.error(*loc, "tipo `value` não é suportado nesta fase.");
+                None
+            }
             ast::Type::TypeArray { subtype, .. } => {
                 let elem = self.resolve_type(subtype)?;
                 Some(Type::Array {
@@ -539,7 +611,7 @@ impl Checker {
                     name: name.clone(),
                     params: named_params,
                     rettypes: ret_types,
-                    body,
+                    body: Box::new(body),
                 })
             }
             // Já reportado como erro na passada 1.
@@ -909,7 +981,7 @@ impl Checker {
 
         Some(TypedStat::Assign {
             loc,
-            name: name.clone(),
+            target: TypedLValue::Name(name.clone()),
             value,
         })
     }
@@ -1171,6 +1243,10 @@ impl Checker {
                 }
                 Type::Boolean
             }
+            // Inatingível: `op` só nasce `Neg`/`Not` linhas acima — `Len`
+            // não tem grafia de origem em `check_unop` nesta fase (T25:
+            // acrescentado à AST tipada, sem produtor ainda).
+            UnOp::Len => unreachable!("`check_unop` nunca produz `UnOp::Len` nesta fase"),
         };
 
         Some(TypedExp {
@@ -1430,7 +1506,10 @@ mod tests {
             params,
             rettypes,
             ..
-        } = &typed[0];
+        } = &typed[0]
+        else {
+            panic!("esperava TypedTopLevel::Func, obteve {:?}", typed[0]);
+        };
         assert_eq!(name, "main");
         assert_eq!(params.len(), 1);
         assert_eq!(
@@ -1580,8 +1659,10 @@ end"#;
                     .join("; ")
             )
         });
-        let TypedTopLevel::Func { body, .. } = &typed[0];
-        let TypedStat::Block { stats, .. } = body else {
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava TypedTopLevel::Func, obteve {:?}", typed[0]);
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
             panic!("esperava TypedStat::Block como corpo");
         };
         stats.clone()
