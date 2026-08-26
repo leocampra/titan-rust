@@ -11,6 +11,8 @@
 #[allow(dead_code, clippy::enum_variant_names)]
 mod ast;
 mod builtins;
+#[allow(dead_code)]
+mod capabilities;
 mod checker;
 mod codegen;
 mod driver;
