@@ -1,0 +1,10 @@
+[package]
+name = "titan-data"
+description = "Data Runtime da linguagem Titan: leitura de CSV e agregações sobre Polars."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polars = { version = "0.51", features = ["lazy", "csv"] }
