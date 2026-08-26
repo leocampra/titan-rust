@@ -15,6 +15,15 @@
 //! `+ - * / % ^`, os relacionais `== ~= < > <= >=` e as palavras-chave de
 //! controle de fluxo e lógicas `and or not if then elseif else while do for`.
 //! `~` só existe em `~=` — isolado é erro léxico (sem bitwise nesta fase).
+//!
+//! A Fase 2 (T20 do PRD.md) acrescenta `[ ] . #` e as palavras-chave
+//! `record`/`as`, usados por arrays, records e maps. `as` deixa de poder ser
+//! usado como identificador (é reservada no original também). Um `[` só vira
+//! `LBracket` quando não abre uma long string/comment (`[[...]]` ou `[=*[`) —
+//! a mesma checagem de `long_bracket_level` que já existe para strings tem
+//! precedência, exatamente como no Lua/Titan original. O único caso ambíguo
+//! seria `a[[b]]` (que nenhum programa Titan válido escreve), documentado com
+//! teste como long string.
 
 use crate::ast::Loc;
 
@@ -61,16 +70,24 @@ pub enum TokenKind {
     KwString,
     KwValue,
 
+    // Palavras-chave de tipos compostos (Fase 2)
+    KwRecord,
+    KwAs,
+
     // Símbolos
     LParen,
     RParen,
     LCurly,
     RCurly,
+    LBracket, // [
+    RBracket, // ]
     Comma,
     Colon,
     Semicolon,
+    Dot,    // .
     Concat, // ..
     Assign, // =
+    Hash,   // #
 
     // Operadores aritméticos (Fase 1)
     Plus,    // +
@@ -464,6 +481,8 @@ impl<'a> Lexer<'a> {
             "float" => TokenKind::KwFloat,
             "string" => TokenKind::KwString,
             "value" => TokenKind::KwValue,
+            "record" => TokenKind::KwRecord,
+            "as" => TokenKind::KwAs,
             _ => TokenKind::Name(text),
         }
     }
@@ -525,6 +544,14 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::RCurly
             }
+            '[' => {
+                self.advance();
+                TokenKind::LBracket
+            }
+            ']' => {
+                self.advance();
+                TokenKind::RBracket
+            }
             ',' => {
                 self.advance();
                 TokenKind::Comma
@@ -537,10 +564,18 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Semicolon
             }
+            '#' => {
+                self.advance();
+                TokenKind::Hash
+            }
             '.' if self.peek2() == Some('.') => {
                 self.advance();
                 self.advance();
                 TokenKind::Concat
+            }
+            '.' => {
+                self.advance();
+                TokenKind::Dot
             }
             '+' => {
                 self.advance();
@@ -1067,5 +1102,104 @@ mod tests {
         assert!(err.message.contains("'~'"));
         assert!(err.message.contains("'~='"));
         assert_eq!(err.loc, Loc { line: 1, col: 3 });
+    }
+
+    #[test]
+    fn indexacao_v_colchete_1() {
+        assert_eq!(
+            kinds("v[1]"),
+            vec![
+                TokenKind::Name("v".to_string()),
+                TokenKind::LBracket,
+                TokenKind::Integer(1),
+                TokenKind::RBracket,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn acesso_a_campo_p_ponto_campo() {
+        assert_eq!(
+            kinds("p.campo"),
+            vec![
+                TokenKind::Name("p".to_string()),
+                TokenKind::Dot,
+                TokenKind::Name("campo".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_tamanho_de_v() {
+        assert_eq!(
+            kinds("#v"),
+            vec![
+                TokenKind::Hash,
+                TokenKind::Name("v".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_record_seguida_de_nome() {
+        assert_eq!(
+            kinds("record Ponto"),
+            vec![
+                TokenKind::KwRecord,
+                TokenKind::Name("Ponto".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_as_para_cast_de_tipo() {
+        assert_eq!(
+            kinds("x as integer"),
+            vec![
+                TokenKind::Name("x".to_string()),
+                TokenKind::KwAs,
+                TokenKind::KwInteger,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn indexacao_aninhada_a_colchete_b_colchete_1() {
+        // `a[b[1]]` — o `[b` faz `long_bracket_level` devolver `None`, então
+        // não há ambiguidade com long string aqui: 5 tokens antes do Eof.
+        assert_eq!(
+            kinds("a[b[1]]"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::LBracket,
+                TokenKind::Name("b".to_string()),
+                TokenKind::LBracket,
+                TokenKind::Integer(1),
+                TokenKind::RBracket,
+                TokenKind::RBracket,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn colchete_duplo_colado_continua_sendo_long_string_como_no_lua() {
+        // `a[[b]]` é ambíguo entre "indexação de indexação" e "long string
+        // `[[b]]`"; nenhum programa Titan válido escreve isso, e a precedência
+        // é a mesma do Lua: long string ganha. Documentado aqui, não é um
+        // caso que o parser precisa desambiguar.
+        assert_eq!(
+            kinds("a[[b]]"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::String("b".to_string()),
+                TokenKind::Eof,
+            ]
+        );
     }
 }

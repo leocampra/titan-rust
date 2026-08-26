@@ -285,7 +285,11 @@ const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "indexacao_de_array",
         fonte: "function main(args: {string}): integer\n    print(args[1])\n    return 0\nend",
-        trecho_esperado: "caractere inesperado '['",
+        // Desde a T20 (PRD.md), `[` é um token válido (`LBracket`) — a rejeição
+        // deixou de ser léxica. O parser desta fase (T11) ainda não tem sufixo
+        // de indexação (isso é T23), então o erro agora vem da regra de
+        // chamada de função, que não espera `[` depois do argumento.
+        trecho_esperado: "Esperava ')' para fechar os argumentos da chamada",
     },
     CasoNegativo {
         nome: "construtor_de_array",
@@ -350,7 +354,10 @@ const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "operador_length",
         fonte: "function main(args: {string}): integer\n    local a = #args\n    return 0\nend",
-        trecho_esperado: "caractere inesperado '#'",
+        // Desde a T20 (PRD.md), `#` é um token válido (`Hash`) — a rejeição
+        // deixou de ser léxica. O operador `#` unário é T25 em diante; por ora
+        // o parser não sabe iniciar uma expressão com `#` e produz este erro.
+        trecho_esperado: "Esperava uma expressão",
     },
     CasoNegativo {
         nome: "tipo_option",
