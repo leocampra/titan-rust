@@ -625,5 +625,124 @@ assume que valores são `Copy` além dos primitivos.
 
 A lista de tarefas executável da Fase 1 (T10–T18) está no `PRD.md`.
 
+---
+
+# Fase 2 — Tipos compostos
+
+As Fases 0 e 1 entregaram o pipeline completo e um núcleo de linguagem capaz de
+escrever algoritmos reais — mas apenas sobre valores escalares. A Fase 2 é a que
+o roadmap sempre marcou como **alta complexidade**: *"arrays, maps, records,
+strings dinâmicas — ownership/borrow mordem aqui"*.
+
+É aqui que se paga o custo real do projeto. Gerar Rust para `integer` e `boolean`
+é mecânico: eles são `Copy`, não têm dono, não têm tempo de vida. Um array não é
+nada disso. A pergunta que a Fase 0 deliberadamente adiou — **qual modelo de
+memória em Rust representa um valor composto do Titan?** — não tem mais como ser
+adiada, e a resposta condiciona todo o resto da linguagem.
+
+A Fase 0 foi desenhada para não fechar essa porta: o mapeamento de tipos ficou
+isolado em duas funções (`rust_type_name` e `rust_param_type_name`, em
+`codegen.rs`), justamente para que essa escolha fosse uma mudança localizada.
+
+## O problema central
+
+No Titan original, arrays, maps e records são **ponteiros para objetos
+gerenciados pelo GC do Lua** (`Table*`, `CClosure*`). Isso tem uma consequência
+semântica direta:
+
+```lua
+local a: {integer} = {1, 2, 3}
+local b: {integer} = a   -- 'b' e 'a' são o MESMO array
+b[1] = 99                -- 'a' também muda
+```
+
+O código gerado pelo backend original é literalmente `$CVAR = $CEXP;` — cópia de
+ponteiro, nunca de conteúdo (`coder.lua:1321`). O manual do Titan prova a
+identidade atravessando a fronteira com Lua: `assert(t == t2)` depois de a tabela
+entrar e sair de uma função Titan (`doc/manual.md:191-203`).
+
+Rust não dá isso de graça. Reproduzir aliasing exigiria `Rc<RefCell<...>>` — que
+traz `.borrow_mut()` em cada indexação, risco de panic em runtime por duplo
+empréstimo (violando a regra "nunca panic") e vazamento em records recursivos.
+
+## As decisões desta fase
+
+**1. Semântica de valor: `Vec`/`struct` donos, com clone na atribuição.**
+`{integer}` vira `Vec<i64>`, um record vira uma `struct` Rust própria, e
+`local b = a` emite `let b = a.clone();`. Isso **diverge do original** — não há
+aliasing — e também do Rust idiomático, onde a atribuição moveria. O custo O(n)
+é aceito conscientemente em troca de código gerado simples, sem `Rc`, sem
+`RefCell`, sem risco de panic.
+
+**2. Parâmetros por `&mut`, preservando a mutação in-place.**
+Esta é a contrapartida da decisão anterior, e é independente dela: clonar **na
+atribuição** não obriga a clonar **na passagem de parâmetro**. A diferença
+decide se o idioma mais comum da linguagem de referência funciona:
+
+```lua
+function selection_sort(xs: {integer}): nil   -- ordena in-place, devolve nil
+    ...
+    xs[i] = xs[min_i]
+end
+```
+
+Com passagem por valor, essa função compilaria, rodaria, ordenaria uma cópia — e
+o chamador não veria nada. Um bug silencioso, sem erro de compilação, no idioma
+central da linguagem. Com `&mut Vec<i64>`, o chamador vê a ordenação, ao custo
+O(1), e **neste ponto convergimos** com o original.
+
+O preço: `f(xs, xs)` é legal em Titan e o borrow checker do Rust o recusaria —
+em inglês. O checker passa a rejeitá-lo antes, em português.
+
+**3. `v[i]` tem tipo `T`, com checagem de faixa em português.**
+No original, indexar produz `T?` (nunca `T`) — é o mecanismo de proteção contra
+buracos. Mas `Option`/`?` está fora do escopo desta fase, e trazê-lo junto
+exigiria narrowing de fluxo no checker. Em vez disso, `v[i]` tem tipo `T` e a
+checagem vai para o runtime: índice inválido aborta com
+`"índice 99 fora da faixa (array tem 3 elementos)"` — nunca o panic cru do Rust
+em inglês.
+
+**4. Escrever em `#v + 1` faz append.**
+O original cresce o array silenciosamente ao escrever além do fim, porque uma
+tabela Lua é um mapa esparso. Replicar isso sobre `Vec` exigiria inventar valores
+default — e para `{Ponto}` não existe default sensato. A solução preserva
+exatamente o idioma que importa (`res[#res+1] = x`, o padrão de append do
+original) e recusa o resto com mensagem clara.
+
+## O que a fase cobre
+
+```text
+Arrays            {T}  ·  {1,2,3}  ·  v[i]  ·  v[i] = x  ·  #v  ·  {{T}}
+Records           record Nome campo: T end  ·  p.campo  ·  {campo = valor}
+Maps              {K: V}  ·  m[k]  ·  m[k] = v
+Strings           string passa a ser sempre String (fim da dualidade &str/String)
+```
+
+## O que continua fora
+
+`Option`/`?`, cast `as`, métodos (`:`), `import`, retornos múltiplos,
+multi-assign, `repeat`/`until`, `break`/`continue`, bitwise, `//`. Tudo segue
+rejeitado com mensagem clara em português, nunca com panic.
+
+Uma consequência nova: construções que o **rustc** recusaria em inglês passam a
+ser rejeitadas antes, pelo checker, em português — `f(xs, xs)`, record recursivo
+(`record No prox: No end`, que seria infinito em Rust sem `Box`), nome de record
+colidindo com tipo do Rust (`record String`), e chave de map `float` (o `HashMap`
+exige `Eq + Hash`, que `f64` não tem).
+
+## Divergências deliberadas, registradas em ADR
+
+| ADR | Decisão |
+|---|---|
+| 0006 | Semântica de valor com clone na atribuição (diverge do aliasing do original) |
+| 0007 | Parâmetros compostos por `&mut`, preservando o idioma in-place |
+| 0008 | Indexação checada no runtime, `T` em vez de `T?`; variância invariante |
+| 0009 | Records como `struct` Rust nominal |
+| 0010 | `string` é sempre `String` — fim da dualidade `&str`/`String` |
+
+**Redox segue fora de escopo** — o alvo é Linux nativo via cargo.
+
+A lista de tarefas executável da Fase 2 (T19–T33) está no `PRD.md`.
+
 
 
