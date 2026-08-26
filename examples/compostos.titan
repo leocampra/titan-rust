@@ -1,0 +1,77 @@
+record Estoque
+    nome: string
+    quantidade: integer
+end
+
+function dobrar_estoque(e: {Estoque}): nil
+    for i: integer = 1, #e do
+        e[i].quantidade = e[i].quantidade * 2
+    end
+end
+
+function ordena_crescente(xs: {integer}): nil
+    local n: integer = #xs
+    for i: integer = 1, n do
+        local min_i: integer = i
+        local min_x: integer = xs[i]
+        for j: integer = i + 1, n do
+            local y: integer = xs[j]
+            if y < min_x then
+                min_i = j
+                min_x = y
+            end
+        end
+        local tmp: integer = xs[i]
+        xs[i] = xs[min_i]
+        xs[min_i] = tmp
+    end
+end
+
+function soma_pesos(pesos: {float}): float
+    local total: float = 0.0
+    for i: integer = 1, #pesos do
+        total = total + pesos[i]
+    end
+    return total
+end
+
+function main(args: {string}): integer
+    local origem: Estoque = {nome = "Parafuso", quantidade = 10}
+    print("Estoque: " .. origem.nome .. " x" .. origem.quantidade)
+    origem.quantidade = origem.quantidade + 5
+    print("Apos reposicao: " .. origem.quantidade)
+
+    local qs: {integer} = {5, 3, 1, 4, 2}
+    local copia: {integer} = qs
+    copia[1] = 999
+    print("Original preservado: " .. qs[1])
+
+    ordena_crescente(qs)
+    print("Ordenado: " .. qs[1] .. "," .. qs[2] .. "," .. qs[3] .. "," .. qs[4] .. "," .. qs[5])
+
+    local res: {integer} = {}
+    for i: integer = 1, #qs do
+        res[#res + 1] = qs[i] * 10
+    end
+    print("Res tamanho: " .. #res)
+    print("Res ultimo: " .. res[#res])
+
+    local pesos: {float} = {1.5, 2.25, 3.0}
+    print("Soma pesos: " .. soma_pesos(pesos))
+
+    local estoques: {Estoque} = {
+        {nome = "Parafuso", quantidade = 10},
+        {nome = "Porca", quantidade = 20},
+    }
+    print("Primeiro estoque: " .. estoques[1].nome .. " x" .. estoques[1].quantidade)
+    dobrar_estoque(estoques)
+    print("Primeiro estoque dobrado: " .. estoques[1].quantidade)
+    print("Segundo estoque dobrado: " .. estoques[2].quantidade)
+
+    local precos: {string: float} = {["parafuso"] = 0.5, ["porca"] = 0.25}
+    precos["arruela"] = 0.1
+    print("Preco parafuso: " .. precos["parafuso"])
+    print("Preco arruela: " .. precos["arruela"])
+
+    return 0
+end

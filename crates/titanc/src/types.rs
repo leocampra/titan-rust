@@ -70,6 +70,14 @@ impl Type {
 
     /// Relação de consistência de tipos, à la gradual typing (`types.lua:150`,
     /// `types.compatible`): `Value` é compatível com qualquer tipo.
+    ///
+    /// `Array`/`Map` são **invariantes** (via `equals`, não recursão em
+    /// `compatible`): com arrays mutáveis passados por `&mut` (Fase 2, decisão
+    /// 4), covariância seria *unsound* — permitiria escrever uma `string`
+    /// através de uma referência `{value}` apontando para um `{integer}`. Ver
+    /// ADR 0008. `Record` é nominal (via `equals`) e `Option` é invariante;
+    /// ambos ganham braço explícito para deixar a intenção escrita, em vez de
+    /// cair no `_ => false`.
     pub fn compatible(&self, other: &Type) -> bool {
         if self.equals(other) {
             return true;
@@ -77,7 +85,7 @@ impl Type {
 
         match (self, other) {
             (Type::Value, _) | (_, Type::Value) => true,
-            (Type::Array { elem: e1 }, Type::Array { elem: e2 }) => e1.compatible(e2),
+            (Type::Array { elem: e1 }, Type::Array { elem: e2 }) => e1.equals(e2),
             (
                 Type::Map {
                     keys: k1,
@@ -87,7 +95,7 @@ impl Type {
                     keys: k2,
                     values: v2,
                 },
-            ) => k1.compatible(k2) && v1.compatible(v2),
+            ) => k1.equals(k2) && v1.equals(v2),
             (
                 Type::Function {
                     params: p1,
@@ -103,6 +111,8 @@ impl Type {
                     && r1.len() == r2.len()
                     && r1.iter().zip(r2).all(|(a, b)| a.compatible(b))
             }
+            (Type::Record { .. }, Type::Record { .. }) => false,
+            (Type::Option { .. }, Type::Option { .. }) => false,
             _ => false,
         }
     }
@@ -172,19 +182,78 @@ mod tests {
     }
 
     #[test]
-    fn arrays_compativeis_por_elemento_compativel() {
-        let a1 = Type::Array {
+    fn arrays_sao_invariantes_em_compatible() {
+        // ADR 0008: `Array` deixou de ser covariante em `compatible` — com
+        // arrays mutáveis por `&mut` (Fase 2), `{value}` aceitar `{integer}`
+        // seria unsound (escrever `string` através de `{value}` que aponta
+        // para um `{integer}`).
+        let a_value = Type::Array {
             elem: Box::new(Type::Value),
         };
-        let a2 = Type::Array {
+        let a_integer = Type::Array {
             elem: Box::new(Type::Integer),
         };
-        assert!(a1.compatible(&a2));
+        assert!(!a_value.compatible(&a_integer));
+        assert!(!a_integer.compatible(&a_value));
 
-        let a3 = Type::Array {
-            elem: Box::new(Type::String),
+        let a_integer2 = Type::Array {
+            elem: Box::new(Type::Integer),
         };
-        assert!(!a2.compatible(&a3));
+        assert!(a_integer.compatible(&a_integer2));
+
+        // `value` (fora de um composto) segue compatível com qualquer coisa,
+        // inclusive um array — a invariância vale só *dentro* do composto.
+        assert!(Type::Value.compatible(&a_integer));
+        assert!(a_integer.compatible(&Type::Value));
+    }
+
+    #[test]
+    fn maps_sao_invariantes_em_compatible() {
+        let m_value = Type::Map {
+            keys: Box::new(Type::String),
+            values: Box::new(Type::Value),
+        };
+        let m_integer = Type::Map {
+            keys: Box::new(Type::String),
+            values: Box::new(Type::Integer),
+        };
+        assert!(!m_value.compatible(&m_integer));
+        assert!(!m_integer.compatible(&m_value));
+    }
+
+    #[test]
+    fn records_sao_nominais_e_invariantes_em_compatible() {
+        let p1 = Type::Record {
+            name: "P".to_string(),
+            fields: vec![("x".to_string(), Type::Integer)],
+        };
+        let p2 = Type::Record {
+            name: "P".to_string(),
+            fields: vec![("x".to_string(), Type::Integer)],
+        };
+        let q = Type::Record {
+            name: "Q".to_string(),
+            fields: vec![("x".to_string(), Type::Integer)],
+        };
+        assert!(p1.compatible(&p2));
+        assert!(!p1.compatible(&q));
+    }
+
+    #[test]
+    fn options_sao_invariantes_em_compatible() {
+        let o_value = Type::Option {
+            base: Box::new(Type::Value),
+        };
+        let o_integer = Type::Option {
+            base: Box::new(Type::Integer),
+        };
+        assert!(!o_value.compatible(&o_integer));
+        assert!(!o_integer.compatible(&o_value));
+
+        let o_integer2 = Type::Option {
+            base: Box::new(Type::Integer),
+        };
+        assert!(o_integer.compatible(&o_integer2));
     }
 
     #[test]

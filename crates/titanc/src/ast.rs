@@ -288,17 +288,69 @@ pub enum Args {
     },
 }
 
+/// Identidade de um campo de `ExpInitList` (`ast.lua`: `Field.name`, que é
+/// polimórfico — `false | string | Exp`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldName {
+    /// Sem chave: posicional, entra num array.
+    None,
+    /// Chave-nome: `x = 1`, campo de record.
+    Name(String),
+    /// Chave-expressão: `["a"] = 1`, entrada de map.
+    Key(Box<Exp>),
+}
+
 /// Campo de record ou de `ExpInitList` (`ast.lua`: `Field.Field`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field {
     pub loc: Loc,
-    pub name: Option<String>,
+    pub name: FieldName,
     pub exp: Exp,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `{1,2}`, `{x=1}` e `{["a"]=1}` produzem `FieldName` distintos e
+    /// representáveis (critério de aceite do T27).
+    #[test]
+    fn field_name_distingue_posicional_nome_e_chave() {
+        let loc = Loc { line: 1, col: 1 };
+
+        let posicional = Field {
+            loc,
+            name: FieldName::None,
+            exp: Exp::ExpInteger { loc, value: 1 },
+        };
+        assert_eq!(posicional.name, FieldName::None);
+
+        let nomeado = Field {
+            loc,
+            name: FieldName::Name("x".to_string()),
+            exp: Exp::ExpInteger { loc, value: 1 },
+        };
+        assert_eq!(nomeado.name, FieldName::Name("x".to_string()));
+
+        let chave = Field {
+            loc,
+            name: FieldName::Key(Box::new(Exp::ExpString {
+                loc,
+                value: "a".to_string(),
+            })),
+            exp: Exp::ExpInteger { loc, value: 1 },
+        };
+        assert_eq!(
+            chave.name,
+            FieldName::Key(Box::new(Exp::ExpString {
+                loc,
+                value: "a".to_string(),
+            }))
+        );
+
+        assert_ne!(posicional.name, nomeado.name);
+        assert_ne!(nomeado.name, chave.name);
+    }
 
     /// Monta a `Program` equivalente a `examples/hello.titan`, para provar que
     /// os enums cobrem o subconjunto que a Fase 0 precisa produzir.

@@ -68,29 +68,49 @@ Titan original continua servindo como referência viva sempre que uma dúvida
 de comportamento aparece (por exemplo, "o que `checker.lua:1593` faz quando
 `main` tem assinatura errada?").
 
-## Modelo de tipos do código gerado (Fase 0)
+## Modelo de tipos do código gerado
 
 O mapeamento Titan → Rust está isolado em duas funções de
 `crates/titanc/src/codegen.rs` (`rust_type_name` e `rust_param_type_name`),
-de propósito — a Fase 2 (arrays, maps, records) vai precisar escolher um
-modelo de memória (`Rc<RefCell<...>>`, arena, ou GC próprio) e essa troca
-precisa ficar contida a essas duas funções, sem se espalhar pelo resto do
-codegen.
+de propósito — desde a Fase 0 essas duas funções foram desenhadas para conter
+qualquer troca de modelo de memória sem se espalhar pelo resto do codegen. A
+Fase 2 (arrays, maps, records) foi onde essa escolha deixou de poder ser
+adiada; o modelo escolhido é **semântica de valor com `clone()`**, sem
+`Rc<RefCell<...>>`, sem arena, sem GC — ver
+[ADR 0006](adr/0006-semantica-de-valor-clone-na-atribuicao.md).
 
 | Titan | Rust |
 |---|---|
 | `integer` | `i64` |
 | `float` | `f64` |
 | `boolean` | `bool` |
-| `string` (literal) | `&'static str` |
-| `string` (computada, ex.: resultado de `..`) | `String` |
+| `string` (qualquer posição) | `String` |
 | `nil` (retorno) | `()` |
-| `{string}` (só o parâmetro de `main`) | `&[String]` |
+| `{T}` (array) | `Vec<T>` |
+| `{K: V}` (map) | `std::collections::HashMap<K, V>` |
+| `record Nome` | `struct Nome` própria, `#[derive(Clone, Debug, PartialEq)]` |
+| `{string}` (parâmetro de `main`) | `&mut Vec<String>` |
+| parâmetro de função de tipo composto | `&mut T` (array/map/record) |
 
 `print` e `concat` (suporte ao operador `..`) não são geradas pelo compilador
 — vêm de `titan-runtime`, um crate Rust comum, referenciado por caminho
 absoluto no `Cargo.toml` gerado. O Titan original **não tem `print`**; aqui
-ela é stdlib, não palavra-chave.
+ela é stdlib, não palavra-chave. A partir da Fase 2, o `titan-runtime` também
+fornece a indexação checada de arrays e maps (`array_get`, `array_get_mut`,
+`array_set`, `map_get`) — toda leitura/escrita fora da faixa aborta com
+mensagem em português em vez de produzir um valor `T?` como no original (ver
+[ADR 0008](adr/0008-indexacao-checada-e-variancia-invariante.md)).
+
+**Cópia vs. referência**, resumido (detalhado nos ADRs 0006–0009):
+
+- `local b = a` com `a` composto → `let b = a.clone();` (cada variável é dona
+  da sua cópia).
+- `f(a)` com `a` composto → o parâmetro correspondente é `&mut T`; a função
+  enxerga e pode mutar o mesmo valor do chamador (preserva o idioma in-place
+  de `selection_sort.titan`).
+- `string` segue a mesma regra de clone que os demais compostos desde a
+  Fase 2 — não há mais distinção entre string "literal" e "computada" no
+  codegen ([ADR 0010](adr/0010-string-sempre-string.md)).
 
 ## Duas armadilhas do Cargo (por que `driver.rs` faz o que faz)
 

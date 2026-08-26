@@ -6,10 +6,10 @@ como **especificação de referência** de gramática, AST e sistema de tipos �
 como base de código. Veja [`PRD.md`](PRD.md) para o plano de tarefas completo e
 [`docs/arquitetura.md`](docs/arquitetura.md) para o porquê das decisões abaixo.
 
-Estado atual: **Fase 1 ("Núcleo da linguagem")** — além do hello world da
-Fase 0, o compilador já cobre operadores aritméticos/relacionais/lógicos,
-`if`/`while`/`for` numérico e atribuição, o suficiente para levar
-`examples/nucleo.titan` (fatorial e fibonacci) até um executável nativo.
+Estado atual: **Fase 2 ("Tipos compostos")** — além do hello world da Fase 0
+e do núcleo da linguagem da Fase 1, o compilador já cobre arrays, records e
+maps, o suficiente para levar `examples/compostos.titan` (e o
+`selection_sort.titan` do Titan original) até um executável nativo.
 
 ## Como compilar
 
@@ -41,6 +41,23 @@ echo $?
 echo $?
 # → 0
 ```
+
+## Como rodar o exemplo da Fase 2 (tipos compostos)
+
+```bash
+./target/release/titanc examples/compostos.titan
+./compostos
+echo $?
+# → 0
+```
+
+`examples/compostos.titan` exercita record (construção, leitura e escrita de
+campo), array (literal, `#`, indexação, mutação in-place por função, push via
+`#res+1`), array de floats e map — inclusive as duas provas centrais da fase:
+`local copia = qs; copia[1] = 999` não altera `qs` (semântica de valor,
+[ADR 0006](docs/adr/0006-semantica-de-valor-clone-na-atribuicao.md)), e
+`dobrar_estoque(qs)` muda o `qs` do chamador (parâmetros compostos por
+`&mut`, [ADR 0007](docs/adr/0007-parametros-compostos-por-mut.md)).
 
 O `titanc` lê o `.titan`, gera um projeto Cargo temporário em `build/<nome>/`,
 compila-o com `cargo build --release` e copia o binário resultante para o
@@ -96,7 +113,17 @@ Duas decisões da Fase 1 divergem deliberadamente do comportamento do Titan
 original — o `for` numérico desaçucarado para `while`
 ([ADR 0004](docs/adr/0004-for-desacucarado-para-while.md)) e `and`/`or`
 exigindo booleano estrito em vez de truthy/falsy
-([ADR 0005](docs/adr/0005-and-or-boolean-estrito.md)).
+([ADR 0005](docs/adr/0005-and-or-boolean-estrito.md)). A Fase 2 soma mais
+cinco: semântica de valor com `clone()` em vez de aliasing
+([ADR 0006](docs/adr/0006-semantica-de-valor-clone-na-atribuicao.md)),
+parâmetros compostos por `&mut` para preservar o idioma in-place
+([ADR 0007](docs/adr/0007-parametros-compostos-por-mut.md)), indexação
+checada no runtime com `T` em vez de `T?`
+([ADR 0008](docs/adr/0008-indexacao-checada-e-variancia-invariante.md)),
+records como `struct` nominal
+([ADR 0009](docs/adr/0009-records-como-struct-rust-nominal.md)) e `string`
+sempre `String`
+([ADR 0010](docs/adr/0010-string-sempre-string.md)).
 
 `titan/` e `lua/` (usado para checar comportamento de referência do Lua) são
 **somente leitura** neste repositório — repositórios de terceiros, nunca
@@ -104,7 +131,8 @@ editados.
 
 ## O que já está implementado
 
-Fase 0 (hello world) + Fase 1 (núcleo da linguagem):
+Fase 0 (hello world) + Fase 1 (núcleo da linguagem) + Fase 2 (tipos
+compostos):
 
 - `function`/`local function`, `local x [: T] = exp`, `return`.
 - Operadores aritméticos `+ - * / % ^`, relacionais `== ~= < > <= >=`,
@@ -112,16 +140,20 @@ Fase 0 (hello world) + Fase 1 (núcleo da linguagem):
   número→string).
 - Controle de fluxo: `if`/`elseif`/`else`, `while`, `for` numérico
   (`for x = start, finish[, inc] do ... end`).
-- Atribuição single-target: `nome = exp` para local já declarada.
+- Atribuição single-target: `nome = exp` para local já declarada, incluindo
+  `v[i] = x` e `p.campo = x`.
+- Tipos compostos: `array` (`{T}`, literal, indexação `v[i]`, `#v`, mutação
+  in-place por função via `&mut`), `record` (declaração `record Nome ... end`,
+  literal exaustivo, leitura/escrita de campo `p.campo`) e `map`
+  (`{K: V}`, `map_get`/`map_set` via indexação).
 
 ## O que não está implementado ainda
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
 - `repeat`/`until`, `break`/`continue`, `for`-in.
-- Retornos múltiplos.
-- Bitwise (`& | ~ << >>`), `//`, `#`.
-- Tipos compostos manipuláveis: arrays, maps, records; inicializadores `{...}`.
+- Retornos múltiplos, multi-assign (`a, b = ...`).
+- Bitwise (`& | ~ << >>`), `//`.
 - `import` e `foreign import`.
 - Métodos e chamadas de método.
 - `Option`/`?` e cast de tipo (`as`).
@@ -139,7 +171,8 @@ titan-rust/
 │   └── titan-runtime/   # runtime mínimo (print, concat) chamado pelo Rust gerado
 ├── examples/
 │   ├── hello.titan
-│   └── nucleo.titan
+│   ├── nucleo.titan
+│   └── compostos.titan
 ├── docs/
 │   ├── arquitetura.md
 │   └── adr/

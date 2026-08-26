@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::checker::{self, CheckError};
-use crate::codegen;
+use crate::codegen::{self, CodegenError};
 use crate::lexer::{self, LexError};
 use crate::parser::{self, ParseError};
 
@@ -29,6 +29,7 @@ pub enum CompileError {
     Lex(LexError),
     Parse(ParseError),
     Check(Vec<CheckError>),
+    Codegen(CodegenError),
     Io {
         context: String,
         source: std::io::Error,
@@ -47,6 +48,7 @@ impl std::fmt::Display for CompileError {
                 let messages: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
                 write!(f, "{}", messages.join("\n"))
             }
+            CompileError::Codegen(e) => write!(f, "{e}"),
             CompileError::Io { context, source } => {
                 write!(f, "{context}: {source}")
             }
@@ -62,6 +64,12 @@ impl std::error::Error for CompileError {}
 impl From<LexError> for CompileError {
     fn from(e: LexError) -> Self {
         CompileError::Lex(e)
+    }
+}
+
+impl From<CodegenError> for CompileError {
+    fn from(e: CodegenError) -> Self {
+        CompileError::Codegen(e)
     }
 }
 
@@ -132,7 +140,7 @@ pub fn compile(opts: &Options) -> Result<PathBuf, CompileError> {
     let tokens = lexer::lex(&source)?;
     let program = parser::parse(&tokens)?;
     let typed = checker::check(&program).map_err(CompileError::Check)?;
-    let rust_code = codegen::generate(&typed);
+    let rust_code = codegen::generate(&typed)?;
 
     if opts.emit_rust {
         println!("{rust_code}");
