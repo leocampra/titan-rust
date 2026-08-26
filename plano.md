@@ -746,3 +746,143 @@ A lista de tarefas executável da Fase 2 (T19–T33) está no `PRD.md`.
 
 
 
+---
+
+# Fase 3 — Capability Runtimes
+
+As Fases 0–2 entregaram um compilador completo para uma linguagem **fechada em
+si mesma**: tudo que um programa `.titan` pode fazer está no próprio arquivo,
+mais `print`/`concat` do `titan-runtime`. Não há `import`, não há namespace,
+não há como o programa alcançar uma biblioteca.
+
+Isso é exatamente o que separa o projeto da sua tese central. A ideia deste
+plano não é "um Lua que compila para Rust" — é que o desenvolvedor **adicione
+capacidades** em vez de instalar dezenas de bibliotecas, e que cada capacidade
+seja um runtime especializado escondendo a infraestrutura atrás de uma API
+simples. Enquanto o compilador não souber o que é um módulo, essa tese não
+existe em código.
+
+A Fase 3 entrega **o mecanismo de capabilities** e o prova com **uma
+capability real**: `titan-data`, um Data Runtime sobre o Polars. Ao fim,
+`import data` mais um CSV de verdade produzem um relatório impresso por um
+executável nativo.
+
+## O ponto de partida é melhor do que parecia
+
+A investigação que abriu a fase encontrou o terreno muito mais preparado do
+que o roadmap sugeria — em parte porque a `ast.rs` foi escrita completa desde
+a Fase 0, em parte por acidente feliz:
+
+- **`TopLevelImport`, `TypeQualName` e `ArgsMethod` já existem na AST**, e
+  nenhum deles é construído hoje.
+- **O parser já aceita `data.read_csv(x)` e `df.soma("valor")` sem nenhuma
+  mudança.** O loop de sufixos é genérico: `.nome` vira `VarDot`, `(args)`
+  vira `ExpCall`. As duas formas morrem no *checker*, não no parser.
+- **O codegen não tem preâmbulo de `use`** — toda chamada de runtime é escrita
+  qualificada inline (`titan_runtime::print(...)`). Acrescentar
+  `titan_data::...` não exige tocar em nenhum cabeçalho gerado.
+
+Sobra, portanto, o trabalho que de fato importa: ensinar o **checker** o que é
+um módulo, o que é um tipo que ele não pode inspecionar, e como resolver o que
+está à esquerda de um ponto.
+
+## As decisões desta fase
+
+**1. `import data`, e não `local data = import "data"`.**
+O Titan original só tem a segunda forma, com acesso sempre pelo alias. Este
+plano sempre escreveu a primeira. Adotamos a do plano, tratando-a como açúcar
+da do original (`localname == modname`) — todo o resto do desenho de
+referência continua valendo sem mudança.
+
+**2. Módulo não é um tipo — é uma espécie de símbolo.**
+O original admite em comentário que `Type.Module` é um hack, e paga o preço
+com erros espalhados por todo uso indevido ("trying to access module as a
+first-class value", "trying to assign to a module"). Aqui o módulo entra como
+variante de `SymbolKind`, e módulo-como-valor fica **irrepresentável** em vez
+de rejeitado caso a caso.
+
+**3. Tipos opacos: `Type::Opaque`.**
+`data.DataFrame` é um tipo nominal que o programa carrega e passa adiante, mas
+cujos campos não pode inspecionar — ele não é declarado no `.titan`, vem do
+runtime. Detalhe que barateia a fase inteira: fazendo o opaco entrar em
+`is_composite`, ele herda de graça toda a máquina de lugares da Fase 2 —
+parâmetro por `&mut` (ADR 0007), `clone()` na atribuição (ADR 0006),
+`emit_place_mut`/`emit_place_expr`. O preço é uma exigência nova: **todo tipo
+opaco de runtime precisa implementar `Clone`**.
+
+**4. As duas formas de chamada, porque as duas resolvem no mesmo lugar.**
+`data.read_csv("v.csv")` cria o DataFrame (função do módulo — não há receptor
+ainda, então ela precisa existir de qualquer jeito) e `df.soma("valor")` opera
+sobre ele (método). Parecia que métodos seriam o item mais caro do escopo; a
+investigação mostrou que ambas passam pelo mesmo ponto do checker, que olha o
+que está à esquerda do ponto — símbolo de módulo, expressão opaca ou record. É
+um braço a mais, não um mecanismo novo.
+
+**5. Método com ponto, não dois-pontos.**
+O original usa `:` para método e reserva `.` para campo. Aqui o opaco não tem
+campos acessíveis, então não há ambiguidade a desfazer — e é `.` que este
+plano sempre escreveu (`model.chat(...)`).
+
+## A escolha do backend, e a medição que a inverteu
+
+A intenção inicial era um backend leve agora (Arrow/csv) e o Polars depois,
+justamente para não impor uma árvore de dependências pesada a todo programa
+que fizesse `import data`. A medição desfez a premissa:
+
+| Dependência | Build limpo |
+|---|---|
+| crate `csv` | **6,7s** (release) |
+| `arrow` (default-features off, csv) | **1m54s** (release) |
+| `polars` (lazy, csv, parquet) | **1m43s** (debug) |
+| rebuild incremental | **0,55s** |
+
+Arrow custa o mesmo que o Polars. O meio-termo não existia: ou se paga ~2min
+uma vez e se ganha o motor completo, ou se fica no `csv` cru reimplementando
+agregação à mão. Decisão: **Polars**. O custo é amortizado porque o `titanc`
+compila em `build/<nome>/`, que persiste entre execuções — só a primeira
+compilação de cada programa paga.
+
+Isso não fecha a porta que motivou a hesitação. A **API `data.*` é o
+contrato; o backend é detalhe interno** (ADR 0015) — trocar o motor por baixo
+não muda uma linha do programa Titan. Que é, afinal, a tese deste plano
+aplicada a si mesma.
+
+## O que a fase cobre
+
+```text
+Mecanismo    import data  ·  namespace  ·  data.f(...)  ·  tipo opaco  ·  df.m(...)
+             dependências condicionais no Cargo.toml gerado
+titan-data   read_csv  ·  linhas  ·  colunas  ·  coluna_integer/coluna_float
+             soma  ·  media  ·  minimo  ·  maximo
+```
+
+Toda a superfície do `titan-data` foi validada contra o Polars 0.51 antes de a
+fase começar — as assinaturas compilam e produzem os valores esperados sobre
+um CSV real.
+
+## O que continua fora
+
+`foreign import`, `import` com alias (`import data as d`), módulos definidos
+pelo usuário (um `.titan` importando outro `.titan` — esta fase só tem
+capabilities internas), `titan-crypto`, `titan-ai`, `Option`/`?`, cast `as`,
+retornos múltiplos, multi-assign, `repeat`/`until`, `break`/`continue`,
+bitwise, `//`, e `df:metodo()` com dois-pontos. Tudo segue rejeitado com
+mensagem clara em português, nunca com panic.
+
+`titan-crypto` e `titan-ai` ficam para as fases 3b/3c: com o mecanismo pronto,
+cada um vira essencialmente um crate novo e uma tabela de funções — engenharia
+de biblioteca, não de compilador.
+
+## Divergências deliberadas, registradas em ADR
+
+| ADR | Decisão |
+|---|---|
+| 0011 | `import data` como açúcar de `local data = import "data"` (diverge do original) |
+| 0012 | Módulo é `SymbolKind`, não tipo (diverge do `Type.Module` do original) |
+| 0013 | Tipo opaco `Type::Opaque`, composto por herança (exige `Clone`) |
+| 0014 | Método com ponto, não dois-pontos (diverge do original) |
+| 0015 | API `data.*` é o contrato, backend é detalhe interno (Polars trocável) |
+
+**Redox segue fora de escopo** — o alvo é Linux nativo via cargo.
+
+A lista de tarefas executável da Fase 3 (T34–T46) está no `PRD.md`.

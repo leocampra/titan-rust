@@ -1321,5 +1321,542 @@ bitwise (`& | ~ << >>`), `//`.
 | **0. Hello world** | pipeline completo, subconjunto mínimo | ✅ **Concluída** |
 | **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
 | **2. Tipos compostos** | arrays, maps, records, strings dinâmicas — ownership/borrow mordem aqui | ✅ **Concluída** |
-| 3. Capability Runtimes | AI, Crypto, Data (`titan-ai`, `titan-crypto`…) | Pendente |
+| 3. Capability Runtimes | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | Em andamento |
+| 3b/3c. Crypto e AI | `titan-crypto`, `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
+| 4. Self-hosting / LSP | compilador escrito na própria linguagem | Pendente |
+
+---
+---
+
+# PRD — Titan-Rust · Fase 3: Capability Runtimes
+
+> Continuação da Fase 2 (T19–T33, **concluída**). Objetivo da fase:
+> `titanc examples/dados.titan && ./dados` lê um CSV de verdade, extrai uma
+> coluna como array Titan e imprime um relatório agregado — provando o
+> mecanismo de capabilities com um runtime real (`titan-data`, sobre Polars).
+> Tarefas T34–T46.
+
+## Resumo executivo
+
+As Fases 0–2 entregaram um compilador completo para uma linguagem **fechada em
+si mesma**: tudo que um programa `.titan` pode fazer está no próprio arquivo,
+mais `print`/`concat` do `titan-runtime`. Não há `import`, não há namespace,
+não há como o programa alcançar uma biblioteca. Enquanto isso não existir, a
+tese central do `plano.md` — o desenvolvedor **adiciona capacidades** em vez de
+instalar bibliotecas — não existe em código.
+
+Esta fase entrega **o mecanismo de capabilities** (`import`, namespaces,
+chamadas qualificadas, tipos opacos, métodos sobre eles, dependências
+condicionais no `Cargo.toml` gerado) e o prova com **uma capability real**:
+`titan-data`, um Data Runtime sobre o Polars.
+
+**Ponto de partida favorável** (levantado na investigação que abriu a fase):
+
+- `TopLevelImport` (`ast.rs:107`), `TypeQualName` (`ast.rs:40`) e `ArgsMethod`
+  (`ast.rs:284`) **já existem na AST** e nenhum é construído hoje.
+- **O parser já aceita `data.read_csv(x)` e `df.soma("valor")` sem nenhuma
+  mudança** — o loop de sufixos (`parser.rs:791-836`) é genérico. As duas
+  formas morrem no *checker* (`checker.rs:2015-2019`), não no parser.
+- **O codegen não tem preâmbulo de `use`**: toda chamada de runtime é escrita
+  qualificada inline (`titan_runtime::print(...)`), então acrescentar
+  `titan_data::...` não exige tocar em nenhum cabeçalho gerado.
+- **Código morto que a fase acorda:** `checker.rs:652-654` rejeita
+  `TopLevelImport`, mas o parser nunca o produz — hoje `import` falha antes,
+  no parser (`integration.rs:365`).
+
+**Referências vivas no Titan original** (`titan/`, somente leitura): gramática
+de `import` em `parser.lua:275-284` · `Type.Module` (e o comentário admitindo
+que é um hack) em `types.lua:59-67` · resolução de membro de módulo em
+`checker.lua:482-537` · `checkimport` em `checker.lua:1609-1617` ·
+`makemoduletype` em `checker.lua:1622-1636` · manual em `doc/manual.md:265-348`.
+
+**Decisões fixadas (confirmadas com o usuário):**
+
+1. **Escopo**: mecanismo completo + `titan-data`. `titan-crypto` e `titan-ai`
+   ficam para as fases 3b/3c — com o mecanismo pronto, cada um vira um crate
+   novo e uma tabela de funções.
+2. **Sintaxe**: `import data` no topo, uso qualificado `data.read_csv(...)` —
+   a forma do `plano.md`, tratada como açúcar de
+   `local data = import "data"` (`localname == modname`).
+3. **Tipos opacos**: `data.DataFrame` é um tipo nominal opaco que o programa
+   carrega e passa adiante, mas cujos campos não pode inspecionar.
+4. **As duas formas de chamada**: `data.read_csv("v.csv")` (função do módulo —
+   não há receptor ainda) e `df.soma("valor")` (método sobre o opaco). Ambas
+   resolvem no mesmo ponto do checker.
+5. **Backend: Polars**, com a API `data.*` como contrato e o backend como
+   detalhe interno (trocável sem mudar o programa Titan).
+6. **Superfície do `titan-data`**: ler CSV, inspecionar (linhas, colunas,
+   coluna→array Titan) e agregar (soma, média, mín, máx).
+
+**Medições que embasam a escolha do backend** (feitas antes de a fase começar):
+
+| Dependência | Build limpo | Observação |
+|---|---|---|
+| crate `csv` | **6,7s** (release) | leve, mas exigiria agregação à mão |
+| `arrow` (default-features off, csv) | **1m54s** (release) | não é o meio-termo leve que se supunha |
+| `polars` (lazy, csv, parquet) | **1m43s** (debug) | motor completo, mesmo custo do Arrow |
+| rebuild incremental | **0,55s** | o custo é pago uma vez e amortizado |
+
+Como Arrow custa o mesmo que Polars, o meio-termo não existe. Decisão:
+**Polars**. O custo é amortizado porque o `titanc` compila em `build/<nome>/`,
+que persiste entre execuções.
+
+**Superfície do Polars 0.51 já validada** (compila e produz os valores
+esperados sobre um CSV real — a T41 não precisa redescobrir):
+
+```rust
+let df = CsvReadOptions::default()
+    .with_has_header(true)
+    .try_into_reader_with_file_path(Some(caminho.into()))?
+    .finish()?;
+df.shape()                                       // (3, 2)
+df.get_column_names()                            // ["cidade", "valor"]
+let c = df.column("valor")?;                     // -> &Column
+c.sum_reduce()?.value().try_extract::<f64>()?    // 35.0
+c.mean_reduce().value().try_extract::<f64>()?    // 11.666…  (sem `?`)
+c.min_reduce()?.value().try_extract::<f64>()?    // 5.0
+c.max_reduce()?.value().try_extract::<f64>()?    // 20.0
+let vs: Vec<i64> = c.i64()?.into_no_null_iter().collect();   // [10, 20, 5]
+```
+
+Duas armadilhas encontradas na validação: `Column` **não** tem `.mean()` (é
+`mean_reduce()`, que não devolve `Result`), e `col("nome")` do `prelude` colide
+com qualquer variável local chamada `col`.
+
+**Decisões técnicas derivadas:**
+
+7. **Módulo é `SymbolKind`, não `Type`.** O original admite que `Type.Module`
+   é um hack (`types.lua:59-67`) e paga com erros espalhados por todo uso
+   indevido (`checker.lua:829-833`, `:398-400`). Aqui `SymbolKind`
+   (`checker.rs:72-90`) ganha `Module { name }` e o `Checker`
+   (`checker.rs:352-368`) ganha um campo `modules` no molde de `records` —
+   módulo-como-valor fica **irrepresentável**.
+8. **`Type::Opaque` entra em `is_composite`** (`codegen.rs:644`), herdando de
+   graça a máquina de lugares da Fase 2: `&mut` em parâmetro (ADR 0007),
+   `clone()` na atribuição (ADR 0006), `emit_place_mut`/`emit_place_expr`.
+   Exigência nova: todo tipo opaco precisa implementar `Clone` (verificado
+   para `polars::DataFrame`).
+9. **Agregações devolvem `float`, sempre** — o Polars devolve `f64` mesmo
+   somando coluna de inteiros. Fazer o retorno depender do tipo da coluna
+   exigiria tipagem dependente de valor, que a linguagem não tem. Já
+   `coluna_integer`/`coluna_float` são funções distintas, porque aí o tipo do
+   array resultante é escolhido pelo programador na chamada.
+10. **Método com ponto, não dois-pontos** — o opaco não tem campos acessíveis,
+    então não há ambiguidade a desfazer, e é `.` que o `plano.md` escreve.
+    `Args::ArgsMethod` segue não construído.
+
+**Convenções de trabalho** (herdadas, seguem valendo):
+- `titan/` e `lua/` são **somente leitura**.
+- Cada tarefa termina com `cargo test` verde antes da seguinte, e um commit.
+- Mensagens de erro do compilador em português — nunca panic.
+
+**Grafo de dependências:**
+`T34` → `T35`; `T36` → `T37` → `T38` → `T39` → `T40` → `T42` → `T43` → `T44`
+→ `T45` → `T46`.
+(T36 é paralela a T34/T35; T41 é paralela a T38–T40; T42 depende de T40 e T41.)
+
+---
+
+## T34 — `lexer.rs`: keyword `import`
+
+**Objetivo:** o único token novo que a fase exige.
+
+**Detalhes:**
+- Novo `TokenKind::KwImport`, junto das demais palavras-chave de fase
+  (`lexer.rs:73-75`).
+- `lex_name_or_keyword` (`lexer.rs:461-486`) ganha `"import" => KwImport`.
+- **Atenção:** `import` deixa de ser identificador válido — registrar a quebra
+  compatível, como foi feito com `as` na T20.
+
+**Critério de aceite:** teste de tokenização de `import data`; e teste
+espelhando `keyword_nova_nao_casa_prefixo_de_identificador` (`lexer.rs:973`),
+provando que `importante` continua sendo `Name`.
+
+**Depende de:** nada.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T35 — `parser.rs`: `import data` e `parse_type` qualificado
+
+**Objetivo:** construir os dois nós que já existem na AST e nunca foram
+produzidos.
+
+**Detalhes:**
+- `parse_toplevel` (`parser.rs:135-155`) reconhece `import Nome` e constrói
+  `TopLevel::TopLevelImport` (`ast.rs:107`) com `localname == modname`
+  (decisão 2). A mensagem de erro do `else` final passa a listar `import`.
+- `parse_type` (`parser.rs:283-337`) checa `Dot` após um `Name` e produz o
+  `Type::TypeQualName` (`ast.rs:40`) — é o `data.DataFrame` como anotação.
+  Sem `Dot`, continua produzindo `TypeName`, como hoje.
+- **Não** aceitar `import data as d` nem `local m = import "data"` — ambos
+  fora de escopo, com erro claro.
+
+**Critério de aceite:** testes de parsing para `import data`,
+`local df: data.DataFrame = ...`, e casos negativos (`import` sem nome,
+`import "data"` com string, alias com `as`).
+
+**Depende de:** T34.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T36 — `types.rs`: `Type::Opaque`
+
+**Objetivo:** representar um tipo que vem do runtime e o programa não pode
+inspecionar.
+
+**Detalhes:**
+- Nova variante `Opaque { module: String, name: String, rust_path: String }`
+  em `types.rs:9-36`.
+- `equals` (`types.rs:41`): nominal por `(module, name)` — como `Record`, que
+  compara só o nome (`types.rs:66`). `rust_path` não entra na comparação (é
+  detalhe de emissão, não identidade).
+- `compatible` (`types.rs:84`): braço explícito, só aceita igual — invariante,
+  pelo mesmo motivo de `Array`/`Map` (ADR 0008): opaco é passado por `&mut`.
+- `type_name` (`checker.rs:2210-2226`) ganha o braço → `data.DataFrame`.
+
+**Critério de aceite:** testes de `equals`/`compatible` no molde dos que já
+existem para `Record` (`types.rs:126-289`), incluindo a prova de que dois
+opacos de módulos diferentes com o mesmo nome não são compatíveis.
+
+**Depende de:** nada. **Paralela a T34/T35.**
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T37 — Tabela de capabilities
+
+**Objetivo:** uma fonte única de verdade sobre módulos, como `BUILTINS` já é
+para `print`.
+
+**Contexto:** `builtins.rs:11-32` tem dois limites que a fase encosta:
+`titan_name` é plano (sem namespace) e `rettype` é escalar (um retorno só).
+
+**Detalhes:**
+- Tabela de módulos (em `builtins.rs` ou num `capabilities.rs` novo) descrevendo,
+  por módulo: nome Titan (`data`), nome do crate (`titan-data`), caminho do
+  crate (para o driver), tipos opacos exportados, e as funções e métodos, cada
+  um com `params`, `rettype` e `rust_path`.
+- Três consumidores, como `BUILTINS` já tem dois: checker (popular o símbolo do
+  módulo e resolver membros), codegen (caminho Rust) e driver (dependência no
+  `Cargo.toml`).
+- Manter `BUILTINS` funcionando sem mudança de comportamento para `print`.
+
+**Critério de aceite:** teste de lookup por módulo e por membro; teste provando
+que capability inexistente é reportada com a lista das disponíveis.
+
+**Depende de:** T36.
+
+**Skills:** `rust-pro` · `clean-code`
+
+---
+
+## T38 — `checker.rs`: registrar o módulo importado
+
+**Objetivo:** `import data` passa a existir para o checker.
+
+**Detalhes:**
+- `SymbolKind` (`checker.rs:72-90`) ganha `Module { name: String }` — módulo
+  não é `Type` (decisão 7).
+- `Checker` (`checker.rs:352-368`) ganha o campo `modules`, no molde de
+  `records`.
+- `collect_signature` (`checker.rs:614-664`) trata `TopLevelImport`: consulta a
+  tabela da T37; se o módulo não existe, erro claro
+  ("capability 'foo' não existe; disponíveis: data"); import duplicado também
+  é erro.
+- Remover o erro morto de `checker.rs:652-654`.
+- `resolve_type` (`checker.rs:753-759`) passa a resolver `TypeQualName` contra
+  o módulo importado, em vez de rejeitar; módulo não importado e tipo
+  inexistente no módulo dão erros distintos.
+- Atribuir a um módulo (`data = 1`) é erro claro, e ele **não** é um `Type`
+  possível de anotação.
+
+**Critério de aceite:** testes de que `import data` registra o símbolo, de que
+`local df: data.DataFrame` resolve, e dos casos negativos acima.
+
+**Depende de:** T37.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T39 — `checker.rs`: chamada qualificada `data.f(...)`
+
+**Objetivo:** o primeiro dos dois caminhos de chamada nova.
+
+**Detalhes:**
+- `TypedExpKind::Call` (`checker.rs:246-292`) troca `callee: String` por um
+  callee estruturado:
+
+  ```rust
+  enum Callee {
+      Direct(String),                            // f(x) e print(x)
+      Module { module: String, name: String },   // data.read_csv(x)
+      Method { recv: Box<TypedExp>, module: String, name: String },
+  }
+  ```
+- **Antes de acrescentar o segundo braço**, extrair a resolução do callee de
+  `check_call` (`checker.rs:2008-2131`, já com ~120 linhas) para uma função à
+  parte — ver risco 4.
+- `check_call` reconhece `Var::VarDot` cuja base é símbolo de módulo (hoje
+  morre em `checker.rs:2015-2019`). A checagem posicional de argumentos,
+  aridade e duplo empréstimo (`checker.rs:2062-2121`) é reusada sem mudança.
+- Erro claro para membro inexistente ("o módulo 'data' não tem função 'foo'").
+
+**Critério de aceite:** testes de tipagem de `data.read_csv("v.csv")`, do erro
+de membro inexistente, de aridade e de argumento com tipo errado.
+
+**Depende de:** T38.
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T40 — `checker.rs`: método sobre tipo opaco `df.f(...)`
+
+**Objetivo:** o segundo caminho, no mesmo ponto do primeiro.
+
+**Detalhes:**
+- No mesmo `match` da T39: base cujo tipo é `Opaque` → `Callee::Method`.
+- O receptor conta como **uso mutável**, pela mesma regra que já vale para
+  argumentos compostos (`checker.rs:2079-2110`) — o opaco é `is_composite`.
+- `df.campo` (acesso sem chamada) é rejeitado com mensagem clara: opaco não tem
+  campos acessíveis. O braço de `VarDot` em `check_var` (`checker.rs:1976-1985`)
+  ganha esse caso antes do erro genérico de "só é possível acessar campo de um
+  record".
+- Método inexistente no opaco dá erro próprio, distinto do de função de módulo.
+
+**Critério de aceite:** testes de `df.soma("valor")`, de método inexistente, e
+de `df.campo` rejeitado com a mensagem específica.
+
+**Depende de:** T39.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T41 — `crates/titan-data`: o Data Runtime
+
+**Objetivo:** a capability real que prova o mecanismo.
+
+**Detalhes:**
+- Crate novo em `crates/titan-data` — entra no workspace pelo glob
+  `members = ["crates/*"]`, sem tocar o `Cargo.toml` raiz.
+- Dependência: `polars` com as features `lazy`, `csv` (as validadas).
+- Superfície: `read_csv`, `linhas`, `colunas`, `coluna_integer`,
+  `coluna_float`, `soma`, `media`, `minimo`, `maximo` — assinaturas do Polars
+  já validadas no resumo executivo.
+- **Padrão de erro herdado do `titan-runtime`** (`lib.rs:35-43`): cada operação
+  tem o par `*_checked -> Result<_, String>` (mensagem em português) mais o
+  wrapper que chama `abortar`. Nenhum erro do Polars em inglês pode vazar:
+  arquivo inexistente, coluna inexistente e coluna de tipo errado viram
+  mensagem própria.
+- Agregações devolvem `f64` sempre (decisão 9).
+
+**Critério de aceite:** testes unitários do crate sobre um CSV de fixture,
+incluindo os três casos de erro acima; nenhum panic em nenhum caminho.
+
+**Depende de:** nada além do workspace. **Paralela a T38–T40.**
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T42 — `codegen.rs`: emissão de chamada qualificada e de método
+
+**Objetivo:** o Rust gerado chama o runtime da capability.
+
+**Detalhes:**
+- `emit_call` (`codegen.rs:942-960`) trata os três `Callee`. Método emite
+  `titan_data::soma(<lugar do receptor>, args...)`, com o receptor por
+  `emit_place_mut` (`codegen.rs:678`) — reusa a máquina de lugares da Fase 2.
+- `rust_type_name` (`codegen.rs:1057`) mapeia `Opaque` para `rust_path`;
+  `rust_param_type_name` (`codegen.rs:1083`) o passa por `&mut`;
+  `is_composite` (`codegen.rs:644`) o inclui. `emit_record_struct` **não** o
+  toca — opaco não é declarado no programa.
+- **Generalizar a ABI de argumentos** (risco 3): hoje o caminho de builtin
+  passa *todos* os args por `borrow_runtime_str` (`codegen.rs:943-946`), o que
+  só está correto porque `print` é o único builtin e recebe string. Passa a
+  ser por-parâmetro, olhando `params`.
+
+**Critério de aceite:** testes de `generate_source` conferindo o Rust emitido
+para chamada de módulo, chamada de método e variável de tipo opaco; e um teste
+de builtin com assinatura mista provando a ABI generalizada.
+
+**Depende de:** T40, T41.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T43 — `driver.rs`: dependências condicionais no `Cargo.toml`
+
+**Objetivo:** o projeto gerado depende só das capabilities que o programa usa.
+
+**Detalhes:**
+- `generate_cargo_toml(name, runtime_path)` (`driver.rs:121-131`) vira
+  `generate_cargo_toml(name, deps)`, com `titan-runtime` sempre presente e uma
+  entrada por módulo importado.
+- O caminho de cada crate sai do mesmo truque de `runtime_crate_path()`
+  (`driver.rs:129`): `env!("CARGO_MANIFEST_DIR").join("../titan-X")`.
+- `checker::check` (ou o driver) passa a expor os módulos importados.
+- Atualizar o teste `gera_cargo_toml_com_workspace_vazio_e_path_absoluto`
+  (`driver.rs:234-241`) e acrescentar um que prove que programa sem `import`
+  **não** ganha a dependência pesada.
+
+**Critério de aceite:** `--emit-rust` inalterado; `hello.titan` continua
+gerando um `Cargo.toml` com apenas `titan-runtime`.
+
+**Depende de:** T42.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T44 — Curadoria dos testes de integração
+
+**Objetivo:** o que era fora de escopo e passou a funcionar sai da tabela de
+negativos; o que continua fora ganha caso próprio.
+
+**Detalhes:**
+- Mover `import_de_modulo` (`integration.rs:365-368`) da tabela de fora-de-escopo
+  para caso positivo — há precedente documentado desse movimento na T30/T31
+  (`integration.rs:344-349`). Note que o fonte lá usa
+  `local m = import "foo"`, que **continua** sendo erro: reescrever para
+  `import data`.
+- Novos casos negativos, cada um pela tripla de `verifica_caso_negativo`
+  (`integration.rs:292-328`) — sem panic, erro claro, sem deixar `build/` para
+  trás: capability inexistente, função inexistente no módulo, método
+  inexistente no opaco, acesso a campo de opaco, módulo usado como valor,
+  atribuição a módulo, `import data as d`, `local m = import "data"`, e
+  `df:soma()` com dois-pontos.
+- Os casos novos devem usar `--emit-rust` sempre que possível, para não pagar
+  o build do Polars (risco 1).
+
+**Critério de aceite:** `cargo test` verde; nenhum caso negativo invoca o
+`cargo build` do projeto gerado desnecessariamente.
+
+**Depende de:** T43.
+
+**Skills:** `test-driven-development` · `verification-before-completion`
+
+---
+
+## T45 — `examples/dados.titan` e integração ponta a ponta
+
+**Objetivo:** a prova da fase, num programa que um usuário escreveria.
+
+**Detalhes:**
+- CSV de exemplo versionado em `examples/`.
+- `examples/dados.titan`: `import data`, leitura, dimensões, extração de uma
+  coluna como array Titan (exercitando a Fase 2 sobre o resultado), e
+  agregação **pelas duas formas** — `data.soma(df, "valor")` e
+  `df.soma("valor")` — imprimindo um relatório.
+- Teste no molde de
+  `compila_e_executa_compostos_titan_conferindo_stdout_e_exit_code`
+  (`integration.rs:138`), conferindo stdout e exit code.
+- Conferir que `hello`, `nucleo` e `compostos` continuam com a mesma saída.
+
+**Critério de aceite:** `./target/release/titanc examples/dados.titan && ./dados`
+imprime o relatório e sai com 0.
+
+**Depende de:** T44.
+
+**Skills:** `test-driven-development` · `verification-before-completion`
+
+---
+
+## T46 — ADRs, documentação e fechamento da Fase 3
+
+**Objetivo:** deixar as decisões não-óbvias registradas e o projeto
+compreensível.
+
+**Entregáveis:**
+- ADRs `0011`–`0015` no formato Status/Contexto/Decisão/Consequências,
+  seguindo `0007-parametros-compostos-por-mut.md`:
+
+  | ADR | Decisão |
+  |---|---|
+  | 0011 | `import data` como açúcar de `local data = import "data"` (diverge do original) |
+  | 0012 | Módulo é `SymbolKind`, não tipo (diverge do `Type.Module` do original) |
+  | 0013 | Tipo opaco `Type::Opaque`, composto por herança (exige `Clone`) |
+  | 0014 | Método com ponto, não dois-pontos (diverge do original) |
+  | 0015 | API `data.*` é o contrato, backend é detalhe interno (Polars trocável) |
+
+- `docs/adr/README.md`: acrescentar as 5 linhas à tabela.
+- `README.md`: estado → Fase 3; mover `import`, métodos e capability runtimes
+  de "o que não está implementado ainda" para o coberto; documentar o custo de
+  build/disco do Polars (risco 1); acrescentar `examples/dados.titan`.
+- `docs/arquitetura.md`: tabela de mapeamento de tipos com `Opaque`; o
+  `Cargo.toml` gerado deixando de ter dependência fixa; `titan-data` no
+  diagrama do pipeline.
+- `PRD.md`: marcar a Fase 3 como concluída no roadmap.
+
+**Depende de:** T45.
+
+**Skills:** `readme` · `docs-architect` · `architecture-decision-records`
+
+---
+
+## Revisão de qualidade (contínua)
+
+Como nas fases anteriores: revisão de código ao fim de **T42** e novamente ao
+fim de **T45**, antes de seguir.
+
+**Skills:** `code-reviewer` · `architect-review` · `find-bugs`
+
+---
+
+## Riscos da fase
+
+1. **Custo do Polars: ~2min de build e ~3GB de `target/` por programa.** Ambos
+   medidos antes da fase começar. Como o `titanc` gera um projeto Cargo por
+   programa (`build/<nome>/`), o disco é consumido por programa, não uma vez.
+   Não bloqueia, mas precisa estar no README. Mitigar nos testes: **um único**
+   caso ponta a ponta com Polars (T45); todos os demais usam `--emit-rust`,
+   que não invoca o `cargo`.
+2. **`Opaque` em `is_composite`** propaga `&mut` e `clone()` por toda a máquina
+   de lugares. É o que barateia a fase, mas exige `Clone` em todo tipo de
+   runtime — e um `Clone` caro seria um custo silencioso, sem erro nenhum.
+   Verificado para `DataFrame`; registrar a exigência no ADR 0013 antes que a
+   fase 3b acrescente um tipo opaco onde clonar não seja barato.
+3. **A ABI de argumentos de builtin** (`borrow_runtime_str` para todos,
+   `codegen.rs:943-946`) só está correta porque `print` é o único builtin e
+   recebe string. A generalização na T42 é pré-requisito de qualquer função de
+   capability com assinatura mista — se esquecida, o Rust gerado não compila e
+   o erro vem em inglês do rustc.
+4. **`check_call` acumula três formas de chamada** (direta, qualificada,
+   método) num corpo que já tem ~120 linhas. Extrair a resolução do callee para
+   uma função à parte **na T39**, antes de a terceira entrar.
+
+---
+
+## Fora de escopo nesta fase
+
+Rejeitar com erro claro (nunca panic): `foreign import`, `import` com alias
+(`import data as d`), `local m = import "data"` (a forma do original), módulos
+definidos pelo usuário (um `.titan` importando outro `.titan` — esta fase só
+tem capabilities internas), `titan-crypto`, `titan-ai`, `Option`/`?`, cast
+(`as`), retornos múltiplos, multi-assign, declaração múltipla, `repeat`/`until`,
+`break`/`continue`, bitwise (`& | ~ << >>`), `//`, e `df:metodo()` com
+dois-pontos.
+
+**Redox OS** segue fora de escopo — compilar para Linux nativo.
+
+---
+
+## Roadmap atualizado (fim da Fase 3)
+
+| Fase | Escopo | Estado |
+|---|---|---|
+| **0. Hello world** | pipeline completo, subconjunto mínimo | ✅ **Concluída** |
+| **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
+| **2. Tipos compostos** | arrays, maps, records, strings dinâmicas | ✅ **Concluída** |
+| **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | Em andamento |
+| 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
+| 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
 | 4. Self-hosting / LSP | compilador escrito na própria linguagem | Pendente |
