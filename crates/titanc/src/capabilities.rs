@@ -83,7 +83,22 @@ impl Capability {
     }
 }
 
-pub const CAPABILITIES: &[Capability] = &[];
+/// Módulo `data`, com um único tipo opaco `DataFrame` e nenhuma
+/// função/método ainda — o suficiente para o checker (T38) resolver
+/// `import data` e `data.DataFrame`. T41 é quem acrescenta o crate real
+/// `titan-data` e passa a popular `functions`.
+const DATA_OPAQUE_TYPES: &[OpaqueType] = &[OpaqueType {
+    titan_name: "DataFrame",
+    rust_path: "titan_data::DataFrame",
+}];
+
+pub const CAPABILITIES: &[Capability] = &[Capability {
+    titan_name: "data",
+    crate_name: "titan-data",
+    crate_path: "crates/titan-data",
+    opaque_types: DATA_OPAQUE_TYPES,
+    functions: &[],
+}];
 
 /// Busca um módulo de capability pelo nome usado em `import`.
 pub fn lookup_module(titan_name: &str) -> Option<&'static Capability> {
@@ -169,20 +184,17 @@ mod tests {
 
     #[test]
     fn lookup_module_por_nome_titan() {
-        // A tabela real (`CAPABILITIES`) ainda está vazia (T41 é quem
-        // acrescenta `data`) — o teste de integração usa uma tabela local
-        // para não depender de T41 nem quebrar quando ela chegar.
-        assert!(lookup_module("data").is_none());
+        // `data` é o stub real que o checker (T38) já enxerga; T41 é quem
+        // acrescenta o crate de verdade por trás dele.
+        assert!(lookup_module("data").is_some());
         assert!(lookup_module("inexistente").is_none());
     }
 
     #[test]
     fn capability_inexistente_reporta_lista_de_disponiveis() {
-        // Hoje a tabela real está vazia (nenhum módulo implementado ainda),
-        // então a lista de disponíveis é vazia — mas a função de listagem já
-        // é a mesma que o checker (T38) vai usar para montar a mensagem de
-        // erro "capability 'foo' não existe; disponíveis: ...".
-        assert_eq!(available_module_names(), Vec::<&str>::new());
+        // Mesma função de listagem que o checker (T38) usa para montar a
+        // mensagem de erro "capability 'foo' não existe; disponíveis: ...".
+        assert_eq!(available_module_names(), vec!["data"]);
     }
 
     #[test]

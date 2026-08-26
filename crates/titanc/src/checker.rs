@@ -68,7 +68,7 @@ type DeclId = usize;
 
 /// Como um nome foi introduzido no escopo — decide o que uma atribuição a
 /// ele significa.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum SymbolKind {
     /// Função top-level ou do runtime (`print`). Atribuição é rejeitada
     /// ("trying to assign to a function", `checker.lua:401`).
@@ -84,6 +84,11 @@ enum SymbolKind {
     /// Local declarada com `local`; atribuições registram o `DeclId` para o
     /// fix-up de mutabilidade ao final do corpo da função.
     Local { decl_id: DeclId },
+    /// Módulo trazido por `import` (T38). Não é um `Type` (decisão 7 da
+    /// Fase 3): não pode ser anotação de variável nem alvo de atribuição —
+    /// só existe para `data.f(...)`/`data.DataFrame` resolverem contra a
+    /// tabela de capabilities (`capabilities.rs`, T37).
+    Module { name: String },
 }
 
 /// Entrada da tabela de símbolos: o tipo e a origem do nome.
@@ -364,6 +369,11 @@ struct Checker {
     /// hoje — só primitivas e compostos estruturais são resolvidos em
     /// `resolve_type`.
     records: HashMap<String, Type>,
+    /// Módulos importados (`import data`, T38), no molde de `records`:
+    /// nome Titan → entrada da tabela de capabilities (`capabilities.rs`,
+    /// T37), consultada por `resolve_type` (`data.DataFrame`) e por
+    /// `check_call`/`check_var` (T39/T40) para membros do módulo.
+    modules: HashMap<String, &'static crate::capabilities::Capability>,
 }
 
 impl Checker {
@@ -387,6 +397,7 @@ impl Checker {
             next_decl_id: 0,
             assigned: HashSet::new(),
             records: HashMap::new(),
+            modules: HashMap::new(),
         }
     }
 
@@ -650,8 +661,34 @@ impl Checker {
             // Já processado por `collect_records`, que roda antes (T29 —
             // duas sub-passadas: records primeiro, funções depois).
             TopLevel::TopLevelRecord { .. } => {}
-            TopLevel::TopLevelImport { loc, .. } => {
-                self.error(*loc, "`import` não é suportado nesta fase.");
+            TopLevel::TopLevelImport {
+                loc, modname, ..
+            } => {
+                if self.st.find_symbol(modname).is_some() || self.modules.contains_key(modname) {
+                    self.error(*loc, format!("'{modname}' já foi declarado antes."));
+                    return;
+                }
+                match crate::capabilities::lookup_module(modname) {
+                    Some(capability) => {
+                        self.modules.insert(modname.clone(), capability);
+                        self.st.add_symbol(
+                            modname,
+                            Type::Invalid,
+                            SymbolKind::Module {
+                                name: modname.clone(),
+                            },
+                        );
+                    }
+                    None => {
+                        let available = crate::capabilities::available_module_names().join(", ");
+                        self.error(
+                            *loc,
+                            format!(
+                                "capability '{modname}' não existe; disponíveis: {available}."
+                            ),
+                        );
+                    }
+                }
             }
             TopLevel::TopLevelForeignImport { loc, .. } => {
                 self.error(*loc, "`foreign import` não é suportado nesta fase.");
@@ -750,12 +787,25 @@ impl Checker {
                     None
                 }
             },
-            ast::Type::TypeQualName { loc, .. } => {
-                self.error(
-                    *loc,
-                    "tipo qualificado por módulo não é suportado nesta fase.",
-                );
-                None
+            ast::Type::TypeQualName { loc, module, name } => {
+                let Some(capability) = self.modules.get(module) else {
+                    self.error(*loc, format!("módulo '{module}' não foi importado."));
+                    return None;
+                };
+                match capability.find_opaque(name) {
+                    Some(opaque) => Some(Type::Opaque {
+                        module: module.clone(),
+                        name: name.clone(),
+                        rust_path: opaque.rust_path.to_string(),
+                    }),
+                    None => {
+                        self.error(
+                            *loc,
+                            format!("o módulo '{module}' não tem o tipo '{name}'."),
+                        );
+                        None
+                    }
+                }
             }
         }
     }
@@ -1198,6 +1248,15 @@ impl Checker {
                         self.error(*var_loc, "não é possível atribuir a uma função.");
                         return None;
                     }
+                    // Módulo (T38): `data = 1` não faz sentido — o nome
+                    // designa o módulo importado, não um valor.
+                    SymbolKind::Module { .. } => {
+                        self.error(
+                            *var_loc,
+                            format!("não é possível atribuir ao módulo '{name}'."),
+                        );
+                        return None;
+                    }
                     SymbolKind::Param if is_composite(&symbol.ty) => {
                         // T29: parâmetro composto aceita `xs[i] = v` (via o
                         // braço `VarBracket`/`VarDot` abaixo — `check_assign`
@@ -1266,6 +1325,13 @@ impl Checker {
                 match root_symbol.kind {
                     SymbolKind::Global => {
                         self.error(loc, "não é possível atribuir a uma função.");
+                        return None;
+                    }
+                    SymbolKind::Module { .. } => {
+                        self.error(
+                            loc,
+                            format!("não é possível atribuir ao módulo '{root_name}'."),
+                        );
                         return None;
                     }
                     SymbolKind::Param if !is_composite(&root_symbol.ty) => {
@@ -1915,11 +1981,23 @@ impl Checker {
     }
 
     /// Tipa um `Var` em posição de leitura (`ExpVar`) — `VarBracket`/`VarDot`
-    /// espelham `checker.lua:541-564` e `:482-539` (T29), simplificados sem
-    /// módulos/métodos, que seguem fora de escopo.
+    /// espelham `checker.lua:541-564` e `:482-539` (T29). Chamada/acesso
+    /// qualificados a membro de módulo (`data.f(...)`, `df.f(...)`) seguem
+    /// fora de escopo até T39/T40.
     fn check_var(&mut self, _loc: &Loc, var: &Var) -> Option<TypedExp> {
         match var {
             Var::VarName { loc, name } => match self.st.find_symbol(name).cloned() {
+                // Módulo (T38): só existe para `data.f(...)`/`data.Tipo`
+                // (T39/T40) resolverem contra a tabela de capabilities — não
+                // é um valor, então usá-lo sozinho (`local x = data`) é
+                // erro claro em vez de vazar `Type::Invalid`.
+                Some(Symbol {
+                    kind: SymbolKind::Module { .. },
+                    ..
+                }) => {
+                    self.error(*loc, format!("'{name}' é um módulo, não um valor."));
+                    None
+                }
                 Some(symbol) => Some(TypedExp {
                     loc: *loc,
                     ty: symbol.ty,
@@ -2422,6 +2500,142 @@ mod tests {
 
         let errs = check(&program).unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("foreign import")));
+    }
+
+    // ---- T38: `import data` registra o módulo -----------------------------
+
+    #[test]
+    fn import_data_e_aceito_e_registra_o_simbolo() {
+        let source =
+            "import data\n\nfunction main(args: {string}): integer\n    return 0\nend";
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        assert_eq!(typed.len(), 1);
+    }
+
+    #[test]
+    fn parametro_com_tipo_qualificado_do_modulo_importado_resolve() {
+        // A T38 só cobre a resolução do tipo `data.DataFrame` em anotações —
+        // construir um valor desse tipo (`data.read_csv(...)`) é a T39. Um
+        // parâmetro tipado exercita `resolve_type`/`TypeQualName` sem
+        // precisar de um valor atribuível ainda.
+        let source = r#"import data
+
+function usa(df: data.DataFrame): integer
+    return 0
+end
+
+function main(args: {string}): integer
+    return 0
+end"#;
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let TypedTopLevel::Func { params, .. } = &typed[0] else {
+            panic!("esperava TypedTopLevel::Func, obteve {:?}", typed[0]);
+        };
+        assert_eq!(
+            params[0].1,
+            Type::Opaque {
+                module: "data".to_string(),
+                name: "DataFrame".to_string(),
+                rust_path: "titan_data::DataFrame".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn import_de_capability_inexistente_produz_erro_com_lista_de_disponiveis() {
+        let source =
+            "import inexistente\n\nfunction main(args: {string}): integer\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| {
+            e.message.contains("capability 'inexistente' não existe")
+                && e.message.contains("disponíveis")
+                && e.message.contains("data")
+        }));
+    }
+
+    #[test]
+    fn import_duplicado_produz_erro_claro() {
+        let source =
+            "import data\nimport data\n\nfunction main(args: {string}): integer\n    return 0\nend";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'data' já foi declarado antes"))
+        );
+    }
+
+    #[test]
+    fn tipo_qualificado_de_modulo_nao_importado_produz_erro_claro() {
+        let source = r#"function main(args: {string}): integer
+    local df: data.DataFrame = nil
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("módulo 'data' não foi importado"))
+        );
+    }
+
+    #[test]
+    fn tipo_inexistente_no_modulo_importado_produz_erro_distinto() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local s: data.Series = nil
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("o módulo 'data' não tem o tipo 'Series'"))
+        );
+    }
+
+    #[test]
+    fn atribuir_a_um_modulo_importado_produz_erro_claro() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    data = 1
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("não é possível atribuir ao módulo 'data'"))
+        );
+    }
+
+    #[test]
+    fn usar_modulo_importado_como_valor_produz_erro_claro() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local x = data
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'data' é um módulo, não um valor"))
+        );
     }
 
     #[test]
