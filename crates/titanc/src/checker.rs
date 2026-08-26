@@ -2221,6 +2221,7 @@ fn type_name(ty: &Type) -> String {
         Type::Map { keys, values } => format!("map {{{}: {}}}", type_name(keys), type_name(values)),
         Type::Record { name, .. } => name.clone(),
         Type::Option { base } => format!("{}?", type_name(base)),
+        Type::Opaque { module, name, .. } => format!("{}.{}", module, name),
     }
 }
 
@@ -2268,6 +2269,16 @@ mod tests {
         let program =
             parse(&tokens).unwrap_or_else(|e| panic!("fonte não deveria ter erro sintático: {e}"));
         check(&program)
+    }
+
+    #[test]
+    fn type_name_de_opaco_e_qualificado_por_modulo() {
+        let df = Type::Opaque {
+            module: "data".to_string(),
+            name: "DataFrame".to_string(),
+            rust_path: "titan_data::DataFrame".to_string(),
+        };
+        assert_eq!(type_name(&df), "data.DataFrame");
     }
 
     #[test]
