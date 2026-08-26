@@ -662,3 +662,651 @@ Rejeitar com erro claro (nunca panic): records, maps, arrays manipuláveis (`v[i
 | 2. Tipos compostos | arrays, maps, records, strings dinâmicas — ownership/borrow mordem aqui | Pendente |
 | 3. Capability Runtimes | AI, Crypto, Data (`titan-ai`, `titan-crypto`…) | Pendente |
 | 4. Self-hosting / LSP | compilador escrito na própria linguagem | Pendente |
+
+---
+---
+
+# PRD — Titan-Rust · Fase 2: Tipos compostos
+
+> Continuação da Fase 1 (T10–T18, **concluída**). Objetivo da fase:
+> `titanc examples/compostos.titan && ./compostos` cria e manipula arrays,
+> records e maps — inclusive um array ordenado in-place por uma função.
+
+## Resumo executivo
+
+A Fase 2 é a que o roadmap sempre marcou como **alta complexidade**: é onde a
+escolha do modelo de memória em Rust deixa de poder ser adiada. A Fase 0 foi
+desenhada para não fechar essa porta, isolando o mapeamento de tipos em
+`rust_type_name`/`rust_param_type_name` (`codegen.rs:617,634`).
+
+**Ponto de partida favorável:** a `ast.rs` já é completa — `ExpInitList`, `Field`,
+`VarBracket`, `VarDot`, `TopLevelRecord`, `TypeMap`, `TypeName` já existem. Como
+nas fases anteriores, a fase não adiciona nós à AST bruta (a única exceção é o
+campo `Field.name`, T27, que ganha fidelidade ao original). O `types.rs` também
+já tem `Array`, `Map`, `Record` e `Option` completos.
+
+**Referências vivas no Titan original** (`titan/`, somente leitura): decisão
+array/map/record de `ExpInitList` em `checker.lua:646-662` · indexação em
+`checker.lua:541-564` · records em `checker.lua:1441-1461` · `#` em
+`checker.lua:852-860` · representação de memória em `coder.lua:474-488`.
+
+**Decisões fixadas (confirmadas com o usuário):**
+
+1. **Semântica de valor**: `{integer}` → `Vec<i64>`, record → `struct` Rust
+   própria; `local b = a` emite `let b = a.clone();`. Sem `Rc`, sem `RefCell`,
+   sem aliasing. Diverge do original (que aliasa) e do Rust idiomático (que
+   moveria). Custo O(n) aceito conscientemente.
+2. **Escopo**: arrays + records + maps. Fora: `Option`/`?`, cast `as`, métodos,
+   `import`, multi-assign, retornos múltiplos, bitwise.
+3. **`v[i]` tem tipo `T`** (não `T?` como o original), com checagem de faixa no
+   `titan-runtime` e mensagem em português — nunca o panic cru do Rust.
+4. **Parâmetros compostos por `&mut`** — decisão independente da 1: clonar na
+   atribuição não obriga a clonar na passagem. É o que faz
+   `selection_sort(xs: {integer}): nil` (o idioma central da referência,
+   `titan/testfiles/selection_sort.titan`) funcionar de verdade; por valor, ele
+   ordenaria uma cópia e o chamador não veria nada — bug silencioso.
+5. **Escrever em `#v + 1` faz append**; qualquer outro índice fora da faixa
+   aborta com mensagem clara. Não replica o crescimento livre do original, que
+   exigiria inventar valores default (impossível para `{Ponto}`).
+
+**Decisões técnicas derivadas:**
+
+6. **`string` passa a ser sempre `String`**, em toda posição — colapsa a
+   dualidade `&str`/`String` hoje espalhada por 5 funções do codegen
+   (`:403,492,566,589,607`). A alternativa (anotar `Owned`/`Borrowed` no
+   `TypedExp`) foi rejeitada: propagaria a dualidade para dentro de
+   `Vec<String>` e dos campos de record, multiplicando os casos.
+7. **`Array`/`Map` viram invariantes em `compatible`** (`types.rs:80`) — a
+   covariância atual (`{value}` aceita `{integer}`) é *unsound* com arrays
+   mutáveis passados por `&mut`.
+8. **Construções que o rustc recusaria em inglês passam a ser rejeitadas pelo
+   checker, em português**: `f(xs, xs)` (duplo empréstimo), record recursivo,
+   nome de record colidindo com tipo do Rust, chave de map `float`.
+
+**Convenções de trabalho** (herdadas, seguem valendo):
+- `titan/` e `lua/` são **somente leitura**.
+- Cada tarefa termina com `cargo test` verde antes da seguinte.
+- Mensagens de erro do compilador em português — nunca panic.
+
+**Grafo de dependências:**
+`T19` → `T20`,`T21` → `T22` → `T23` → `T24` → `T25`,`T26` → `T27` → `T28` →
+`T29` → `T30` → `T31` → `T32` → `T33`.
+(T20/T21 e T25/T26 são paralelizáveis entre si.)
+
+**Skills transversais:** `rust-pro` · `clean-code` · `test-driven-development` ·
+`verification-before-completion`
+
+---
+
+## T19 — Restaurar `examples/nucleo.titan` e reverdear a baseline
+
+**Objetivo:** a Fase 2 não começa sobre teste vermelho.
+
+**Contexto:** `cargo test` **não está verde** — 1 de 143 testes falha. O commit
+`e7bf378` (T18) alterou `examples/nucleo.titan` de forma que quebra os
+algoritmos: além de `fatorial(5)`→`fatorial(50)` e `fibonacci(10)`→`fibonacci(100)`,
+mudou os **casos-base** de `n <= 1` para `n <= 10` nas duas funções. O resultado
+estoura o `i64` e produz `Fatorial de 50: -3258495067890909184`, enquanto
+`crates/titanc/tests/integration.rs:110` espera `Fatorial de 5: 120`. Não é bug
+do compilador.
+
+**Detalhes:**
+- `git show f617127:examples/nucleo.titan > examples/nucleo.titan`.
+- Conferir se `README.md` ou `docs/` citam os valores alterados; se sim, alinhar.
+- Registrar em uma linha que o T18 introduziu a regressão — o histórico importa.
+
+**Critério de aceite:** `cargo test` verde (143/143).
+`./target/release/titanc examples/nucleo.titan && ./nucleo` imprime
+`Fatorial de 5: 120` / `Fibonacci de 10: 55`, exit 0.
+
+**Depende de:** nada. **É pré-requisito de toda a fase.**
+
+**Skills:** `verification-before-completion`
+
+---
+
+## T20 — `lexer.rs`: `[` `]` `.` `#` e keywords `record`/`as`
+
+**Objetivo:** os tokens que arrays, records e maps exigem, sem quebrar long strings.
+
+**Detalhes:**
+- Novos `TokenKind`: `LBracket`, `RBracket`, `Dot`, `Hash`, `KwRecord`, `KwAs`.
+- `lex_name_or_keyword` (`lexer.rs:433`) ganha `record` e `as`. **Atenção:** `as`
+  deixa de ser identificador válido — é reservada no original, mas registrar a
+  quebra compatível.
+- `.` isolado → `Dot`: o braço `'.' if self.peek2() == Some('.')` (que produz
+  `Concat`) ganha um `else`. Não afeta `lex_number`, que já testa
+  `peek() == Some('.') && peek2() != Some('.')`.
+- **Armadilha do `long_bracket_level`** (`lexer.rs:199,500`): hoje qualquer `[`
+  seguido de `[` ou `=*[` vira long string **antes** de virar `LBracket`. A boa
+  notícia é que **`a[b[1]]` não colide** — o `[b` faz `long_bracket_level`
+  devolver `None`. O único caso ambíguo é `a[[b]]`, que nenhum programa Titan
+  válido escreve. **Manter a precedência atual** (long string ganha, como no
+  Lua) e documentar com teste.
+
+**Critério de aceite:** testes de tokenização para `v[1]`, `p.campo`, `#v`,
+`record Ponto`, `x as integer`, `a[b[1]]` (indexação aninhada, 5 tokens), e o
+teste que documenta `a[[b]]` como long string. Ajustar os trechos esperados de
+`integration.rs:288,353` (sem `#[ignore]`).
+
+**Depende de:** T19. **Paralela a T21.**
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T21 — `types.rs`: variância invariante e braços faltantes
+
+**Objetivo:** fechar o buraco de soundness antes que arrays mutáveis o explorem.
+
+**Contexto:** `compatible` (`types.rs:73`) hoje é covariante em `Array`
+(`:80`), fazendo `{value}` aceitar `{integer}`. Com arrays mutáveis passados por
+`&mut` (decisão 4), isso é *unsound* da forma clássica: escrever uma `string`
+através de uma referência `{value}` que aponta para um `{integer}`.
+
+**Detalhes:**
+- Braços `Array` e `Map` passam de `compatible` recursivo para `equals`.
+- `Record` (nominal, via `equals`) e `Option` (invariante) ganham braço
+  explícito, saindo do `_ => false` — a intenção passa a estar escrita.
+- `Value` continua compatível com tudo **no topo** da função: a invariância é só
+  *dentro* do composto.
+- Atualizar `arrays_compativeis_por_elemento_compativel` (`types.rs:175`), que
+  hoje **afirma** a covariância, com comentário apontando o ADR 0008.
+
+**Critério de aceite:** `{value}` não aceita `{integer}` nem vice-versa;
+`{integer}` aceita `{integer}`; `Record{"P"}` aceita `Record{"P"}` e recusa
+`Record{"Q"}`; `value` segue compatível com `{integer}`.
+
+**Depende de:** T19. **Paralela a T20.**
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T22 — `parser.rs`: `parse_type` completo (map, `TypeName`, `value`)
+
+**Objetivo:** anotações de tipo dos compostos, e correção de um bug latente.
+
+**Detalhes:**
+- **Bug latente**: `TokenKind::KwValue` existe no lexer, mas `parse_type`
+  (`parser.rs:242`) não tem braço para ele — `local x: value` dá "Esperava um
+  tipo". Acrescentar `KwValue` → `TypeValue`. (O `resolve_type` já o mapeia; a
+  rejeição passa a ser do checker, em T25.)
+- `TokenKind::Name(_)` → `Type::TypeName { loc, name }` — é assim que um record é
+  referenciado; **não existe `TypeRecord`**.
+- **`{T}` vs `{K: V}`**: ambos começam com `{`. O original usa backtrack de PEG
+  (tenta Map, depois Array); aqui, sendo descida recursiva determinística:
+  consumir `{`, parsear um tipo, e **olhar o próximo token** — `:` → map;
+  `}` → array; outra coisa → erro claro. Sem keyword `map`.
+- `?` (option) **não** entra — segue fora de escopo, com erro léxico claro.
+- Atualizar a mensagem do braço `_` para listar as formas novas.
+
+**Critério de aceite:** parseiam `{integer}`, `{{integer}}`, `{string: integer}`,
+`Ponto`, `value`; erro claro para `{integer:}`, `{: integer}`, `{integer`.
+
+**Depende de:** T20, T21.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns`
+
+---
+
+## T23 — `parser.rs`: loop de sufixos (`[`, `.`, `(`) e `record` no topo
+
+**Objetivo:** o ponto central da sintaxe — `v[i]`, `p.campo` e a declaração de
+record.
+
+**Detalhes:**
+- **`parse_suffixed_exp` (`parser.rs:658`)** — hoje um `while self.check(&LParen)`
+  que só trata chamada. Vira um loop de três sufixos:
+  `(` → `ExpCall` (como hoje) · `[` → `VarBracket` (espera `]`) ·
+  `.` → `VarDot` (espera `Name`). `VarBracket`/`VarDot` são embrulhados em
+  `ExpVar` para poderem seguir sendo sufixados (`a[1].campo[2]`).
+- **`parse_stat_assign` (`:415`) não muda** — já aceita qualquer `Exp::ExpVar` e
+  extrai o `Var`, então `v[i] = x` e `p.campo = x` passam de graça.
+- **`parse_toplevel` (`:128`)** ganha `KwRecord` → `parse_toplevel_record`,
+  produzindo `TopLevelRecord { loc, name, fields: Vec<Decl> }` (campos são
+  `Decl`, reusando `parse_decl`, até `end`; `;` opcional entre campos).
+- **Não replicar o desaçúcar do original** (`parser.lua:215-229`, que gera um
+  `TopLevelStatic` sintético `Nome.new`): métodos estáticos estão fora do escopo,
+  e implementá-los só para o construtor traria um caso especial que nada mais
+  usa. Comentário no código apontando o ADR 0009.
+
+**Critério de aceite:** parseiam `v[1]`, `v[i+1]`, `a[1][2]`, `p.x`, `p.a.b`,
+`f()[1].c`, `v[1] = 2`, `p.x = 3`, `record Ponto x: float y: float end`. Erro
+claro para `v[]`, `v[1`, `p.`, `record end`, `record P x end`. Testes **de
+parser** (AST montada) — o checker ainda rejeita tudo isso.
+
+**Depende de:** T22.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns`
+
+---
+
+## T24 — `string` é sempre `String`: fim da dualidade `&str`/`String`
+
+**Objetivo:** pagar a dívida técnica **antes** que strings dentro de compostos a
+tornem insustentável.
+
+**Contexto:** hoje a dualidade está espalhada por cinco funções acopladas —
+`emit_slot_value` (`:403`), `str_ord_operand` (`:492`), `concat_operand` (`:566`),
+`coerce_to_borrowed_str` (`:589`), `is_owned_string_expr` (`:607`) — e o próprio
+doc-comment em `:598-606` admite que o checker não anota o "nascimento" da
+variável, então trata todo `Var: string` como dono e coage sempre. Com
+`Vec<String>` e campos de record isso não escala.
+
+**Detalhes:**
+- `Type::String` → `"String"` em **toda** posição; apagar o caso especial de
+  `rust_param_type_name` (`:634`), que pode deixar de existir.
+- Colapsar as 5 funções em ≤2: uma que decide `.clone()` e outra que decide `&`
+  na fronteira do runtime. Comparação de ordem passa a funcionar direto
+  (`String: PartialOrd<String>`), eliminando `str_ord_operand`.
+- **`ENTRY_SHIM` (`:47`)**: passar `&mut args`, e `main(args: {string})` vira
+  `&mut Vec<String>` — elimina a última exceção `&[String]` de
+  `rust_type_name:624`, deixando o mapeamento com zero casos especiais.
+- Custo aceito: `f("literal")` passa a alocar. É o mesmo O(n) que a decisão 1 já
+  aceitou, em troca de eliminar uma classe inteira de bugs.
+
+**Critério de aceite:** `hello.titan` e `nucleo.titan` seguem compilando com a
+saída correta (regressão ponta a ponta); comparação `s1 < s2` entre duas
+variáveis funciona; Rust gerado **sem warnings**; contagem de funções de string
+no codegen cai de 5 para ≤2.
+
+**Depende de:** T23. **É pré-requisito duro de T26** — `Vec<&str>` vs
+`Vec<String>` é o pântano que a fase inteira tenta evitar.
+
+**Skills:** `rust-pro` · `clean-code` · `architect-review`
+
+---
+
+## T25 — `checker.rs`: tabela de builtins e refatoração da AST tipada
+
+**Objetivo:** preparar as estruturas que o resto da fase preenche — sem ainda
+aceitar construção nova. Tarefa **puramente estrutural**.
+
+**Detalhes (A — builtins):**
+- Novo `crates/titanc/src/builtins.rs` (declarado em `main.rs`; o `titanc` é
+  crate binário puro, sem `lib.rs`): `struct Builtin { titan_name, rust_path,
+  params, rettype }`, `const BUILTINS`, `fn lookup`.
+- `Checker::new` (`checker.rs:312`) itera `BUILTINS` em vez do `print`
+  hard-coded; `emit_call` (`codegen.rs:573`) consulta `lookup` em vez do
+  `if callee == "print"`. Hoje as duas pontas conhecem `print` de forma
+  independente e não sincronizada.
+
+**Detalhes (B — AST tipada):**
+- `TypedTopLevel` (`:134`) ganha `Record { loc, name, fields }` — **isso quebra
+  `codegen.rs:61`** (o `let ... = top;` irrefutável), que é exatamente o
+  mecanismo desejado: falha em tempo de compilação.
+- `TypedStat::Assign { name: String }` (`:195`) vira
+  `Assign { target: TypedLValue, value }`, com
+  `enum TypedLValue { Name, Index, Field }`.
+- `TypedExpKind` (`:224`) ganha `Index`, `Field`, `ArrayLit`, `RecordLit`,
+  `MapLit` — três nós de literal distintos, não um `InitList` genérico: o checker
+  já desambiguou, e o codegen ganha `match` exaustivo.
+- `UnOp` (`:288`) ganha `Len`.
+- `struct Checker` (`:296`) ganha `records: HashMap<String, Type>` — não há
+  tabela de tipos nomeados hoje.
+- **Rejeitar `Type::Value` explicitamente**: T22 fez `value` chegar ao checker, e
+  o codegen não sabe emiti-lo — cairia no `unreachable!` de `rust_type_name:625`,
+  que é panic e violaria a convenção.
+- Atualizar `fixup_mutability` (`:1302`) e
+  `collect_referenced_names_stat`/`_exp` (`codegen.rs:115,162`) para os braços
+  novos — o `match` exaustivo faz o compilador listar tudo.
+
+**Critério de aceite:** compila; **nenhum comportamento muda** (todos os testes
+negativos existentes seguem passando). Se algum teste de comportamento mudar,
+algo saiu do escopo.
+
+**Depende de:** T24. **Paralela a T26.**
+
+**Skills:** `rust-pro` · `architect-review` · `clean-code`
+
+---
+
+## T26 — `titan-runtime`: superfície de arrays, records e maps
+
+**Objetivo:** a indexação checada da decisão 3, com mensagens em português.
+
+**Contexto:** o runtime tem hoje 58 linhas e duas funções (`print`, `concat`).
+Toda a superfície da Fase 2 nasce aqui.
+
+**Detalhes:**
+```rust
+array_get / array_get_mut / array_set / array_len
+string_len            // `#` sobre string
+map_get / map_set
+```
+- **1-based → 0-based** convertido dentro do runtime (o original é 1-based,
+  `coder.lua:1994`), num lugar só.
+- **Abortar, não `panic!`**: `fn abortar(msg: &str) -> !` com `eprintln!` em
+  português + `std::process::exit(1)`. Satisfaz "nunca panic cru em inglês"
+  literalmente — sem `thread 'main' panicked`, sem backtrace.
+- Mensagens: `"índice 99 fora da faixa (array tem 3 elementos)"` ·
+  `"índice 0 inválido: arrays em Titan começam em 1"` ·
+  `"índice 5 fora da faixa (array tem 3 elementos; só é possível escrever em
+  1..3 ou fazer append em 4)"` · `"chave não encontrada no map"`.
+- `array_set` implementa a decisão 5: escreve em `1..#v`, faz **push** em
+  `#v + 1`, aborta no resto.
+- **Testabilidade sem subprocesso**: expor variantes `*_checked -> Result<_, String>`
+  e fazer as versões abortantes um wrapper fino sobre elas.
+
+**Critério de aceite:** testes do runtime cobrindo faixa válida, limite, append
+em `#v+1`, índice 0, negativo e além do fim; mensagens conferidas em português.
+
+**Depende de:** T24. **Paralela a T25.**
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns`
+
+---
+
+## T27 — `ast.rs`: `Field.name` vira `FieldName`
+
+**Objetivo:** representar `{["a"] = 1}` antes que o checker se acomode ao
+`Option<String>`.
+
+**Contexto:** `Field.name: Option<String>` não representa chave-expressão de map.
+No original, `Field.name` é **polimórfico** (`false | string | Exp`,
+`ast.lua:77-79`) — então isto não é "adicionar nó à AST", é corrigir a fidelidade
+de um campo existente.
+
+**Detalhes:**
+```rust
+pub enum FieldName {
+    None,           // posicional → array
+    Name(String),   // campo de record
+    Key(Box<Exp>),  // chave de map — cobre {["a"] = 1}
+}
+```
+Mudança mecânica: o parser só constrói, o checker só lê.
+
+**Critério de aceite:** `{1,2}`, `{x=1}` e `{["a"]=1}` são representáveis e
+distinguíveis.
+
+**Depende de:** T25, T26.
+
+**Skills:** `rust-pro` · `clean-code`
+
+---
+
+## T28 — `parser.rs`: `ExpInitList` (literais de array, record e map)
+
+**Objetivo:** o `{` em posição de expressão.
+
+**Detalhes:**
+- `parse_simple_exp` (`parser.rs:618`) ganha braço `TokenKind::LCurly` — hoje
+  ausente, produzindo `"Esperava uma expressão."` (é o que `integration.rs:291`
+  espera).
+- Campo decidido por lookahead: `[` exp `]` `=` exp → `FieldName::Key` ·
+  `Name` `=` exp → `FieldName::Name` (**lookahead de 2**: `Name` seguido de `=`;
+  senão é expressão que começa com nome) · exp → `FieldName::None`.
+- Separadores `,` e `;`, vírgula final opcional, `{}` vazio válido.
+- **O parser não decide** se é array/map/record — a desambiguação é semântica
+  (T29), como no original (`checker.lua:646-662`), porque `{}` vazio só se
+  resolve por contexto.
+
+**Critério de aceite:** parseiam `{}`, `{1,2,3}`, `{1,2,}`, `{x=1, y=2}`,
+`{["a"]=1}`, `{{1},{2}}`, e o misto `{1, x=2}` (parseia; o checker rejeita). Erro
+claro para `{1,,2}`, `{x=}`, `{1` sem fechar.
+
+**Depende de:** T27.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns`
+
+---
+
+## T29 — `checker.rs`: o núcleo semântico
+
+**Objetivo:** tipar tudo que T20–T28 destravaram. **Maior tarefa da fase.**
+
+**Detalhes — passada 1 (`collect_signature`, `:373`):**
+- Trocar a rejeição de `TopLevelRecord` por registro em `self.records` como
+  `Type::Record { name, fields }`.
+- **Vira duas sub-passadas**: records primeiro, funções depois — uma função pode
+  receber `Ponto`.
+- Rejeitar com erro claro: nome de record duplicado, campo duplicado, campo sem
+  tipo, **nome reservado do Rust** (`String`, `Vec`, `Option`, `Box`, `Result`,
+  `HashMap`), e **record recursivo** (`record No prox: No end` seria
+  infinitamente grande em Rust sem `Box`; sem essa checagem o rustc recusa em
+  inglês).
+
+**Detalhes — `resolve_type`:**
+- `TypeMap` (`:427`) → `Type::Map`, validando a chave: só `integer`, `string` e
+  `boolean`. O `HashMap` do Rust exige `Eq + Hash`, que `f64` não tem e que
+  `Vec`/struct não derivam nesta fase. O original já proíbe chave `nil`/option
+  (`checker.lua:118`).
+- `TypeName` (`:442`) → consulta `self.records`; não achou → `"tipo 'X'
+  desconhecido."` (mensagem que já existe, agora com significado real).
+
+**Detalhes — `ExpInitList` (`:983`)**, espelhando `checker.lua:646-662`:
+1. **Contexto primeiro** (anotação de `local`, tipo de parâmetro, de retorno, de
+   campo) decide array/map/record.
+2. Sem contexto → forma do 1º campo: `Name` → record, mas **sem contexto não se
+   sabe qual** → erro claro; `Key` → map; senão array.
+3. `{}` vazio sem contexto → erro claro.
+- **Exige propagar `context: Option<&Type>` por `check_exp`** — a refatoração
+  mais invasiva da fase (14 call sites), sem alternativa boa: `{}` vazio precisa
+  de contexto. Hoje `check_exp(&mut self, exp: &Exp)` não o recebe; no original é
+  `checkexp(node, st, errors, context)`.
+- **Record exige exaustividade**: todo campo presente, nenhum extra, nenhum
+  posicional — erros separados e claros para cada caso.
+
+**Detalhes — `check_var` (`:1199,1203`):**
+- `VarBracket` → base `Array` (índice `integer`, resulta `elem`) ou `Map` (índice
+  compatível com `keys`, resulta `values`); base `String` → erro claro.
+  **Resultado é `T`, não `T?`** (decisão 3).
+- `VarDot` → base `Record`; campo inexistente → `"o record 'Ponto' não tem campo
+  'z'."`.
+
+**Detalhes — `check_assign` (`:862`) e mutabilidade:**
+- Constrói `TypedLValue`; valida o tipo do valor contra o do alvo.
+- `root_decl_id(lvalue)` desce a cadeia de índices/campos até o `VarName` base e
+  alimenta o `HashSet<DeclId>` existente — `v[i]=x` e `p.campo=x` marcam a
+  **variável-raiz** como mut. Cobre aninhamento (`m[i].campo[j] = x` marca `m`).
+- `SymbolKind::Param` **composto** passa a aceitar `xs[i] = v` (é `&mut`);
+  escalar segue rejeitado (`:881`). Distinguir consultando o tipo
+  (`is_composite`), sem inflar `SymbolKind`.
+- Atribuição ao parâmetro composto **inteiro** (`xs = {}`) → erro claro.
+
+**Detalhes — `check_unop` (`:1137`) e `check_call`:**
+- `#` (`UnOp::Len`) sobre `Array` ou `String` → `Integer`. **Erro sobre `Map`** —
+  o original também proíbe (`checker.lua:855`).
+- `check_call`: rejeitar `f(xs, xs)` (duplo empréstimo mutável, que o rustc
+  recusaria em inglês) **e** inserir os `DeclId` de argumentos compostos no
+  `assigned` — passar array a função é **uso mutável** sob `&mut`, e sem isso o
+  Rust gerado não compila (`cannot borrow as mutable`).
+
+**Critério de aceite:** ~20 testes cobrindo aceitação (array literal, indexação,
+`#`, record completo, map, `{{integer}}`, record contendo array) e rejeição com
+mensagem conferida (record incompleto, campo extra, campo inexistente, índice
+não-integer, `#` de map, chave de map float, record recursivo, nome reservado,
+`f(xs,xs)`, `{}` sem contexto, record sem contexto).
+
+**Depende de:** T28.
+
+**Skills:** `rust-pro` · `test-driven-development` · `architect-review` ·
+`error-handling-patterns`
+
+---
+
+## T30 — `codegen.rs`: emissão de arrays, records e maps
+
+**Objetivo:** traduzir tudo que T29 tipou, sem um único warning no Rust gerado.
+
+**Detalhes:**
+- **`rust_type_name` (`:617`) preenchido ANTES de qualquer teste ponta a ponta** —
+  `{integer}` hoje cai no `unreachable!` da linha 625, que é panic e violaria a
+  convenção. `Array{elem}` → `Vec<T>` (o caso especial `&[String]` sai, T24 já
+  mudou o shim) · `Map{k,v}` → `std::collections::HashMap<K, V>` ·
+  `Record{name}` → `Nome`. Garantir por teste que todo `Type` construível pelo
+  checker tem braço aqui.
+- **Structs de record**: `generate` (`:31`) ganha um laço prévio emitindo todas
+  as `TypedTopLevel::Record` antes das funções, com
+  `#[derive(Clone, Debug, PartialEq)]` e campos `pub`. `Clone` é obrigatório
+  (decisão 1); `Copy` **nunca** (records podem conter `String`/`Vec`). Sem
+  mangling no nome do tipo — o namespace de tipos do Rust não colide com o
+  `fn main` do shim (ADR 0009).
+- **`emit_toplevel` (`:60`)**: parâmetro composto → `&mut Vec<T>` / `&mut Nome` /
+  `&mut HashMap<K,V>`. Conserta o `match` quebrado por T25, tratando `Record`.
+- **Clone (decisão 1)**: uma única função `precisa_clone(exp)` centraliza a
+  regra — `Var`/`Index`/`Field` de tipo composto ou string ganham `.clone()`;
+  literais, chamadas e construtores passam direto (já são donos).
+- **Argumento composto**: `&mut expr`; quando já é parâmetro, o reborrow
+  implícito do Rust cobre (emitir o nome cru).
+- **Indexação**: leitura via `array_get` (deref para escalar, `.clone()` para
+  composto/string); escrita via `array_set`. `#` → `array_len`/`string_len`.
+- **Literais**: `vec![a, b, c]` · `Nome { x: .., y: .. }` ·
+  `HashMap::from([(k,v), ..])`.
+
+**Critério de aceite** (padrão da fase: `--emit-rust` + execução real via o
+helper `compila_e_executa`): array criado, indexado, escrito, `#`; record
+construído, campo lido e escrito; map criado e consultado; **função que ordena um
+array in-place muda o array do chamador** (prova a decisão 4); **`local b = a;
+b[1] = 9` não altera `a`** (prova a decisão 1). Rust gerado **sem warnings**.
+
+**Depende de:** T29, T26.
+
+**Skills:** `rust-pro` · `clean-code` · `test-driven-development` ·
+`architect-review`
+
+---
+
+## T31 — Curadoria dos testes de integração
+
+**Objetivo:** reclassificar o que saiu de "fora de escopo" e corrigir uma
+asserção que deixa de ser verdadeira.
+
+**Detalhes:**
+- `CASOS_FORA_DE_ESCOPO_FASE_1` (`integration.rs:284`) → `..._FASE_2`. **Removem-se**
+  `indexacao_de_array` (`:286`), `construtor_de_array` (`:291`) e
+  `operador_length` (`:351`) — viram casos **positivos**. **Ajustam-se** os
+  trechos de `chamada_de_metodo` e `tipo_option` (com `.` e `[` lexados, as
+  mensagens mudam de camada). **Mantêm-se** bitwise, `//`, `import`, `repeat`,
+  `break`, retornos múltiplos.
+- Acrescentar ~10 negativos novos: `cast_as`, `metodo_com_dois_pontos`,
+  `multi_assign`, `nome_de_record_reservado`, `record_construtor_incompleto`,
+  `record_campo_extra`, `map_com_chave_float`, `duplo_emprestimo` (`f(xs,xs)`),
+  `length_de_map`, `record_recursivo`.
+- **`arquivos_reais_do_titan_original_produzem_erro_claro_sem_panic` (`:374`)**
+  afirma hoje que *todo* `.titan` real é rejeitado — o que **deixa de ser
+  verdade**: `testfiles/sieve.titan` usa exclusivamente arrays, e
+  `testfiles/selection_sort.titan` idem. Reescrever a **asserção** para a
+  propriedade que sempre importou (e que o nome do teste já enuncia): *compila
+  **ou** falha com erro claro; nunca panica, nunca com stderr vazio*. Renomear
+  para `..._nunca_panicam`. Acrescentar lista nomeada dos arquivos que a Fase 2
+  **espera compilar** — isso transforma o teste de guarda-corpo em medida de
+  progresso.
+
+**Critério de aceite:** `cargo test` verde; a suíte reflete o escopo real da
+fase; `selection_sort.titan` compila.
+
+**Depende de:** T30.
+
+**Skills:** `test-automator` · `verification-before-completion` · `find-bugs`
+
+---
+
+## T32 — `examples/compostos.titan` e integração ponta a ponta
+
+**Objetivo:** um programa que exercite arrays + records + maps, com teste de
+integração real (mesmo padrão do T8/T17).
+
+**Entregável — `examples/compostos.titan`**, cobrindo: record (construção por
+contexto, leitura e escrita de campo), array (literal, `#`, indexação, mutação
+in-place por função, push via `#res+1`), array de floats, e map.
+
+Duas linhas do programa são as mais importantes da suíte, porque **provam as
+decisões da fase**:
+- `Original preservado: ...` — depois de `local copia = qs; copia[1] = 999`, o
+  `qs` original está intacto (decisão 1, semântica de valor).
+- `Primeiro estoque dobrado: ...` — depois de `dobrar_estoque(qs)`, o chamador
+  vê a mutação (decisão 4, `&mut`).
+
+**Atenção:** não usar `as` no exemplo — cast está fora de escopo. Onde for
+preciso misturar `integer` e `float`, usar a promoção que `numeric_result` já faz
+desde a Fase 1.
+
+**Critério de aceite:** teste de integração invoca o `titanc` real, executa o
+binário, confere **stdout completo** e exit code 0.
+
+**Verificação:**
+```bash
+cd /home/leonardo/titan-rust/titan-rust
+cargo build --release
+./target/release/titanc examples/compostos.titan
+./compostos
+echo $?          # → 0
+./target/release/titanc --emit-rust examples/compostos.titan   # structs, Vec, HashMap, &mut, .clone()
+./target/release/titanc examples/hello.titan  && ./hello       # regressão Fase 0
+./target/release/titanc examples/nucleo.titan && ./nucleo      # regressão Fase 1
+./target/release/titanc ../titan/testfiles/selection_sort.titan  # idioma in-place do original
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+**Depende de:** T31.
+
+**Skills:** `test-automator` · `verification-before-completion` · `find-bugs`
+
+---
+
+## T33 — ADRs, documentação e fechamento da Fase 2
+
+**Objetivo:** deixar as decisões não-óbvias registradas e o projeto compreensível.
+
+**Entregáveis:**
+- ADRs `0006`–`0010` no formato Status/Contexto/Decisão/Consequências, seguindo
+  `0004-for-desacucarado-para-while.md`:
+
+  | ADR | Decisão |
+  |---|---|
+  | 0006 | Semântica de valor com clone na atribuição (diverge do aliasing do original) |
+  | 0007 | Parâmetros compostos por `&mut`, preservando o idioma in-place |
+  | 0008 | Indexação checada no runtime, `T` em vez de `T?`; variância invariante |
+  | 0009 | Records como `struct` Rust nominal |
+  | 0010 | `string` é sempre `String` — fim da dualidade `&str`/`String` |
+
+- `docs/adr/README.md`: acrescentar as 5 linhas à tabela.
+- `README.md`: mover arrays/records/maps/`#`/indexação de "o que não está
+  implementado ainda" para o coberto; atualizar o estado para Fase 2.
+- `PRD.md`: marcar a Fase 2 como concluída no roadmap.
+- `docs/arquitetura.md`: atualizar a tabela de mapeamento de tipos (hoje
+  descreve só a Fase 0 e antecipa a escolha do modelo de memória).
+
+**Depende de:** T32.
+
+**Skills:** `readme` · `docs-architect` · `architecture-decision-records`
+
+---
+
+## Revisão de qualidade (contínua)
+
+Como nas fases anteriores: revisão de código ao fim de **T30** e novamente ao fim
+de **T32**, antes de seguir.
+
+**Skills:** `code-reviewer` · `architect-review` · `find-bugs`
+
+---
+
+## Riscos da fase
+
+1. **`check_exp` ganhar o parâmetro `context`** (T29) toca 14 call sites — é a
+   refatoração mais invasiva e não tem alternativa boa: `{}` vazio precisa de
+   contexto para ser tipado.
+2. **Marcar `mut` por *uso*, não só por atribuição** (dependência cruzada
+   T29↔T30): passar um array a uma função é uso mutável sob `&mut`. Se
+   esquecido, o Rust gerado não compila e o erro vem em inglês do rustc.
+3. **T24 antes de T26** não é negociável: `Vec<&str>` vs `Vec<String>` é
+   exatamente o pântano que a fase tenta evitar.
+4. **Toda construção que o rustc rejeitaria em inglês** precisa de rejeição no
+   checker, em português. A lista identificada: `f(xs, xs)`, record recursivo,
+   nome de record reservado, chave de map `float`. Revisitá-la ao fim de T30.
+
+---
+
+## Fora de escopo nesta fase
+
+Rejeitar com erro claro (nunca panic): `Option`/`?`, cast (`as`), métodos e
+chamadas de método, `import`/`foreign import`, retornos múltiplos, multi-assign
+(`a, b = ...`), declaração múltipla, `repeat`/`until`, `break`/`continue`,
+bitwise (`& | ~ << >>`), `//`.
+
+**Redox OS** segue fora de escopo — compilar para Linux nativo.

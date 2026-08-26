@@ -1,5 +1,5 @@
 function fatorial(n: integer): integer
-    if n <= 10 then
+    if n <= 1 then
         return 1
     end
     local resultado: integer = 1
@@ -12,7 +12,7 @@ function fatorial(n: integer): integer
 end
 
 function fibonacci(n: integer): integer
-    if n <= 10 then
+    if n <= 1 then
         return n
     end
     local a: integer = 0
@@ -26,7 +26,7 @@ function fibonacci(n: integer): integer
 end
 
 function main(args: {string}): integer
-    print("Fatorial de 50: " .. fatorial(50))
-    print("Fibonacci de 100: " .. fibonacci(100))
+    print("Fatorial de 5: " .. fatorial(5))
+    print("Fibonacci de 10: " .. fibonacci(10))
     return 0
 end
