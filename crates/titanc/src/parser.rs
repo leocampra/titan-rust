@@ -262,17 +262,36 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Type::TypeString { loc })
             }
+            TokenKind::KwValue => {
+                self.advance();
+                Ok(Type::TypeValue { loc })
+            }
+            TokenKind::Name(_) => {
+                let (name, _) = self.expect_name("Esperava um nome de tipo.")?;
+                Ok(Type::TypeName { loc, name })
+            }
             TokenKind::LCurly => {
                 self.advance();
-                let subtype = self.parse_type()?;
-                self.expect(&TokenKind::RCurly, "Esperava '}' para fechar o tipo array.")?;
-                Ok(Type::TypeArray {
-                    loc,
-                    subtype: Box::new(subtype),
-                })
+                let first = self.parse_type()?;
+                if self.eat(&TokenKind::Colon) {
+                    let valuestype = self.parse_type()?;
+                    self.expect(&TokenKind::RCurly, "Esperava '}' para fechar o tipo map.")?;
+                    Ok(Type::TypeMap {
+                        loc,
+                        keystype: Box::new(first),
+                        valuestype: Box::new(valuestype),
+                    })
+                } else {
+                    self.expect(&TokenKind::RCurly, "Esperava '}' para fechar o tipo array.")?;
+                    Ok(Type::TypeArray {
+                        loc,
+                        subtype: Box::new(first),
+                    })
+                }
             }
             _ => Err(self.erro(
-                "Esperava um tipo (`integer`, `float`, `boolean`, `string`, `nil` ou `{T}`).",
+                "Esperava um tipo (`integer`, `float`, `boolean`, `string`, `value`, `nil`, \
+                 um nome de record, `{T}` ou `{K: V}`).",
             )),
         }
     }
@@ -1217,5 +1236,97 @@ end"#,
         assert!(matches!(rhs, Exp::ExpInteger { value: 3, .. }));
         let (_, op_interno, _) = como_binop(lhs);
         assert_eq!(op_interno, "+");
+    }
+
+    // ---- T22: parse_type completo (map, TypeName, value) -----------------
+
+    /// Parseia `local x: <tipo> = nil` isoladamente e devolve o `Type` da
+    /// declaração — a forma mais direta de exercitar `parse_type` sem
+    /// precisar de uma função de topo inteira.
+    fn parse_type_source(tipo: &str) -> Result<Type, ParseError> {
+        let source =
+            format!("local function f(): integer\n    local x: {tipo} = nil\n    return 0\nend");
+        let program = parse_source(&source)?;
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatDecl { decls, .. } = &stats[0] else {
+            panic!("esperava StatDecl");
+        };
+        Ok(decls[0]
+            .r#type
+            .clone()
+            .expect("tipo deveria estar presente"))
+    }
+
+    #[test]
+    fn parse_type_aceita_value() {
+        let ty = parse_type_source("value").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert!(matches!(ty, Type::TypeValue { .. }));
+    }
+
+    #[test]
+    fn parse_type_aceita_nome_de_record() {
+        let ty = parse_type_source("Ponto").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert!(matches!(ty, Type::TypeName { name, .. } if name == "Ponto"));
+    }
+
+    #[test]
+    fn parse_type_aceita_array() {
+        let ty = parse_type_source("{integer}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Type::TypeArray { subtype, .. } = ty else {
+            panic!("esperava TypeArray, obteve {ty:?}");
+        };
+        assert!(matches!(*subtype, Type::TypeInteger { .. }));
+    }
+
+    #[test]
+    fn parse_type_aceita_array_de_array() {
+        let ty =
+            parse_type_source("{{integer}}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Type::TypeArray { subtype, .. } = ty else {
+            panic!("esperava TypeArray, obteve {ty:?}");
+        };
+        let Type::TypeArray { subtype, .. } = *subtype else {
+            panic!("esperava TypeArray aninhado, obteve {subtype:?}");
+        };
+        assert!(matches!(*subtype, Type::TypeInteger { .. }));
+    }
+
+    #[test]
+    fn parse_type_aceita_map() {
+        let ty = parse_type_source("{string: integer}")
+            .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Type::TypeMap {
+            keystype,
+            valuestype,
+            ..
+        } = ty
+        else {
+            panic!("esperava TypeMap, obteve {ty:?}");
+        };
+        assert!(matches!(*keystype, Type::TypeString { .. }));
+        assert!(matches!(*valuestype, Type::TypeInteger { .. }));
+    }
+
+    #[test]
+    fn parse_type_map_com_chave_ausente_produz_erro_claro() {
+        let err = parse_type_source("{: integer}").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parse_type_map_com_valor_ausente_produz_erro_claro() {
+        let err = parse_type_source("{integer:}").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parse_type_array_sem_fechar_produz_erro_claro() {
+        let err = parse_type_source("{integer").unwrap_err();
+        assert!(err.message.contains('}'));
     }
 }
