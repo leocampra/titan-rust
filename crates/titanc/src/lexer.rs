@@ -24,6 +24,10 @@
 //! precedência, exatamente como no Lua/Titan original. O único caso ambíguo
 //! seria `a[[b]]` (que nenhum programa Titan válido escreve), documentado com
 //! teste como long string.
+//!
+//! A Fase 3 (T34 do PRD.md) acrescenta a palavra-chave `import`, usada para
+//! trazer uma capability para o programa. Como `as`, deixa de poder ser usada
+//! como identificador.
 
 use crate::ast::Loc;
 
@@ -73,6 +77,9 @@ pub enum TokenKind {
     // Palavras-chave de tipos compostos (Fase 2)
     KwRecord,
     KwAs,
+
+    // Palavra-chave de capabilities (Fase 3)
+    KwImport,
 
     // Símbolos
     LParen,
@@ -483,6 +490,7 @@ impl<'a> Lexer<'a> {
             "value" => TokenKind::KwValue,
             "record" => TokenKind::KwRecord,
             "as" => TokenKind::KwAs,
+            "import" => TokenKind::KwImport,
             _ => TokenKind::Name(text),
         }
     }
@@ -1165,6 +1173,28 @@ mod tests {
                 TokenKind::KwInteger,
                 TokenKind::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn keyword_import_data() {
+        assert_eq!(
+            kinds("import data"),
+            vec![
+                TokenKind::KwImport,
+                TokenKind::Name("data".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_import_nao_casa_prefixo_de_identificador() {
+        // Mesma garantia do teste `localx`/`forma`: `importante` não é
+        // `import` + `ante`.
+        assert_eq!(
+            kinds("importante"),
+            vec![TokenKind::Name("importante".to_string()), TokenKind::Eof]
         );
     }
 
