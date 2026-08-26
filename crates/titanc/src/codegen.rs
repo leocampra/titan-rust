@@ -23,15 +23,43 @@
 //! Fase 2.
 
 use crate::checker::{
-    BinOp, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedTopLevel, UnOp,
+    BinOp, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedThen, TypedTopLevel,
+    UnOp,
 };
 use crate::types::Type;
 
 const INDENT: &str = "    ";
 
+/// Uma construção que o checker (T29) já tipa, mas que este backend ainda
+/// não sabe emitir — `records`, `arrays`/`maps`/`records` compostos além do
+/// caso especial `{string}`, indexação e acesso a campo. Nunca indica erro
+/// do programa Titan em si (o checker já validou isso); é limitação
+/// temporária do codegen, a ser fechada por T30 (records/tipos),
+/// T31 (arrays), T32 (records) e T33 (maps).
+#[derive(Debug)]
+pub struct CodegenError(pub String);
+
+impl std::fmt::Display for CodegenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for CodegenError {}
+
 /// Gera o `main.rs` completo (funções do programa + shim de entrada) a partir
 /// da AST tipada.
-pub fn generate(program: &TypedProgram) -> String {
+///
+/// Antes de emitir qualquer coisa, varre `program` em busca de construções
+/// que o checker (T29) passou a aceitar mas que este backend ainda não sabe
+/// traduzir — sem essa pré-checagem, `emit_toplevel`/`emit_stat`/`emit_exp`
+/// entrariam num `unreachable!()` real (panic) ao alcançá-las, violando a
+/// convenção do projeto de nunca panicar. T30–T33 substituem esta
+/// pré-checagem pela emissão de verdade, nó por nó, à medida que cada uma dá
+/// suporte.
+pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
+    check_supported(program)?;
+
     let mut out = String::new();
 
     for top in program {
@@ -40,7 +68,181 @@ pub fn generate(program: &TypedProgram) -> String {
     }
 
     out.push_str(ENTRY_SHIM);
-    out
+    Ok(out)
+}
+
+/// Percorre `program` procurando por qualquer construção que
+/// `rust_type_name`/`emit_exp`/`emit_stat` ainda não sabem emitir. Ver a nota
+/// em [`generate`].
+fn check_supported(program: &TypedProgram) -> Result<(), CodegenError> {
+    for top in program {
+        match top {
+            TypedTopLevel::Record { name, .. } => {
+                return Err(unsupported(format!(
+                    "declaração do record '{name}' (struct Rust correspondente)"
+                )));
+            }
+            TypedTopLevel::Func {
+                params,
+                rettypes,
+                body,
+                ..
+            } => {
+                for (_, ty) in params {
+                    check_supported_type(ty)?;
+                }
+                for ty in rettypes {
+                    check_supported_type(ty)?;
+                }
+                check_supported_stat(body)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_supported_stat(stat: &TypedStat) -> Result<(), CodegenError> {
+    match stat {
+        TypedStat::Block { stats, .. } => {
+            for s in stats {
+                check_supported_stat(s)?;
+            }
+        }
+        TypedStat::Decl { ty, value, .. } => {
+            check_supported_type(ty)?;
+            check_supported_exp(value)?;
+        }
+        TypedStat::Call { call, .. } => check_supported_exp(call)?,
+        TypedStat::Return { exps, .. } => {
+            for e in exps {
+                check_supported_exp(e)?;
+            }
+        }
+        TypedStat::If { thens, elsestat, .. } => {
+            for TypedThen { condition, block, .. } in thens {
+                check_supported_exp(condition)?;
+                check_supported_stat(block)?;
+            }
+            if let Some(stat) = elsestat {
+                check_supported_stat(stat)?;
+            }
+        }
+        TypedStat::While { condition, block, .. } => {
+            check_supported_exp(condition)?;
+            check_supported_stat(block)?;
+        }
+        TypedStat::For {
+            ty,
+            start,
+            finish,
+            inc,
+            block,
+            ..
+        } => {
+            check_supported_type(ty)?;
+            check_supported_exp(start)?;
+            check_supported_exp(finish)?;
+            check_supported_exp(inc)?;
+            check_supported_stat(block)?;
+        }
+        TypedStat::Assign { target, value, .. } => {
+            match target {
+                TypedLValue::Name(_) => {}
+                TypedLValue::Index { .. } | TypedLValue::Field { .. } => {
+                    return Err(unsupported(
+                        "atribuição a índice (`v[i] = ...`) ou campo (`p.campo = ...`)"
+                            .to_string(),
+                    ));
+                }
+            }
+            check_supported_exp(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_supported_exp(exp: &TypedExp) -> Result<(), CodegenError> {
+    check_supported_type(&exp.ty)?;
+    match &exp.kind {
+        TypedExpKind::Nil
+        | TypedExpKind::Bool(_)
+        | TypedExpKind::Integer(_)
+        | TypedExpKind::Float(_)
+        | TypedExpKind::String(_)
+        | TypedExpKind::Var(_) => Ok(()),
+        TypedExpKind::Call { args, .. } => {
+            for a in args {
+                check_supported_exp(a)?;
+            }
+            Ok(())
+        }
+        TypedExpKind::Concat(exps) => {
+            for e in exps {
+                check_supported_exp(e)?;
+            }
+            Ok(())
+        }
+        TypedExpKind::Binop { lhs, rhs, .. } => {
+            check_supported_exp(lhs)?;
+            check_supported_exp(rhs)
+        }
+        TypedExpKind::Unop { op, exp } => {
+            if *op == UnOp::Len {
+                return Err(unsupported("operador `#`".to_string()));
+            }
+            check_supported_exp(exp)
+        }
+        TypedExpKind::Index { .. } => {
+            Err(unsupported("indexação (`v[i]`)".to_string()))
+        }
+        TypedExpKind::Field { .. } => {
+            Err(unsupported("acesso a campo (`p.campo`)".to_string()))
+        }
+        TypedExpKind::ArrayLit(_) => Err(unsupported(
+            "inicializador de array (`{...}`)".to_string(),
+        )),
+        TypedExpKind::RecordLit { .. } => Err(unsupported(
+            "inicializador de record (`{...}`)".to_string(),
+        )),
+        TypedExpKind::MapLit(_) => {
+            Err(unsupported("inicializador de map (`{...}`)".to_string()))
+        }
+    }
+}
+
+/// Espelha exatamente o que [`rust_type_name`] sabe traduzir hoje — o único
+/// composto suportado é `{string}` (o parâmetro `args` de `main`); qualquer
+/// outro array, todo `map` e todo `record` ainda não têm tradução.
+fn check_supported_type(ty: &Type) -> Result<(), CodegenError> {
+    match ty {
+        Type::Nil | Type::Boolean | Type::Integer | Type::Float | Type::String => Ok(()),
+        Type::Array { elem } if **elem == Type::String => Ok(()),
+        other => Err(unsupported(format!("o tipo {}", describe_type(other)))),
+    }
+}
+
+fn unsupported(construct: String) -> CodegenError {
+    CodegenError(format!(
+        "geração de código para {construct} ainda não é suportada nesta fase \
+         (T30/T31/T32/T33 do PRD.md)."
+    ))
+}
+
+/// Descrição textual de um tipo para a mensagem de [`unsupported`] — não
+/// precisa ser exaustiva nem elegante, só identificável pelo usuário.
+fn describe_type(ty: &Type) -> String {
+    match ty {
+        Type::Array { elem } => format!("array de {}", describe_type(elem)),
+        Type::Map { .. } => "map".to_string(),
+        Type::Record { name, .. } => format!("record '{name}'"),
+        Type::Value => "value".to_string(),
+        Type::Option { .. } => "opcional (`?`)".to_string(),
+        Type::Function { .. } => "função".to_string(),
+        Type::Invalid => "<inválido>".to_string(),
+        Type::Nil | Type::Boolean | Type::Integer | Type::Float | Type::String => {
+            "primitivo".to_string()
+        }
+    }
 }
 
 /// Shim de entrada (PRD.md, T6): o `fn main` real do binário gerado — separado
@@ -728,7 +930,7 @@ mod tests {
                     .join("; ")
             )
         });
-        generate(&typed)
+        generate(&typed).unwrap_or_else(|e| panic!("erro de geração de código inesperado: {e}"))
     }
 
     #[test]

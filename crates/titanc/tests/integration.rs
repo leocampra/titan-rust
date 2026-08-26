@@ -286,19 +286,22 @@ const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
         nome: "indexacao_de_array",
         fonte: "function main(args: {string}): integer\n    print(args[1])\n    return 0\nend",
         // Desde a T23 (PRD.md), o parser tem sufixo de indexação (`v[i]` vira
-        // `VarBracket`) — a rejeição deixou de ser sintática. O checker desta
-        // fase ainda não sabe verificar indexação (isso é T25+/T29), então o
-        // erro agora vem dele.
-        trecho_esperado: "indexação",
+        // `VarBracket`) — a rejeição deixou de ser sintática. Desde a T29, o
+        // checker sabe verificar indexação (aceita este programa: `args[1]`
+        // é `string`, compatível com `print`) — a rejeição agora vem do
+        // stub não-panic do codegen (T30/T31/T32/T33 são quem dão suporte
+        // real à emissão).
+        trecho_esperado: "geração de código para indexação",
     },
     CasoNegativo {
         nome: "construtor_de_array",
         fonte: "function main(args: {string}): integer\n    local t = {1, 2}\n    return 0\nend",
         // Desde a T28 (PRD.md), o parser produz `ExpInitList` para `{...}` —
-        // a rejeição deixou de ser sintática. O checker desta fase ainda não
-        // sabe tipar arrays/records/maps (isso é T29), então o erro agora
-        // vem dele.
-        trecho_esperado: "inicializador de array/record",
+        // a rejeição deixou de ser sintática. Desde a T29, o checker sabe
+        // tipar arrays/records/maps (aceita `{1, 2}` como `{integer}`) — a
+        // rejeição agora vem do stub não-panic do codegen (T30/T31/T32/T33
+        // são quem dão suporte real à emissão).
+        trecho_esperado: "geração de código para o tipo array",
     },
     CasoNegativo {
         nome: "retornos_multiplos",
@@ -427,7 +430,8 @@ fn arquivos_reais_do_titan_original_produzem_erro_claro_sem_panic() {
 /// exatamente o cenário citado no PRD.md (T5) como caso negativo de
 /// "construção não suportada" — usamos um trecho representativo em vez do
 /// arquivo real do Titan (que depende de módulos externos não relevantes
-/// aqui).
+/// aqui). Desde a T29 o `record` em si é aceito pelo checker; `foreign
+/// import` segue fora de escopo e garante a falha aqui.
 #[test]
 fn arquivo_com_foreign_import_e_record_produz_erro_de_construcao_nao_suportada() {
     let out_dir = temp_dir("foreign-import-record");

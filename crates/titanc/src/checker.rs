@@ -399,6 +399,218 @@ impl Checker {
 
     // ---- Passada 1: assinaturas top-level ------------------------------
 
+    /// Nomes que colidiriam com tipos do prelúdio do Rust se virassem o nome
+    /// de uma `struct` gerada — lista fechada dada pelo PRD.md (T29).
+    const RESERVED_RUST_NAMES: [&'static str; 5] = ["String", "Vec", "Option", "Box", "Result"];
+
+    /// Registra o nome e os campos **brutos** de todos os records do
+    /// programa (sem resolver tipos ainda) — passo 1 da checagem de records
+    /// (T29). Rejeita nome duplicado, nome reservado do Rust e campo sem
+    /// tipo/duplicado. Devolve `false` se algum desses erros ocorreu (o
+    /// chamador então pula a detecção de ciclo e a resolução de tipos, que
+    /// pressupõem uma lista limpa).
+    fn collect_record_names(&mut self, program: &Program) -> HashMap<String, Vec<ast::Decl>> {
+        let mut raw: HashMap<String, Vec<ast::Decl>> = HashMap::new();
+        for node in program {
+            let TopLevel::TopLevelRecord { loc, name, fields } = node else {
+                continue;
+            };
+            if raw.contains_key(name) {
+                self.error(*loc, format!("'{name}' já foi declarado antes."));
+                continue;
+            }
+            if Self::RESERVED_RUST_NAMES.contains(&name.as_str()) {
+                self.error(
+                    *loc,
+                    format!(
+                        "'{name}' é um nome reservado do Rust; escolha outro nome de record."
+                    ),
+                );
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut ok = true;
+            for field in fields {
+                if !seen.insert(field.name.clone()) {
+                    self.error(
+                        field.loc,
+                        format!("campo '{}' duplicado no record '{name}'.", field.name),
+                    );
+                    ok = false;
+                }
+                if field.r#type.is_none() {
+                    self.error(
+                        field.loc,
+                        format!("campo '{}' precisa de um tipo explícito.", field.name),
+                    );
+                    ok = false;
+                }
+            }
+            if ok {
+                raw.insert(name.clone(), fields.clone());
+            }
+        }
+        raw
+    }
+
+    /// Detecta recursão direta ou indireta no grafo de dependência de
+    /// records (um campo `TypeName` de um record para outro é uma aresta) —
+    /// um record recursivo seria infinitamente grande em Rust sem `Box`
+    /// (PRD.md, T29). DFS com três cores; devolve o nome do primeiro record
+    /// já registrado envolvido em um ciclo, se houver.
+    fn find_recursive_record(raw: &HashMap<String, Vec<ast::Decl>>) -> Option<String> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Color {
+            White,
+            Gray,
+            Black,
+        }
+        fn dependencies(fields: &[ast::Decl]) -> Vec<&str> {
+            fields
+                .iter()
+                .filter_map(|f| match &f.r#type {
+                    Some(ast::Type::TypeName { name, .. }) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+        fn visit(
+            name: &str,
+            raw: &HashMap<String, Vec<ast::Decl>>,
+            colors: &mut HashMap<String, Color>,
+        ) -> bool {
+            match colors.get(name).copied().unwrap_or(Color::White) {
+                Color::Black => return false,
+                Color::Gray => return true,
+                Color::White => {}
+            }
+            colors.insert(name.to_string(), Color::Gray);
+            if let Some(fields) = raw.get(name) {
+                for dep in dependencies(fields) {
+                    if raw.contains_key(dep) && visit(dep, raw, colors) {
+                        return true;
+                    }
+                }
+            }
+            colors.insert(name.to_string(), Color::Black);
+            false
+        }
+
+        let mut colors = HashMap::new();
+        for name in raw.keys() {
+            if visit(name, raw, &mut colors) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    /// Records primeiro, funções depois (T29): uma função pode receber um
+    /// record declarado mais adiante no arquivo. `self.records` precisa
+    /// estar completo antes de `resolve_param_types`/`resolve_types`
+    /// resolverem qualquer `TypeName`.
+    fn collect_records(&mut self, program: &Program) {
+        let raw = self.collect_record_names(program);
+
+        if let Some(cycle_name) = Self::find_recursive_record(&raw) {
+            let loc = program
+                .iter()
+                .find_map(|node| match node {
+                    TopLevel::TopLevelRecord { loc, name, .. } if name == &cycle_name => {
+                        Some(*loc)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(Loc { line: 1, col: 1 });
+            self.error(
+                loc,
+                format!(
+                    "o record '{cycle_name}' é recursivo (direta ou indiretamente); \
+                     esta fase não suporta indireção para quebrar o ciclo."
+                ),
+            );
+            return;
+        }
+
+        // Placeholders (campos ainda vazios) para todo record, **antes** de
+        // resolver qualquer campo: um record que se referencia só através de
+        // um composto (`filhos: {No}`) não é recursão real (`Vec<No>` tem
+        // tamanho finito, diferente de um campo `No` direto, já rejeitado
+        // acima) — mas sem o nome já presente em `self.records`,
+        // `resolve_type` não teria como resolver o `TypeName("No")` dentro
+        // do `{No}` enquanto o próprio `No` ainda está sendo processado.
+        for name in raw.keys() {
+            self.records.insert(
+                name.clone(),
+                Type::Record {
+                    name: name.clone(),
+                    fields: Vec::new(),
+                },
+            );
+        }
+
+        // Ordem topológica (dependências diretas antes de quem as usa) só
+        // para achar uma ordem de resolução estável; não é mais estritamente
+        // necessária para correção (os placeholders acima já cobrem
+        // qualquer ordem), mas mantém a mensagem de erro determinística.
+        for name in Self::topological_order(&raw) {
+            let fields = &raw[&name];
+            let mut typed_fields = Vec::with_capacity(fields.len());
+            let mut ok = true;
+            for field in fields {
+                // `unwrap`: `collect_record_names` já garantiu que todo
+                // campo aqui tem `r#type: Some(..)`.
+                let annotated = field.r#type.as_ref().unwrap();
+                match self.resolve_type(annotated) {
+                    Some(ty) => typed_fields.push((field.name.clone(), ty)),
+                    None => ok = false,
+                }
+            }
+            if ok {
+                self.records.insert(
+                    name.clone(),
+                    Type::Record {
+                        name: name.clone(),
+                        fields: typed_fields,
+                    },
+                );
+            } else {
+                // Resolução falhou (erro já reportado por `resolve_type`) —
+                // remove o placeholder para não deixar um record "fantasma"
+                // com campos vazios disponível ao resto do checker.
+                self.records.remove(&name);
+            }
+        }
+    }
+
+    /// Ordem pós-ordem de uma DFS sobre o grafo de dependência de records —
+    /// garante que um record só é resolvido depois de todo record que ele
+    /// referencia por `TypeName` (só é chamada quando já não há ciclo).
+    fn topological_order(raw: &HashMap<String, Vec<ast::Decl>>) -> Vec<String> {
+        fn visit(name: &str, raw: &HashMap<String, Vec<ast::Decl>>, visited: &mut HashSet<String>, order: &mut Vec<String>) {
+            if !visited.insert(name.to_string()) {
+                return;
+            }
+            if let Some(fields) = raw.get(name) {
+                for field in fields {
+                    if let Some(ast::Type::TypeName { name: dep, .. }) = &field.r#type
+                        && raw.contains_key(dep)
+                    {
+                        visit(dep, raw, visited, order);
+                    }
+                }
+            }
+            order.push(name.to_string());
+        }
+
+        let mut visited = HashSet::new();
+        let mut order = Vec::with_capacity(raw.len());
+        for name in raw.keys() {
+            visit(name, raw, &mut visited, &mut order);
+        }
+        order
+    }
+
     fn collect_signature(&mut self, node: &TopLevel) {
         match node {
             TopLevel::TopLevelFunc {
@@ -435,9 +647,9 @@ impl Checker {
                     "declaração de variável no nível de topo não é suportada nesta fase.",
                 );
             }
-            TopLevel::TopLevelRecord { loc, .. } => {
-                self.error(*loc, "`record` não é suportado nesta fase.");
-            }
+            // Já processado por `collect_records`, que roda antes (T29 —
+            // duas sub-passadas: records primeiro, funções depois).
+            TopLevel::TopLevelRecord { .. } => {}
             TopLevel::TopLevelImport { loc, .. } => {
                 self.error(*loc, "`import` não é suportado nesta fase.");
             }
@@ -496,9 +708,29 @@ impl Checker {
                     elem: Box::new(elem),
                 })
             }
-            ast::Type::TypeMap { loc, .. } => {
-                self.error(*loc, "tipo `map` não é suportado nesta fase.");
-                None
+            ast::Type::TypeMap {
+                loc,
+                keystype,
+                valuestype,
+            } => {
+                let keys = self.resolve_type(keystype)?;
+                if !matches!(keys, Type::Integer | Type::String | Type::Boolean) {
+                    // O `HashMap` do Rust exige `Eq + Hash`, que `f64` não
+                    // tem e que `Vec`/struct não derivam nesta fase (T29).
+                    self.error(
+                        *loc,
+                        format!(
+                            "chave de `map` precisa ser integer, string ou boolean, encontrado {}.",
+                            type_name(&keys)
+                        ),
+                    );
+                    return None;
+                }
+                let values = self.resolve_type(valuestype)?;
+                Some(Type::Map {
+                    keys: Box::new(keys),
+                    values: Box::new(values),
+                })
             }
             ast::Type::TypeFunction { loc, .. } => {
                 self.error(
@@ -511,10 +743,13 @@ impl Checker {
                 self.error(*loc, "tipo opcional (`?`) não é suportado nesta fase.");
                 None
             }
-            ast::Type::TypeName { loc, name } => {
-                self.error(*loc, format!("tipo '{name}' desconhecido."));
-                None
-            }
+            ast::Type::TypeName { loc, name } => match self.records.get(name) {
+                Some(ty) => Some(ty.clone()),
+                None => {
+                    self.error(*loc, format!("tipo '{name}' desconhecido."));
+                    None
+                }
+            },
             ast::Type::TypeQualName { loc, .. } => {
                 self.error(
                     *loc,
@@ -614,6 +849,20 @@ impl Checker {
                     body: Box::new(body),
                 })
             }
+            TopLevel::TopLevelRecord { loc, name, .. } => {
+                // A resolução de verdade já aconteceu em `collect_records`
+                // (passada 1); aqui só reaproveitamos o resultado — se o
+                // record não está em `self.records`, ele já foi rejeitado
+                // com erro claro lá (nome duplicado, campo inválido, ciclo).
+                let Some(Type::Record { fields, .. }) = self.records.get(name).cloned() else {
+                    return None;
+                };
+                Some(TypedTopLevel::Record {
+                    loc: *loc,
+                    name: name.clone(),
+                    fields,
+                })
+            }
             // Já reportado como erro na passada 1.
             _ => None,
         }
@@ -650,11 +899,16 @@ impl Checker {
                     return None;
                 }
                 let decl = &decls[0];
-                let value = self.check_exp(&exps[0])?;
+                // Resolvido antes de tipar o valor (T29): `{...}` precisa do
+                // tipo anotado como contexto para se desambiguar.
+                let declared = match &decl.r#type {
+                    Some(annotated) => Some(self.resolve_type(annotated)?),
+                    None => None,
+                };
+                let value = self.check_exp(&exps[0], declared.as_ref())?;
 
-                let ty = match &decl.r#type {
-                    Some(annotated) => {
-                        let declared = self.resolve_type(annotated)?;
+                let ty = match declared {
+                    Some(declared) => {
                         if !declared.compatible(&value.ty) {
                             self.error(
                                 decl.loc,
@@ -687,14 +941,14 @@ impl Checker {
                 })
             }
             Stat::StatCall { loc, callexp } => {
-                let call = self.check_exp(callexp)?;
+                let call = self.check_exp(callexp, None)?;
                 Some(TypedStat::Call { loc: *loc, call })
             }
             Stat::StatReturn { loc, exps } => {
                 let mut typed_exps = Vec::with_capacity(exps.len());
                 let mut ok = true;
-                for e in exps {
-                    match self.check_exp(e) {
+                for (i, e) in exps.iter().enumerate() {
+                    match self.check_exp(e, rettypes.get(i)) {
                         Some(typed) => typed_exps.push(typed),
                         None => ok = false,
                     }
@@ -820,7 +1074,7 @@ impl Checker {
     /// via `compatible` — gradual typing), como o `checkexp(cond, ...,
     /// types.Boolean())` do original.
     fn check_condition(&mut self, exp: &Exp, contexto: &str) -> Option<TypedExp> {
-        let typed = self.check_exp(exp)?;
+        let typed = self.check_exp(exp, Some(&Type::Boolean))?;
         if !Type::Boolean.compatible(&typed.ty) {
             self.error(
                 typed.loc,
@@ -850,10 +1104,10 @@ impl Checker {
         block: &Stat,
         rettypes: &[Type],
     ) -> Option<TypedStat> {
-        let typed_start = self.check_exp(start)?;
-        let typed_finish = self.check_exp(finish)?;
+        let typed_start = self.check_exp(start, None)?;
+        let typed_finish = self.check_exp(finish, None)?;
         let typed_inc = match inc {
-            Some(exp) => Some(self.check_exp(exp)?),
+            Some(exp) => Some(self.check_exp(exp, None)?),
             None => None,
         };
 
@@ -924,69 +1178,151 @@ impl Checker {
         })
     }
 
-    /// Atribuição single-target `nome = exp` (`checker.lua:378-410`).
+    /// Atribuição single-target `nome = exp` | `v[i] = exp` | `p.campo = exp`
+    /// (`checker.lua:378-410`, estendido na T29 para `Index`/`Field`).
     fn check_assign(&mut self, loc: Loc, var: &Var, exp: &Exp) -> Option<TypedStat> {
-        let Var::VarName {
-            loc: var_loc, name, ..
-        } = var
-        else {
-            // Defensivo: o parser (T11) só produz `VarName` como alvo.
-            self.error(
-                loc,
-                "atribuição a índice ou campo não é suportada nesta fase.",
-            );
-            return None;
-        };
+        match var {
+            Var::VarName {
+                loc: var_loc, name, ..
+            } => {
+                let Some(symbol) = self.st.find_symbol(name).cloned() else {
+                    self.error(*var_loc, format!("'{name}' não foi declarado."));
+                    return None;
+                };
 
-        let Some(symbol) = self.st.find_symbol(name).cloned() else {
-            self.error(*var_loc, format!("'{name}' não foi declarado."));
-            return None;
-        };
+                match symbol.kind {
+                    // Globais nesta fase são sempre funções (`print` e as
+                    // top-level) — "trying to assign to a function"
+                    // (`checker.lua:401`).
+                    SymbolKind::Global => {
+                        self.error(*var_loc, "não é possível atribuir a uma função.");
+                        return None;
+                    }
+                    SymbolKind::Param if is_composite(&symbol.ty) => {
+                        // T29: parâmetro composto aceita `xs[i] = v` (via o
+                        // braço `VarBracket`/`VarDot` abaixo — `check_assign`
+                        // só é chamado com o `Var` inteiro, então esta rota
+                        // (`VarName`) é sempre a atribuição ao parâmetro
+                        // **inteiro**, que segue proibida mesmo composto.
+                        self.error(
+                            *var_loc,
+                            format!(
+                                "não é possível atribuir ao parâmetro composto '{name}' inteiro; modifique seus elementos/campos."
+                            ),
+                        );
+                        return None;
+                    }
+                    SymbolKind::Param => {
+                        self.error(
+                            *var_loc,
+                            format!("não é possível atribuir ao parâmetro '{name}' nesta fase."),
+                        );
+                        return None;
+                    }
+                    // `ForVar` é sempre `mut` no template do T15 (nada a
+                    // rastrear); `Local` é registrada mais abaixo, após a
+                    // atribuição validar.
+                    SymbolKind::ForVar | SymbolKind::Local { .. } => {}
+                }
 
-        match symbol.kind {
-            // Globais nesta fase são sempre funções (`print` e as top-level)
-            // — "trying to assign to a function", `checker.lua:401`.
-            SymbolKind::Global => {
-                self.error(*var_loc, "não é possível atribuir a uma função.");
-                return None;
+                let value = self.check_exp(exp, Some(&symbol.ty))?;
+                if !symbol.ty.compatible(&value.ty) {
+                    self.error(
+                        value.loc,
+                        format!(
+                            "atribuição incompatível para '{name}': esperado {}, encontrado {}.",
+                            type_name(&symbol.ty),
+                            type_name(&value.ty)
+                        ),
+                    );
+                    return None;
+                }
+
+                if let SymbolKind::Local { decl_id } = symbol.kind {
+                    self.assigned.insert(decl_id);
+                }
+
+                Some(TypedStat::Assign {
+                    loc,
+                    target: TypedLValue::Name(name.clone()),
+                    value,
+                })
             }
-            SymbolKind::Param => {
-                self.error(
-                    *var_loc,
-                    format!("não é possível atribuir ao parâmetro '{name}' nesta fase."),
-                );
-                return None;
+            Var::VarBracket { .. } | Var::VarDot { .. } => {
+                // A variável-raiz da cadeia de índices/campos precisa ser um
+                // parâmetro composto ou uma local — nunca uma função nem um
+                // parâmetro escalar.
+                let Some(root_name) = root_var_name(var) else {
+                    // Defensivo: `VarBracket`/`VarDot` sempre têm uma
+                    // `VarName` na raiz da cadeia (o parser só produz `[`/`.`
+                    // como sufixo de uma expressão primária).
+                    self.error(loc, "alvo de atribuição inválido.");
+                    return None;
+                };
+                let Some(root_symbol) = self.st.find_symbol(&root_name).cloned() else {
+                    self.error(loc, format!("'{root_name}' não foi declarado."));
+                    return None;
+                };
+                match root_symbol.kind {
+                    SymbolKind::Global => {
+                        self.error(loc, "não é possível atribuir a uma função.");
+                        return None;
+                    }
+                    SymbolKind::Param if !is_composite(&root_symbol.ty) => {
+                        self.error(
+                            loc,
+                            format!(
+                                "não é possível atribuir através do parâmetro escalar '{root_name}' nesta fase."
+                            ),
+                        );
+                        return None;
+                    }
+                    SymbolKind::Param | SymbolKind::ForVar | SymbolKind::Local { .. } => {}
+                }
+
+                let target = self.check_var(&loc, var)?;
+                let target_ty = target.ty.clone();
+                let value = self.check_exp(exp, Some(&target_ty))?;
+                if !target_ty.compatible(&value.ty) {
+                    self.error(
+                        value.loc,
+                        format!(
+                            "atribuição incompatível: esperado {}, encontrado {}.",
+                            type_name(&target_ty),
+                            type_name(&value.ty)
+                        ),
+                    );
+                    return None;
+                }
+
+                if let SymbolKind::Local { decl_id } = root_symbol.kind {
+                    self.assigned.insert(decl_id);
+                }
+
+                let target_lvalue = match target.kind {
+                    TypedExpKind::Index { base, index } => TypedLValue::Index { base, index },
+                    TypedExpKind::Field { base, name } => TypedLValue::Field { base, name },
+                    // Inatingível: `check_var` só produz `Index`/`Field` para
+                    // `VarBracket`/`VarDot`, os únicos braços deste `match`.
+                    _ => unreachable!("check_var produziu um TypedExpKind inesperado"),
+                };
+
+                Some(TypedStat::Assign {
+                    loc,
+                    target: target_lvalue,
+                    value,
+                })
             }
-            // `ForVar` é sempre `mut` no template do T15 (nada a rastrear);
-            // `Local` é registrada mais abaixo, após a atribuição validar.
-            SymbolKind::ForVar | SymbolKind::Local { .. } => {}
         }
-
-        let value = self.check_exp(exp)?;
-        if !symbol.ty.compatible(&value.ty) {
-            self.error(
-                value.loc,
-                format!(
-                    "atribuição incompatível para '{name}': esperado {}, encontrado {}.",
-                    type_name(&symbol.ty),
-                    type_name(&value.ty)
-                ),
-            );
-            return None;
-        }
-
-        if let SymbolKind::Local { decl_id } = symbol.kind {
-            self.assigned.insert(decl_id);
-        }
-
-        Some(TypedStat::Assign {
-            loc,
-            target: TypedLValue::Name(name.clone()),
-            value,
-        })
     }
 
-    fn check_exp(&mut self, exp: &Exp) -> Option<TypedExp> {
+    /// Tipa uma expressão. `context`, acrescentado na T29 (PRD.md), é o tipo
+    /// esperado nesta posição quando conhecido de antemão (anotação de
+    /// `local`, tipo de parâmetro/retorno, elemento de array/map, campo de
+    /// record) — só `ExpInitList` o consome (a desambiguação de `{...}`
+    /// depende dele), mas ele precisa atravessar todo `check_exp` para
+    /// chegar até um `{...}` aninhado em qualquer posição.
+    fn check_exp(&mut self, exp: &Exp, context: Option<&Type>) -> Option<TypedExp> {
         match exp {
             Exp::ExpNil { loc } => Some(TypedExp {
                 loc: *loc,
@@ -1018,7 +1354,7 @@ impl Checker {
                 let mut typed_exps = Vec::with_capacity(exps.len());
                 let mut ok = true;
                 for e in exps {
-                    match self.check_exp(e) {
+                    match self.check_exp(e, None) {
                         Some(typed) => {
                             // Decisão 4 da Fase 1: `..` coage número→string
                             // (espírito do `trytostr` do original) — a
@@ -1052,13 +1388,7 @@ impl Checker {
                 })
             }
             Exp::ExpCall { loc, exp, args } => self.check_call(loc, exp, args),
-            Exp::ExpInitList { loc, .. } => {
-                self.error(
-                    *loc,
-                    "inicializador de array/record (`{...}`) não é suportado nesta fase.",
-                );
-                None
-            }
+            Exp::ExpInitList { loc, fields } => self.check_init_list(*loc, fields, context),
             Exp::ExpUnop { loc, op, exp } => self.check_unop(*loc, op, exp),
             Exp::ExpBinop { loc, lhs, op, rhs } => self.check_binop(*loc, op, lhs, rhs),
             Exp::ExpCast { loc, .. } => {
@@ -1075,6 +1405,317 @@ impl Checker {
         }
     }
 
+    /// Desambigua e tipa `{...}` (T29), espelhando `checker.lua:646-662`:
+    /// contexto primeiro, senão a forma do primeiro campo decide.
+    fn check_init_list(
+        &mut self,
+        loc: Loc,
+        fields: &[ast::Field],
+        context: Option<&Type>,
+    ) -> Option<TypedExp> {
+        // Contexto explícito manda, senão a forma do primeiro campo decide
+        // (checker.lua:646-662). `{}` vazio sem contexto não tem como
+        // decidir — erro claro.
+        match context {
+            Some(Type::Array { elem }) => self.check_array_lit(loc, fields, Some(elem.as_ref())),
+            Some(Type::Map { keys, values }) => {
+                self.check_map_lit(loc, fields, Some((keys.as_ref(), values.as_ref())))
+            }
+            Some(Type::Record {
+                name: rname,
+                fields: rfields,
+            }) => self.check_record_lit(loc, fields, rname, rfields),
+            Some(other) => {
+                self.error(
+                    loc,
+                    format!(
+                        "não é possível usar `{{...}}` onde se espera {}.",
+                        type_name(other)
+                    ),
+                );
+                None
+            }
+            None => match fields.first() {
+                None => {
+                    self.error(
+                        loc,
+                        "não é possível inferir o tipo de `{}` vazio; anote o tipo.",
+                    );
+                    None
+                }
+                Some(field) => match &field.name {
+                    ast::FieldName::Key(_) => self.check_map_lit(loc, fields, None),
+                    ast::FieldName::Name(_) => {
+                        self.error(
+                            loc,
+                            "não é possível inferir o tipo do record; anote o tipo.",
+                        );
+                        None
+                    }
+                    ast::FieldName::None => self.check_array_lit(loc, fields, None),
+                },
+            },
+        }
+    }
+
+    /// `{1, 2, 3}` como array (T29), espelhando `checker.lua:664-700`.
+    fn check_array_lit(
+        &mut self,
+        loc: Loc,
+        fields: &[ast::Field],
+        econtext: Option<&Type>,
+    ) -> Option<TypedExp> {
+        let mut typed_elems = Vec::with_capacity(fields.len());
+        let mut ok = true;
+        for field in fields {
+            if !matches!(field.name, ast::FieldName::None) {
+                self.error(
+                    field.loc,
+                    "campo nomeado não é válido dentro de um literal de array.",
+                );
+                ok = false;
+                continue;
+            }
+            match self.check_exp(&field.exp, econtext) {
+                Some(typed) => typed_elems.push(typed),
+                None => ok = false,
+            }
+        }
+        if !ok {
+            return None;
+        }
+
+        let elem_ty = match econtext {
+            Some(ty) => ty.clone(),
+            None => match typed_elems.first() {
+                Some(first) => first.ty.clone(),
+                // `fields` vazio só chega aqui vindo de `check_init_list`
+                // com `econtext` `None`, que já rejeitou `{}` antes de
+                // chamar este método — mantido por robustez.
+                None => Type::Integer,
+            },
+        };
+
+        for elem in &typed_elems {
+            if !elem_ty.compatible(&elem.ty) {
+                self.error(
+                    elem.loc,
+                    format!(
+                        "elemento do array incompatível: esperado {}, encontrado {}.",
+                        type_name(&elem_ty),
+                        type_name(&elem.ty)
+                    ),
+                );
+                return None;
+            }
+        }
+
+        Some(TypedExp {
+            loc,
+            ty: Type::Array {
+                elem: Box::new(elem_ty),
+            },
+            kind: TypedExpKind::ArrayLit(typed_elems),
+        })
+    }
+
+    /// `{["a"] = 1}` como map (T29), espelhando `checker.lua:701-737`.
+    fn check_map_lit(
+        &mut self,
+        loc: Loc,
+        fields: &[ast::Field],
+        context: Option<(&Type, &Type)>,
+    ) -> Option<TypedExp> {
+        let (kcontext, vcontext) = match context {
+            Some((k, v)) => (Some(k), Some(v)),
+            None => (None, None),
+        };
+
+        let mut typed_entries = Vec::with_capacity(fields.len());
+        let mut ok = true;
+        for field in fields {
+            let ast::FieldName::Key(key_exp) = &field.name else {
+                self.error(
+                    field.loc,
+                    "campo posicional ou nomeado não é válido dentro de um literal de map; use `[chave] = valor`.",
+                );
+                ok = false;
+                continue;
+            };
+            let typed_key = self.check_exp(key_exp, kcontext);
+            let typed_value = self.check_exp(&field.exp, vcontext);
+            match (typed_key, typed_value) {
+                (Some(k), Some(v)) => typed_entries.push((k, v)),
+                _ => ok = false,
+            }
+        }
+        if !ok {
+            return None;
+        }
+
+        let key_ty = match kcontext {
+            Some(ty) => ty.clone(),
+            None => match typed_entries.first() {
+                Some((k, _)) => k.ty.clone(),
+                None => Type::Integer,
+            },
+        };
+        let value_ty = match vcontext {
+            Some(ty) => ty.clone(),
+            None => match typed_entries.first() {
+                Some((_, v)) => v.ty.clone(),
+                None => Type::Integer,
+            },
+        };
+
+        for (k, v) in &typed_entries {
+            if !key_ty.compatible(&k.ty) {
+                self.error(
+                    k.loc,
+                    format!(
+                        "chave de map incompatível: esperado {}, encontrado {}.",
+                        type_name(&key_ty),
+                        type_name(&k.ty)
+                    ),
+                );
+                return None;
+            }
+            if !value_ty.compatible(&v.ty) {
+                self.error(
+                    v.loc,
+                    format!(
+                        "valor de map incompatível: esperado {}, encontrado {}.",
+                        type_name(&value_ty),
+                        type_name(&v.ty)
+                    ),
+                );
+                return None;
+            }
+        }
+
+        Some(TypedExp {
+            loc,
+            ty: Type::Map {
+                keys: Box::new(key_ty),
+                values: Box::new(value_ty),
+            },
+            kind: TypedExpKind::MapLit(typed_entries),
+        })
+    }
+
+    /// `Nome{x = 1, y = 2}` como record (T29), espelhando
+    /// `checker.lua:738-794`. Exaustivo: todo campo presente, nenhum extra,
+    /// nenhum posicional.
+    fn check_record_lit(
+        &mut self,
+        loc: Loc,
+        fields: &[ast::Field],
+        rname: &str,
+        rfields: &[(String, Type)],
+    ) -> Option<TypedExp> {
+        let mut seen = HashSet::new();
+        let mut typed_by_name: Vec<(String, TypedExp)> = Vec::with_capacity(fields.len());
+        let mut ok = true;
+        for field in fields {
+            let fname = match &field.name {
+                ast::FieldName::Name(n) => n,
+                ast::FieldName::None => {
+                    self.error(
+                        field.loc,
+                        format!(
+                            "record '{rname}' não aceita campo posicional; use `nome = valor`."
+                        ),
+                    );
+                    ok = false;
+                    continue;
+                }
+                ast::FieldName::Key(_) => {
+                    self.error(
+                        field.loc,
+                        format!("record '{rname}' não aceita chave-expressão (`[...] = ...`)."),
+                    );
+                    ok = false;
+                    continue;
+                }
+            };
+            let Some((_, expected_ty)) = rfields.iter().find(|(n, _)| n == fname) else {
+                self.error(
+                    field.loc,
+                    format!("campo '{fname}' não existe no record '{rname}'."),
+                );
+                ok = false;
+                continue;
+            };
+            if !seen.insert(fname.clone()) {
+                self.error(
+                    field.loc,
+                    format!("campo '{fname}' duplicado no construtor de '{rname}'."),
+                );
+                ok = false;
+                continue;
+            }
+            match self.check_exp(&field.exp, Some(expected_ty)) {
+                Some(typed) => {
+                    if !expected_ty.compatible(&typed.ty) {
+                        self.error(
+                            typed.loc,
+                            format!(
+                                "campo '{fname}' incompatível: esperado {}, encontrado {}.",
+                                type_name(expected_ty),
+                                type_name(&typed.ty)
+                            ),
+                        );
+                        ok = false;
+                    } else {
+                        typed_by_name.push((fname.clone(), typed));
+                    }
+                }
+                None => ok = false,
+            }
+        }
+
+        for (fname, _) in rfields {
+            if !seen.contains(fname) {
+                self.error(
+                    loc,
+                    format!("falta o campo '{fname}' no construtor de '{rname}'."),
+                );
+                ok = false;
+            }
+        }
+
+        if !ok {
+            return None;
+        }
+
+        // Ordem canônica dos campos do record, não a ordem escrita no
+        // construtor — o codegen (T32) emite os campos na ordem da
+        // declaração do `record`.
+        let ordered_fields = rfields
+            .iter()
+            .map(|(n, _)| {
+                let typed = typed_by_name
+                    .iter()
+                    .find(|(name, _)| name == n)
+                    .map(|(_, t)| t.clone())
+                    .expect("exaustividade já garantida acima");
+                (n.clone(), typed)
+            })
+            .collect();
+
+        Some(TypedExp {
+            loc,
+            ty: Type::Record {
+                name: rname.to_string(),
+                fields: rfields.to_vec(),
+            },
+            kind: TypedExpKind::RecordLit {
+                type_name: rname.to_string(),
+                fields: ordered_fields,
+            },
+        })
+    }
+
     /// Regras de tipo dos operadores binários (T13), espelhando
     /// `checker.lua:910-1122` sem bitwise nem gradual typing.
     fn check_binop(&mut self, loc: Loc, op_str: &str, lhs: &Exp, rhs: &Exp) -> Option<TypedExp> {
@@ -1086,8 +1727,8 @@ impl Checker {
             return None;
         };
 
-        let lhs = self.check_exp(lhs)?;
-        let rhs = self.check_exp(rhs)?;
+        let lhs = self.check_exp(lhs, None)?;
+        let rhs = self.check_exp(rhs, None)?;
 
         let ty = match op {
             // Ambos numéricos; int/int → int, qualquer float promove a float.
@@ -1198,14 +1839,19 @@ impl Checker {
         ok
     }
 
-    /// Regras de tipo dos operadores unários (T13): `-` numérico preserva o
-    /// tipo do operando; `not` é boolean → boolean (`checker.lua:1100-1122`).
+    /// Regras de tipo dos operadores unários (T13/T29): `-` numérico preserva
+    /// o tipo do operando; `not` é boolean → boolean (`checker.lua:1100-1122`);
+    /// `#` (`checker.lua:852-859`) sobre `Array`/`String` resulta `Integer` —
+    /// **o parser ainda não produz `#` como prefixo de expressão nesta fase**
+    /// (nenhuma tarefa até T28 estendeu `parse_unary_exp`), então este braço
+    /// só é alcançável hoje por AST montada à mão, como os testes do PRD.
     fn check_unop(&mut self, loc: Loc, op_str: &str, exp: &Exp) -> Option<TypedExp> {
         let op = match op_str {
             "-" => UnOp::Neg,
             "not" => UnOp::Not,
+            "#" => UnOp::Len,
             // O parser (T11) só produz `-` e `not`; defensivo para AST
-            // montada à mão (`#`, `~`).
+            // montada à mão (`~`).
             _ => {
                 self.error(
                     loc,
@@ -1215,7 +1861,7 @@ impl Checker {
             }
         };
 
-        let exp = self.check_exp(exp)?;
+        let exp = self.check_exp(exp, None)?;
         let ty = match op {
             UnOp::Neg => {
                 if !is_numeric(&exp.ty) {
@@ -1243,10 +1889,19 @@ impl Checker {
                 }
                 Type::Boolean
             }
-            // Inatingível: `op` só nasce `Neg`/`Not` linhas acima — `Len`
-            // não tem grafia de origem em `check_unop` nesta fase (T25:
-            // acrescentado à AST tipada, sem produtor ainda).
-            UnOp::Len => unreachable!("`check_unop` nunca produz `UnOp::Len` nesta fase"),
+            UnOp::Len => {
+                if !matches!(exp.ty, Type::Array { .. } | Type::String) {
+                    self.error(
+                        exp.loc,
+                        format!(
+                            "`#` espera um array ou string, encontrado {}.",
+                            type_name(&exp.ty)
+                        ),
+                    );
+                    return None;
+                }
+                Type::Integer
+            }
         };
 
         Some(TypedExp {
@@ -1259,6 +1914,9 @@ impl Checker {
         })
     }
 
+    /// Tipa um `Var` em posição de leitura (`ExpVar`) — `VarBracket`/`VarDot`
+    /// espelham `checker.lua:541-564` e `:482-539` (T29), simplificados sem
+    /// módulos/métodos, que seguem fora de escopo.
     fn check_var(&mut self, _loc: &Loc, var: &Var) -> Option<TypedExp> {
         match var {
             Var::VarName { loc, name } => match self.st.find_symbol(name).cloned() {
@@ -1272,16 +1930,77 @@ impl Checker {
                     None
                 }
             },
-            Var::VarBracket { loc, .. } => {
-                self.error(*loc, "indexação (`v[i]`) não é suportada nesta fase.");
-                None
+            Var::VarBracket { loc, exp1, exp2 } => {
+                let base = self.check_exp(exp1, None)?;
+                let (keys_ty, result_ty) = match &base.ty {
+                    Type::Array { elem } => (Type::Integer, elem.as_ref().clone()),
+                    Type::Map { keys, values } => (keys.as_ref().clone(), values.as_ref().clone()),
+                    Type::String => {
+                        self.error(
+                            base.loc,
+                            "não é possível indexar uma string com `[]` nesta fase.",
+                        );
+                        return None;
+                    }
+                    other => {
+                        self.error(
+                            base.loc,
+                            format!("não é possível indexar {}.", type_name(other)),
+                        );
+                        return None;
+                    }
+                };
+                let index = self.check_exp(exp2, Some(&keys_ty))?;
+                if !keys_ty.compatible(&index.ty) {
+                    self.error(
+                        index.loc,
+                        format!(
+                            "índice incompatível: esperado {}, encontrado {}.",
+                            type_name(&keys_ty),
+                            type_name(&index.ty)
+                        ),
+                    );
+                    return None;
+                }
+                Some(TypedExp {
+                    loc: *loc,
+                    // Decisão 3 do PRD.md (T29): o resultado é `T`, não `T?`
+                    // — sem `Option` nesta fase.
+                    ty: result_ty,
+                    kind: TypedExpKind::Index {
+                        base: Box::new(base),
+                        index: Box::new(index),
+                    },
+                })
             }
-            Var::VarDot { loc, .. } => {
-                self.error(
-                    *loc,
-                    "acesso a campo (`v.campo`) não é suportado nesta fase.",
-                );
-                None
+            Var::VarDot { loc, exp, name } => {
+                let base = self.check_exp(exp, None)?;
+                let Type::Record { name: rname, fields } = &base.ty else {
+                    self.error(
+                        base.loc,
+                        format!(
+                            "só é possível acessar campo de um record, encontrado {}.",
+                            type_name(&base.ty)
+                        ),
+                    );
+                    return None;
+                };
+                let Some((_, field_ty)) = fields.iter().find(|(fname, _)| fname == name) else {
+                    self.error(
+                        *loc,
+                        format!("o record '{rname}' não tem campo '{name}'."),
+                    );
+                    return None;
+                };
+                let field_ty = field_ty.clone();
+                Some(TypedExp {
+                    loc: *loc,
+                    ty: field_ty,
+                    kind: TypedExpKind::Field {
+                        base: Box::new(base),
+                        name: name.clone(),
+                    },
+                })
             }
         }
     }
@@ -1319,14 +2038,52 @@ impl Checker {
 
         let mut typed_args = Vec::with_capacity(arg_exps.len());
         let mut ok = true;
-        for arg in arg_exps {
-            match self.check_exp(arg) {
+        for (i, arg) in arg_exps.iter().enumerate() {
+            match self.check_exp(arg, params.get(i)) {
                 Some(typed) => typed_args.push(typed),
                 None => ok = false,
             }
         }
         if !ok {
             return None;
+        }
+
+        // Duplo empréstimo mutável (T29): passar a mesma variável composta
+        // duas vezes na mesma chamada (`f(xs, xs)`) geraria `cannot borrow
+        // as mutable more than once` no Rust gerado — rejeitado aqui com
+        // mensagem em português em vez de deixar o `rustc` recusar. Também
+        // marca cada raiz composta como usada mutavelmente (mesmo
+        // espírito de `check_assign`): passar um array/map/record a uma
+        // função é uso mutável sob `&mut`.
+        let mut seen_composite_roots: Vec<String> = Vec::new();
+        for (arg_exp, typed_arg) in arg_exps.iter().zip(&typed_args) {
+            if !is_composite(&typed_arg.ty) {
+                continue;
+            }
+            let Exp::ExpVar { var, .. } = arg_exp else {
+                continue;
+            };
+            let Some(root_name) = root_var_name(var) else {
+                continue;
+            };
+            if seen_composite_roots.contains(&root_name) {
+                self.error(
+                    typed_arg.loc,
+                    format!(
+                        "não é possível passar '{root_name}' duas vezes na mesma chamada: \
+                         empréstimo mutável duplicado."
+                    ),
+                );
+                return None;
+            }
+            if let Some(Symbol {
+                kind: SymbolKind::Local { decl_id },
+                ..
+            }) = self.st.find_symbol(&root_name)
+            {
+                self.assigned.insert(*decl_id);
+            }
+            seen_composite_roots.push(root_name);
         }
 
         if typed_args.len() != params.len() {
@@ -1409,6 +2166,34 @@ fn is_numeric(ty: &Type) -> bool {
     matches!(ty, Type::Integer | Type::Float)
 }
 
+/// `true` para os tipos passados por `&mut` no Rust gerado (T29): um
+/// parâmetro composto aceita `xs[i] = v`, e passá-lo a outra função é uso
+/// mutável (`check_call` insere seu `DeclId` em `assigned`). Consulta apenas
+/// o tipo, sem inflar `SymbolKind` com mais uma variante.
+fn is_composite(ty: &Type) -> bool {
+    matches!(ty, Type::Array { .. } | Type::Map { .. } | Type::Record { .. })
+}
+
+/// Desce a cadeia de `VarBracket`/`VarDot` (`v[i]`, `p.campo`,
+/// `m[i].campo[j]`) até achar o `VarName` raiz — usado por `check_assign`
+/// para descobrir qual variável-raiz uma atribuição indexada/de campo
+/// alcança (T29, decisão de mutabilidade composta: `v[i]=x` e `p.campo=x`
+/// marcam a variável-raiz como mutável, cobrindo aninhamento).
+fn root_var_name(var: &Var) -> Option<String> {
+    match var {
+        Var::VarName { name, .. } => Some(name.clone()),
+        Var::VarBracket { exp1, .. } => root_exp_var_name(exp1),
+        Var::VarDot { exp, .. } => root_exp_var_name(exp),
+    }
+}
+
+fn root_exp_var_name(exp: &Exp) -> Option<String> {
+    match exp {
+        Exp::ExpVar { var, .. } => root_var_name(var),
+        _ => None,
+    }
+}
+
 /// Coerção numérica int→float centralizada (T13): o tipo resultante de
 /// combinar dois operandos **já validados** como numéricos — `Integer` só
 /// quando os dois lados são `Integer`; qualquer `Float` promove o resultado
@@ -1447,6 +2232,9 @@ fn type_name(ty: &Type) -> String {
 pub fn check(program: &Program) -> Result<TypedProgram, Vec<CheckError>> {
     let mut checker = Checker::new();
 
+    // Records primeiro (T29): uma função pode receber um record declarado
+    // mais adiante no arquivo.
+    checker.collect_records(program);
     for node in program {
         checker.collect_signature(node);
     }
@@ -1602,9 +2390,11 @@ mod tests {
     }
 
     #[test]
-    fn foreign_import_e_record_produzem_erro_de_construcao_nao_suportada() {
-        // Mesmo espírito de um arquivo `.titan` do Titan original: `record`
-        // e `foreign import` não fazem parte do subconjunto da Fase 0.
+    fn foreign_import_produz_erro_de_construcao_nao_suportada() {
+        // Mesmo espírito de um arquivo `.titan` do Titan original:
+        // `foreign import` não faz parte do subconjunto desta fase. `record`
+        // passou a ser aceito a partir da T29 — coberto por
+        // `record_vazio_e_aceito_pelo_checker` mais abaixo.
         let loc = Loc { line: 1, col: 1 };
         let program: Program = vec![
             TopLevel::TopLevelForeignImport {
@@ -1621,7 +2411,6 @@ mod tests {
 
         let errs = check(&program).unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("foreign import")));
-        assert!(errs.iter().any(|e| e.message.contains("record")));
     }
 
     #[test]
@@ -2118,8 +2907,10 @@ end"#;
 
     #[test]
     fn operadores_fora_do_subconjunto_montados_a_mao_produzem_erro() {
-        // O parser (T11) nunca produz `//` nem `#` — AST montada à mão para
+        // O parser (T11) nunca produz `//` nem `~` — AST montada à mão para
         // exercitar o braço defensivo `_` da conversão String → BinOp/UnOp.
+        // `#` deixou de ser exemplo aqui na T29 (passou a ser suportado);
+        // ver a seção de testes da T29 mais abaixo.
         let loc = Loc { line: 1, col: 1 };
         let program: Program = vec![TopLevel::TopLevelFunc {
             loc,
@@ -2148,11 +2939,8 @@ end"#;
                         },
                         Exp::ExpUnop {
                             loc,
-                            op: "#".to_string(),
-                            exp: Box::new(Exp::ExpString {
-                                loc,
-                                value: "a".to_string(),
-                            }),
+                            op: "~".to_string(),
+                            exp: Box::new(Exp::ExpInteger { loc, value: 1 }),
                         },
                     ],
                 }],
@@ -2166,7 +2954,599 @@ end"#;
         );
         assert!(
             errs.iter()
-                .any(|e| e.message.contains("operador unário `#` não é suportado"))
+                .any(|e| e.message.contains("operador unário `~` não é suportado"))
+        );
+    }
+
+    // ---- T29: records, arrays, maps, indexação, campos ------------------
+
+    #[test]
+    fn record_vazio_e_aceito_pelo_checker() {
+        let loc = Loc { line: 1, col: 1 };
+        let program: Program = vec![
+            TopLevel::TopLevelRecord {
+                loc,
+                name: "Ponto".to_string(),
+                fields: vec![],
+            },
+            TopLevel::TopLevelFunc {
+                loc,
+                islocal: false,
+                name: "main".to_string(),
+                params: vec![Decl {
+                    loc,
+                    name: "args".to_string(),
+                    r#type: Some(ast::Type::TypeArray {
+                        loc,
+                        subtype: Box::new(ast::Type::TypeString { loc }),
+                    }),
+                    option: false,
+                }],
+                rettypes: vec![ast::Type::TypeInteger { loc }],
+                block: Stat::StatBlock {
+                    loc,
+                    stats: vec![Stat::StatReturn {
+                        loc,
+                        exps: vec![Exp::ExpInteger { loc, value: 0 }],
+                    }],
+                },
+            },
+        ];
+
+        let typed = check(&program).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        assert!(
+            typed
+                .iter()
+                .any(|t| matches!(t, TypedTopLevel::Record { name, .. } if name == "Ponto"))
+        );
+    }
+
+    #[test]
+    fn array_literal_com_contexto_e_aceito() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local t: {integer} = {1, 2, 3}\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl");
+        };
+        assert_eq!(
+            value.ty,
+            Type::Array {
+                elem: Box::new(Type::Integer)
+            }
+        );
+        assert!(matches!(value.kind, TypedExpKind::ArrayLit(ref v) if v.len() == 3));
+    }
+
+    #[test]
+    fn array_literal_sem_contexto_infere_do_primeiro_elemento() {
+        let typed = typed_value_of("{1, 2, 3}");
+        assert_eq!(
+            typed.ty,
+            Type::Array {
+                elem: Box::new(Type::Integer)
+            }
+        );
+    }
+
+    #[test]
+    fn array_aninhado_e_aceito() {
+        let typed = typed_value_of("{{1, 2}, {3, 4}}");
+        assert_eq!(
+            typed.ty,
+            Type::Array {
+                elem: Box::new(Type::Array {
+                    elem: Box::new(Type::Integer)
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn init_list_vazio_sem_contexto_produz_erro() {
+        let errs = exp_errors_of("{}");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("inferir o tipo de `{}` vazio"))
+        );
+    }
+
+    #[test]
+    fn map_literal_e_aceito() {
+        let typed = typed_value_of(r#"{["a"] = 1, ["b"] = 2}"#);
+        assert_eq!(
+            typed.ty,
+            Type::Map {
+                keys: Box::new(Type::String),
+                values: Box::new(Type::Integer),
+            }
+        );
+        assert!(matches!(typed.kind, TypedExpKind::MapLit(ref v) if v.len() == 2));
+    }
+
+    #[test]
+    fn map_com_chave_float_produz_erro() {
+        let source = "function main(args: {string}): integer\n\
+             \x20   local m: {float: integer} = {}\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("chave de `map`") && e.message.contains("float"))
+        );
+    }
+
+    #[test]
+    fn record_completo_e_aceito_com_contexto() {
+        let source = "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   y: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1, y = 2}\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn record_incompleto_produz_erro() {
+        let source = "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   y: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1}\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("falta o campo 'y'"))
+        );
+    }
+
+    #[test]
+    fn record_com_campo_extra_produz_erro() {
+        let source = "record Ponto\n\
+             \x20   x: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1, z = 2}\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("campo 'z' não existe"))
+        );
+    }
+
+    #[test]
+    fn record_sem_contexto_produz_erro() {
+        let source = "record Ponto\n\
+             \x20   x: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p = {x = 1}\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("inferir o tipo do record"))
+        );
+    }
+
+    #[test]
+    fn record_com_nome_reservado_do_rust_produz_erro() {
+        let source = "record String\n\
+             \x20   x: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("nome reservado")));
+    }
+
+    #[test]
+    fn record_recursivo_direto_produz_erro() {
+        let source = "record No\n\
+             \x20   valor: integer\n\
+             \x20   prox: No\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("recursivo")));
+    }
+
+    #[test]
+    fn record_recursivo_indireto_produz_erro() {
+        let source = "record A\n\
+             \x20   b: B\n\
+             end\n\
+             record B\n\
+             \x20   a: A\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("recursivo")));
+    }
+
+    #[test]
+    fn record_com_array_do_proprio_tipo_e_aceito() {
+        // Diferente de `prox: No` (campo direto, recursão real — rejeitada
+        // acima), `filhos: {No}` é indireção via `Vec<No>`, que tem tamanho
+        // finito: não é recursão infinita e precisa ser aceito.
+        let source = "record No\n\
+             \x20   valor: integer\n\
+             \x20   filhos: {No}\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn record_contendo_campo_array_e_aceito() {
+        let source = "record Lista\n\
+             \x20   itens: {integer}\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local l: Lista = {itens = {1, 2, 3}}\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn indexacao_de_array_e_aceita() {
+        let typed = typed_value_of("({1, 2, 3})[1]");
+        assert_eq!(typed.ty, Type::Integer);
+        assert!(matches!(typed.kind, TypedExpKind::Index { .. }));
+    }
+
+    #[test]
+    fn indice_de_array_nao_integer_produz_erro() {
+        let errs = exp_errors_of(r#"({1, 2, 3})["a"]"#);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("índice incompatível"))
+        );
+    }
+
+    #[test]
+    fn acesso_a_campo_de_record_e_aceito() {
+        let source = "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   y: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1, y = 2}\n\
+             \x20   return p.x\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn acesso_a_campo_inexistente_produz_erro() {
+        let source = "record Ponto\n\
+             \x20   x: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1}\n\
+             \x20   return p.z\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("não tem campo 'z'"))
+        );
+    }
+
+    #[test]
+    fn hash_de_array_e_de_string_resulta_integer() {
+        // O parser ainda não produz `#` como prefixo de expressão nesta
+        // fase (PRD.md, T29) — AST montada à mão, como o restante da suíte
+        // "montada à mão" já faz para construções que o parser não emite.
+        let loc = Loc { line: 1, col: 1 };
+        for operand in [
+            Exp::ExpInitList {
+                loc,
+                fields: vec![
+                    ast::Field {
+                        loc,
+                        name: ast::FieldName::None,
+                        exp: Exp::ExpInteger { loc, value: 1 },
+                    },
+                    ast::Field {
+                        loc,
+                        name: ast::FieldName::None,
+                        exp: Exp::ExpInteger { loc, value: 2 },
+                    },
+                ],
+            },
+            Exp::ExpString {
+                loc,
+                value: "abc".to_string(),
+            },
+        ] {
+            let program: Program = vec![TopLevel::TopLevelFunc {
+                loc,
+                islocal: false,
+                name: "main".to_string(),
+                params: vec![Decl {
+                    loc,
+                    name: "args".to_string(),
+                    r#type: Some(ast::Type::TypeArray {
+                        loc,
+                        subtype: Box::new(ast::Type::TypeString { loc }),
+                    }),
+                    option: false,
+                }],
+                rettypes: vec![ast::Type::TypeInteger { loc }],
+                block: Stat::StatBlock {
+                    loc,
+                    stats: vec![Stat::StatReturn {
+                        loc,
+                        exps: vec![Exp::ExpUnop {
+                            loc,
+                            op: "#".to_string(),
+                            exp: Box::new(operand),
+                        }],
+                    }],
+                },
+            }];
+            check(&program).unwrap_or_else(|errs| {
+                panic!(
+                    "esperava sucesso, obteve erros: {}",
+                    errs.iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn hash_de_map_produz_erro() {
+        let loc = Loc { line: 1, col: 1 };
+        let program: Program = vec![TopLevel::TopLevelFunc {
+            loc,
+            islocal: false,
+            name: "main".to_string(),
+            params: vec![Decl {
+                loc,
+                name: "args".to_string(),
+                r#type: Some(ast::Type::TypeArray {
+                    loc,
+                    subtype: Box::new(ast::Type::TypeString { loc }),
+                }),
+                option: false,
+            }],
+            rettypes: vec![ast::Type::TypeInteger { loc }],
+            block: Stat::StatBlock {
+                loc,
+                stats: vec![
+                    Stat::StatDecl {
+                        loc,
+                        decls: vec![Decl {
+                            loc,
+                            name: "m".to_string(),
+                            r#type: Some(ast::Type::TypeMap {
+                                loc,
+                                keystype: Box::new(ast::Type::TypeString { loc }),
+                                valuestype: Box::new(ast::Type::TypeInteger { loc }),
+                            }),
+                            option: false,
+                        }],
+                        exps: vec![Exp::ExpInitList {
+                            loc,
+                            fields: vec![],
+                        }],
+                    },
+                    Stat::StatReturn {
+                        loc,
+                        exps: vec![Exp::ExpUnop {
+                            loc,
+                            op: "#".to_string(),
+                            exp: Box::new(Exp::ExpVar {
+                                loc,
+                                var: Box::new(Var::VarName {
+                                    loc,
+                                    name: "m".to_string(),
+                                }),
+                            }),
+                        }],
+                    },
+                ],
+            },
+        }];
+        let errs = check(&program).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("`#` espera um array ou string"))
+        );
+    }
+
+    #[test]
+    fn atribuicao_a_indice_de_array_e_aceita() {
+        let source = "record Caixa\n\
+             \x20   itens: {integer}\n\
+             end\n\
+             function altera(c: Caixa): integer\n\
+             \x20   c.itens[1] = 9\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn atribuicao_a_campo_de_record_e_aceita() {
+        let source = "record Ponto\n\
+             \x20   x: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1}\n\
+             \x20   p.x = 2\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn parametro_composto_aceita_atribuicao_indexada() {
+        let source = "function altera(xs: {integer}): integer\n\
+             \x20   xs[1] = 9\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn atribuicao_ao_parametro_composto_inteiro_produz_erro() {
+        let source = "function troca(xs: {integer}): integer\n\
+             \x20   xs = {1, 2}\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("parâmetro composto"))
+        );
+    }
+
+    #[test]
+    fn atribuicao_a_parametro_escalar_continua_rejeitada() {
+        let source = "function f(x: integer): integer\n\
+             \x20   x = 1\n\
+             \x20   return x\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("parâmetro")));
+    }
+
+    #[test]
+    fn passar_mesma_variavel_composta_duas_vezes_produz_erro() {
+        let source = "function f(xs: {integer}, ys: {integer}): integer\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local xs: {integer} = {1, 2}\n\
+             \x20   return f(xs, xs)\n\
+             end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("empréstimo mutável duplicado"))
+        );
+    }
+
+    #[test]
+    fn passar_array_composto_a_funcao_marca_variavel_como_mutavel() {
+        let source = "function main(args: {string}): integer\n\
+             \x20   local xs: {integer} = {1, 2}\n\
+             \x20   local descartado: integer = usa(xs)\n\
+             \x20   return 0\n\
+             end\n\
+             function usa(xs: {integer}): integer\n\
+             \x20   return 0\n\
+             end";
+        let stats = typed_body_stats(source);
+        let TypedStat::Decl { name, mutable, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl");
+        };
+        assert_eq!(name, "xs");
+        assert!(
+            *mutable,
+            "xs é passada por valor composto a `usa` → marcada mutável (uso sob &mut)"
         );
     }
 }
