@@ -1842,9 +1842,9 @@ impl Checker {
     /// Regras de tipo dos operadores unários (T13/T29): `-` numérico preserva
     /// o tipo do operando; `not` é boolean → boolean (`checker.lua:1100-1122`);
     /// `#` (`checker.lua:852-859`) sobre `Array`/`String` resulta `Integer` —
-    /// **o parser ainda não produz `#` como prefixo de expressão nesta fase**
-    /// (nenhuma tarefa até T28 estendeu `parse_unary_exp`), então este braço
-    /// só é alcançável hoje por AST montada à mão, como os testes do PRD.
+    /// `parser::parse_unary_exp` produz `#` como prefixo de expressão desde a
+    /// T30 (lacuna do parser fechada ali; `check_unop` já sabia mapear `"#"`
+    /// desde a T29).
     fn check_unop(&mut self, loc: Loc, op_str: &str, exp: &Exp) -> Option<TypedExp> {
         let op = match op_str {
             "-" => UnOp::Neg,

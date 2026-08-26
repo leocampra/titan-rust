@@ -639,13 +639,18 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `(not | -)* pow_exp` — a repetição vira recursão: `- -1` e
-    /// `not not true` produzem `ExpUnop` aninhados.
+    /// `(not | - | #)* pow_exp` — a repetição vira recursão: `- -1` e
+    /// `not not true` produzem `ExpUnop` aninhados. `#` (T20/T25: lexado
+    /// desde a T20, mas sem produtor no parser até aqui — T30 fecha essa
+    /// lacuna, exigida por `#xs`/`#s` ponta a ponta) segue o mesmo lugar na
+    /// gramática: `checker::check_unop` já sabe mapear `"#"` para
+    /// `UnOp::Len`.
     fn parse_unary_exp(&mut self) -> Result<Exp, ParseError> {
         let loc = self.loc();
         let op = match &self.peek().kind {
             TokenKind::Not => "not",
             TokenKind::Minus => "-",
+            TokenKind::Hash => "#",
             _ => return self.parse_pow_exp(),
         };
         self.advance();

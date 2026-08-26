@@ -168,6 +168,35 @@ where
     m.insert(chave, valor);
 }
 
+/// Referência mutável a `m[chave]`, devolvendo o erro em português em vez de
+/// abortar. Base para [`map_get_mut`] — mesmo papel de
+/// [`array_get_mut_checked`], necessário para escrever através de um `v` que
+/// é ele mesmo o valor de outro composto (`m[chave][i] = x`,
+/// `f(m[chave])` quando o parâmetro é composto): sem uma referência real ao
+/// lugar dentro do `HashMap`, a escrita só alcançaria uma cópia.
+pub fn map_get_mut_checked<'a, K, V>(
+    m: &'a mut std::collections::HashMap<K, V>,
+    chave: &K,
+) -> Result<&'a mut V, String>
+where
+    K: std::hash::Hash + Eq,
+{
+    m.get_mut(chave)
+        .ok_or_else(|| "chave não encontrada no map".to_string())
+}
+
+/// Referência mutável a `m[chave]`. Aborta com mensagem em português se a
+/// chave não existir.
+pub fn map_get_mut<'a, K, V>(m: &'a mut std::collections::HashMap<K, V>, chave: &K) -> &'a mut V
+where
+    K: std::hash::Hash + Eq,
+{
+    match map_get_mut_checked(m, chave) {
+        Ok(val) => val,
+        Err(msg) => abortar(&msg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +412,25 @@ mod tests {
         assert_eq!(map_get_checked(&m, &1), Ok("um".to_string()));
         assert_eq!(
             map_get_checked(&m, &2),
+            Err("chave não encontrada no map".to_string())
+        );
+    }
+
+    // --- map_get_mut_checked ------------------------------------------------
+
+    #[test]
+    fn map_get_mut_checked_permite_escrever() {
+        let mut m: HashMap<String, i64> = HashMap::new();
+        map_set(&mut m, "a".to_string(), 1);
+        *map_get_mut_checked(&mut m, &"a".to_string()).unwrap() = 99;
+        assert_eq!(map_get_checked(&m, &"a".to_string()), Ok(99));
+    }
+
+    #[test]
+    fn map_get_mut_checked_chave_ausente() {
+        let mut m: HashMap<String, i64> = HashMap::new();
+        assert_eq!(
+            map_get_mut_checked(&mut m, &"faltando".to_string()),
             Err("chave não encontrada no map".to_string())
         );
     }

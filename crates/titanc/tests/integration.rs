@@ -283,27 +283,6 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// tipos) com erro claro, nunca panic.
 const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
     CasoNegativo {
-        nome: "indexacao_de_array",
-        fonte: "function main(args: {string}): integer\n    print(args[1])\n    return 0\nend",
-        // Desde a T23 (PRD.md), o parser tem sufixo de indexação (`v[i]` vira
-        // `VarBracket`) — a rejeição deixou de ser sintática. Desde a T29, o
-        // checker sabe verificar indexação (aceita este programa: `args[1]`
-        // é `string`, compatível com `print`) — a rejeição agora vem do
-        // stub não-panic do codegen (T30/T31/T32/T33 são quem dão suporte
-        // real à emissão).
-        trecho_esperado: "geração de código para indexação",
-    },
-    CasoNegativo {
-        nome: "construtor_de_array",
-        fonte: "function main(args: {string}): integer\n    local t = {1, 2}\n    return 0\nend",
-        // Desde a T28 (PRD.md), o parser produz `ExpInitList` para `{...}` —
-        // a rejeição deixou de ser sintática. Desde a T29, o checker sabe
-        // tipar arrays/records/maps (aceita `{1, 2}` como `{integer}`) — a
-        // rejeição agora vem do stub não-panic do codegen (T30/T31/T32/T33
-        // são quem dão suporte real à emissão).
-        trecho_esperado: "geração de código para o tipo array",
-    },
-    CasoNegativo {
         nome: "retornos_multiplos",
         fonte: "function main(args: {string}): integer\n    return 1, 2\nend",
         trecho_esperado: "erro de sintaxe",
@@ -359,14 +338,6 @@ const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
         trecho_esperado: "Esperava uma expressão",
     },
     CasoNegativo {
-        nome: "operador_length",
-        fonte: "function main(args: {string}): integer\n    local a = #args\n    return 0\nend",
-        // Desde a T20 (PRD.md), `#` é um token válido (`Hash`) — a rejeição
-        // deixou de ser léxica. O operador `#` unário é T25 em diante; por ora
-        // o parser não sabe iniciar uma expressão com `#` e produz este erro.
-        trecho_esperado: "Esperava uma expressão",
-    },
-    CasoNegativo {
         nome: "tipo_option",
         fonte: "function main(args: {string}): integer\n    local a: integer? = nil\n    return 0\nend",
         trecho_esperado: "caractere inesperado '?'",
@@ -402,7 +373,7 @@ fn arquivos_reais_do_titan_original_produzem_erro_claro_sem_panic() {
         );
         let out_dir = temp_dir(&format!(
             "titan-original-{}",
-            relativo.replace('/', "-").replace('.', "-")
+            relativo.replace(['/', '.'], "-")
         ));
 
         let output = Command::new(titanc_bin())
