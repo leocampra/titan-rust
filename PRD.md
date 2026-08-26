@@ -671,6 +671,7 @@ Rejeitar com erro claro (nunca panic): records, maps, arrays manipuláveis (`v[i
 > Continuação da Fase 1 (T10–T18, **concluída**). Objetivo da fase:
 > `titanc examples/compostos.titan && ./compostos` cria e manipula arrays,
 > records e maps — inclusive um array ordenado in-place por uma função.
+> **Concluída** (T19–T33).
 
 ## Resumo executivo
 
@@ -1310,3 +1311,15 @@ chamadas de método, `import`/`foreign import`, retornos múltiplos, multi-assig
 bitwise (`& | ~ << >>`), `//`.
 
 **Redox OS** segue fora de escopo — compilar para Linux nativo.
+
+---
+
+## Roadmap atualizado (fim da Fase 2)
+
+| Fase | Escopo | Estado |
+|---|---|---|
+| **0. Hello world** | pipeline completo, subconjunto mínimo | ✅ **Concluída** |
+| **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
+| **2. Tipos compostos** | arrays, maps, records, strings dinâmicas — ownership/borrow mordem aqui | ✅ **Concluída** |
+| 3. Capability Runtimes | AI, Crypto, Data (`titan-ai`, `titan-crypto`…) | Pendente |
+| 4. Self-hosting / LSP | compilador escrito na própria linguagem | Pendente |
