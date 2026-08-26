@@ -294,7 +294,11 @@ const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "construtor_de_array",
         fonte: "function main(args: {string}): integer\n    local t = {1, 2}\n    return 0\nend",
-        trecho_esperado: "Esperava uma expressão",
+        // Desde a T28 (PRD.md), o parser produz `ExpInitList` para `{...}` —
+        // a rejeição deixou de ser sintática. O checker desta fase ainda não
+        // sabe tipar arrays/records/maps (isso é T29), então o erro agora
+        // vem dele.
+        trecho_esperado: "inicializador de array/record",
     },
     CasoNegativo {
         nome: "retornos_multiplos",

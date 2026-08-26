@@ -20,7 +20,9 @@
 //! `import`, retornos múltiplos, `repeat`/`until`, ...) produz um erro
 //! sintático claro — nunca panic.
 
-use crate::ast::{Args, Decl, Exp, Loc, Program, Stat, Then, TopLevel, Type, Var};
+use crate::ast::{
+    Args, Decl, Exp, Field, FieldName, Loc, Program, Stat, Then, TopLevel, Type, Var,
+};
 use crate::lexer::{Token, TokenKind};
 
 /// Erro sintático com posição (no espírito de
@@ -57,6 +59,11 @@ impl<'a> Parser<'a> {
     fn peek(&self) -> &Token {
         // O último token é sempre `Eof`, então `pos` nunca ultrapassa o slice.
         &self.tokens[self.pos]
+    }
+
+    /// Olha um token à frente sem consumir; no fim do fluxo, repete `Eof`.
+    fn peek2(&self) -> &Token {
+        &self.tokens[(self.pos + 1).min(self.tokens.len() - 1)]
     }
 
     fn loc(&self) -> Loc {
@@ -702,8 +709,74 @@ impl<'a> Parser<'a> {
                 Ok(Exp::ExpString { loc, value })
             }
             TokenKind::Name(_) | TokenKind::LParen => self.parse_suffixed_exp(),
+            TokenKind::LCurly => self.parse_init_list(),
             _ => Err(self.erro("Esperava uma expressão.")),
         }
+    }
+
+    /// `{` em posição de expressão (`ast.lua`: `ExpInitList`) — literal de
+    /// array, record ou map. O parser não desambigua qual dos três é: essa
+    /// decisão é semântica (T29, `checker.lua:646-662`), porque `{}` vazio só
+    /// se resolve por contexto.
+    fn parse_init_list(&mut self) -> Result<Exp, ParseError> {
+        let loc = self.loc();
+        self.advance(); // consome '{'
+
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RCurly) && !self.check(&TokenKind::Eof) {
+            fields.push(self.parse_field()?);
+            if !self.eat(&TokenKind::Comma) && !self.eat(&TokenKind::Semicolon) {
+                break;
+            }
+        }
+        self.expect(
+            &TokenKind::RCurly,
+            "Esperava '}' para fechar o inicializador.",
+        )?;
+
+        Ok(Exp::ExpInitList { loc, fields })
+    }
+
+    /// Um campo de `ExpInitList`: `[ exp ] = exp` (chave-expressão),
+    /// `nome = exp` (chave-nome, lookahead de 2: `Name` seguido de `=`; senão
+    /// é expressão que começa com nome) ou `exp` (posicional).
+    fn parse_field(&mut self) -> Result<Field, ParseError> {
+        let loc = self.loc();
+
+        if self.check(&TokenKind::LBracket) {
+            self.advance();
+            let key = self.parse_exp()?;
+            self.expect(
+                &TokenKind::RBracket,
+                "Esperava ']' para fechar a chave do campo.",
+            )?;
+            self.expect(&TokenKind::Assign, "Esperava '=' após a chave do campo.")?;
+            let exp = self.parse_exp()?;
+            return Ok(Field {
+                loc,
+                name: FieldName::Key(Box::new(key)),
+                exp,
+            });
+        }
+
+        if matches!(self.peek().kind, TokenKind::Name(_)) && self.peek2().kind == TokenKind::Assign
+        {
+            let (name, _) = self.expect_name("Esperava um nome de campo.")?;
+            self.advance(); // consome '='
+            let exp = self.parse_exp()?;
+            return Ok(Field {
+                loc,
+                name: FieldName::Name(name),
+                exp,
+            });
+        }
+
+        let exp = self.parse_exp()?;
+        Ok(Field {
+            loc,
+            name: FieldName::None,
+            exp,
+        })
     }
 
     /// Expressão primária (nome ou `( exp )`) seguida de zero ou mais
@@ -1585,6 +1658,110 @@ end"#,
     #[test]
     fn parse_record_com_campo_sem_tipo_produz_erro_claro() {
         let err = parse_source("record P\n    x\nend").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    // ---- T28: ExpInitList (literais de array, record e map) --------------
+
+    #[test]
+    fn parse_init_list_vazio() {
+        let exp = parse_exp_source("{}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpInitList { fields, .. } = exp else {
+            panic!("esperava ExpInitList, obteve {exp:?}");
+        };
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn parse_init_list_posicional() {
+        let exp = parse_exp_source("{1,2,3}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpInitList { fields, .. } = exp else {
+            panic!("esperava ExpInitList, obteve {exp:?}");
+        };
+        assert_eq!(fields.len(), 3);
+        for (field, esperado) in fields.iter().zip([1, 2, 3]) {
+            assert_eq!(field.name, FieldName::None);
+            assert!(matches!(field.exp, Exp::ExpInteger { value, .. } if value == esperado));
+        }
+    }
+
+    #[test]
+    fn parse_init_list_com_virgula_final() {
+        let exp = parse_exp_source("{1,2,}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpInitList { fields, .. } = exp else {
+            panic!("esperava ExpInitList, obteve {exp:?}");
+        };
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn parse_init_list_nomeado() {
+        let exp =
+            parse_exp_source("{x=1, y=2}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpInitList { fields, .. } = exp else {
+            panic!("esperava ExpInitList, obteve {exp:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, FieldName::Name("x".to_string()));
+        assert!(matches!(fields[0].exp, Exp::ExpInteger { value: 1, .. }));
+        assert_eq!(fields[1].name, FieldName::Name("y".to_string()));
+        assert!(matches!(fields[1].exp, Exp::ExpInteger { value: 2, .. }));
+    }
+
+    #[test]
+    fn parse_init_list_chave_expressao() {
+        let exp =
+            parse_exp_source(r#"{["a"]=1}"#).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpInitList { fields, .. } = exp else {
+            panic!("esperava ExpInitList, obteve {exp:?}");
+        };
+        assert_eq!(fields.len(), 1);
+        let FieldName::Key(key) = &fields[0].name else {
+            panic!("esperava FieldName::Key, obteve {:?}", fields[0].name);
+        };
+        assert!(matches!(**key, Exp::ExpString { ref value, .. } if value == "a"));
+        assert!(matches!(fields[0].exp, Exp::ExpInteger { value: 1, .. }));
+    }
+
+    #[test]
+    fn parse_init_list_aninhado() {
+        let exp = parse_exp_source("{{1},{2}}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpInitList { fields, .. } = exp else {
+            panic!("esperava ExpInitList, obteve {exp:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        for field in &fields {
+            assert!(matches!(field.exp, Exp::ExpInitList { .. }));
+        }
+    }
+
+    #[test]
+    fn parse_init_list_misto_parseia_checker_rejeita_depois() {
+        // O parser não desambigua array/record/map — só o checker (T29).
+        let exp = parse_exp_source("{1, x=2}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpInitList { fields, .. } = exp else {
+            panic!("esperava ExpInitList, obteve {exp:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, FieldName::None);
+        assert_eq!(fields[1].name, FieldName::Name("x".to_string()));
+    }
+
+    #[test]
+    fn parse_init_list_virgula_dupla_produz_erro_claro() {
+        let err = parse_exp_source("{1,,2}").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parse_init_list_campo_nomeado_sem_valor_produz_erro_claro() {
+        let err = parse_exp_source("{x=}").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parse_init_list_sem_fechar_produz_erro_claro() {
+        let err = parse_exp_source("{1").unwrap_err();
         assert!(!err.message.is_empty());
     }
 }
