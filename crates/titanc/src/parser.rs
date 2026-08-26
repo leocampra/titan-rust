@@ -139,6 +139,10 @@ impl<'a> Parser<'a> {
             return self.parse_toplevel_record(loc);
         }
 
+        if self.eat(&TokenKind::KwImport) {
+            return self.parse_toplevel_import(loc);
+        }
+
         let islocal = self.eat(&TokenKind::Local);
 
         if self.eat(&TokenKind::Function) {
@@ -150,8 +154,30 @@ impl<'a> Parser<'a> {
         }
 
         Err(self.erro(
-            "Esperava uma declaração de topo (`function`, `local` ou `record`) em vez disso.",
+            "Esperava uma declaração de topo (`function`, `import`, `local` ou `record`) em vez disso.",
         ))
+    }
+
+    /// `import Nome` — `localname == modname` (decisão 2 da T35): sem alias.
+    /// `import "data"` (string) e `import data as d` (alias) ficam fora de
+    /// escopo, com erro claro em vez de aceitar silenciosamente.
+    fn parse_toplevel_import(&mut self, loc: Loc) -> Result<TopLevel, ParseError> {
+        if matches!(self.peek().kind, TokenKind::String(_)) {
+            return Err(self.erro(
+                "Esperava um nome de módulo após 'import' (nome de string não é suportado).",
+            ));
+        }
+        let (modname, _) = self.expect_name("Esperava um nome de módulo após 'import'.")?;
+
+        if self.check(&TokenKind::KwAs) {
+            return Err(self.erro("'import ... as ...' não é suportado."));
+        }
+
+        Ok(TopLevel::TopLevelImport {
+            loc,
+            localname: modname.clone(),
+            modname,
+        })
     }
 
     /// `record Nome campo: Tipo ... end` — campos são `Decl` (reusa
@@ -309,6 +335,15 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Name(_) => {
                 let (name, _) = self.expect_name("Esperava um nome de tipo.")?;
+                if self.eat(&TokenKind::Dot) {
+                    let (member, _) =
+                        self.expect_name("Esperava um nome de tipo após '.' no tipo qualificado.")?;
+                    return Ok(Type::TypeQualName {
+                        loc,
+                        module: name,
+                        name: member,
+                    });
+                }
                 Ok(Type::TypeName { loc, name })
             }
             TokenKind::LCurly => {
@@ -1768,5 +1803,63 @@ end"#,
     fn parse_init_list_sem_fechar_produz_erro_claro() {
         let err = parse_exp_source("{1").unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    // ---- T35: `import data` e `parse_type` qualificado -------------------
+
+    #[test]
+    fn parse_import_produz_toplevelimport_com_localname_igual_modname() {
+        let program =
+            parse_source("import data").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert_eq!(program.len(), 1);
+        let TopLevel::TopLevelImport {
+            localname, modname, ..
+        } = &program[0]
+        else {
+            panic!("esperava TopLevelImport, obteve {:?}", program[0]);
+        };
+        assert_eq!(localname, "data");
+        assert_eq!(modname, "data");
+    }
+
+    #[test]
+    fn parse_type_aceita_qualificado_de_modulo_importado() {
+        let ty =
+            parse_type_source("data.DataFrame").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Type::TypeQualName { module, name, .. } = ty else {
+            panic!("esperava TypeQualName, obteve {ty:?}");
+        };
+        assert_eq!(module, "data");
+        assert_eq!(name, "DataFrame");
+    }
+
+    #[test]
+    fn parse_type_sem_dot_continua_typename() {
+        let ty = parse_type_source("DataFrame").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert!(matches!(ty, Type::TypeName { name, .. } if name == "DataFrame"));
+    }
+
+    #[test]
+    fn parse_import_sem_nome_produz_erro_claro() {
+        let err = parse_source("import").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parse_import_com_string_produz_erro_claro() {
+        let err = parse_source(r#"import "data""#).unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn parse_import_com_as_produz_erro_claro() {
+        let err = parse_source("import data as d").unwrap_err();
+        assert!(err.message.contains("as"), "obteve: {}", err.message);
+    }
+
+    #[test]
+    fn erro_de_toplevel_menciona_import() {
+        let err = parse_source("42").unwrap_err();
+        assert!(err.message.contains("import"), "obteve: {}", err.message);
     }
 }

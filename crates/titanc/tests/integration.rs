@@ -364,7 +364,12 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "import_de_modulo",
         fonte: "local m = import \"foo\"\n\nfunction main(args: {string}): integer\n    return 0\nend",
-        trecho_esperado: "declaração de topo",
+        // Desde a T34 (PRD.md), `import` é um token válido (`KwImport`) — a
+        // rejeição deixou de vir do checker (`TopLevelImport`) e passou a ser
+        // léxica/sintática: `import` não é mais um `Name` válido à direita de
+        // `=`, então o parser falha ao tentar iniciar uma expressão ali. A
+        // forma de topo `import data` só existe a partir da T35.
+        trecho_esperado: "Esperava uma expressão",
     },
     CasoNegativo {
         nome: "repeat_until",

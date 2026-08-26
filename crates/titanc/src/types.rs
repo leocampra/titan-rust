@@ -35,6 +35,14 @@ pub enum Type {
     Option {
         base: Box<Type>,
     },
+    /// Tipo que vem do runtime de uma capability: o programa não pode
+    /// inspecionar sua representação, só chamar métodos sobre ele.
+    /// `rust_path` é detalhe de emissão (não entra na identidade do tipo).
+    Opaque {
+        module: String,
+        name: String,
+        rust_path: String,
+    },
 }
 
 impl Type {
@@ -64,6 +72,18 @@ impl Type {
             ) => types_equal(p1, p2) && types_equal(r1, r2),
             (Type::Record { name: n1, .. }, Type::Record { name: n2, .. }) => n1 == n2,
             (Type::Option { base: b1 }, Type::Option { base: b2 }) => b1.equals(b2),
+            (
+                Type::Opaque {
+                    module: m1,
+                    name: n1,
+                    ..
+                },
+                Type::Opaque {
+                    module: m2,
+                    name: n2,
+                    ..
+                },
+            ) => m1 == m2 && n1 == n2,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
@@ -113,6 +133,7 @@ impl Type {
             }
             (Type::Record { .. }, Type::Record { .. }) => false,
             (Type::Option { .. }, Type::Option { .. }) => false,
+            (Type::Opaque { .. }, Type::Opaque { .. }) => false,
             _ => false,
         }
     }
@@ -254,6 +275,77 @@ mod tests {
             base: Box::new(Type::Integer),
         };
         assert!(o_integer.compatible(&o_integer2));
+    }
+
+    #[test]
+    fn opacos_sao_iguais_por_modulo_e_nome() {
+        let df1 = Type::Opaque {
+            module: "data".to_string(),
+            name: "DataFrame".to_string(),
+            rust_path: "titan_data::DataFrame".to_string(),
+        };
+        let df2 = Type::Opaque {
+            module: "data".to_string(),
+            name: "DataFrame".to_string(),
+            // `rust_path` não entra na comparação: é detalhe de emissão, não
+            // identidade do tipo.
+            rust_path: "outro::caminho::DataFrame".to_string(),
+        };
+        let serie = Type::Opaque {
+            module: "data".to_string(),
+            name: "Series".to_string(),
+            rust_path: "titan_data::Series".to_string(),
+        };
+        assert!(df1.equals(&df2));
+        assert!(!df1.equals(&serie));
+    }
+
+    #[test]
+    fn opacos_sao_nominais_e_invariantes_em_compatible() {
+        let df1 = Type::Opaque {
+            module: "data".to_string(),
+            name: "DataFrame".to_string(),
+            rust_path: "titan_data::DataFrame".to_string(),
+        };
+        let df2 = Type::Opaque {
+            module: "data".to_string(),
+            name: "DataFrame".to_string(),
+            rust_path: "titan_data::DataFrame".to_string(),
+        };
+        let serie = Type::Opaque {
+            module: "data".to_string(),
+            name: "Series".to_string(),
+            rust_path: "titan_data::Series".to_string(),
+        };
+        assert!(df1.compatible(&df2));
+        assert!(!df1.compatible(&serie));
+    }
+
+    #[test]
+    fn opacos_de_modulos_diferentes_com_mesmo_nome_nao_sao_compativeis() {
+        let df_data = Type::Opaque {
+            module: "data".to_string(),
+            name: "DataFrame".to_string(),
+            rust_path: "titan_data::DataFrame".to_string(),
+        };
+        let df_outro = Type::Opaque {
+            module: "outro_modulo".to_string(),
+            name: "DataFrame".to_string(),
+            rust_path: "outro_modulo::DataFrame".to_string(),
+        };
+        assert!(!df_data.equals(&df_outro));
+        assert!(!df_data.compatible(&df_outro));
+    }
+
+    #[test]
+    fn value_e_compativel_com_opaco() {
+        let df = Type::Opaque {
+            module: "data".to_string(),
+            name: "DataFrame".to_string(),
+            rust_path: "titan_data::DataFrame".to_string(),
+        };
+        assert!(Type::Value.compatible(&df));
+        assert!(df.compatible(&Type::Value));
     }
 
     #[test]
