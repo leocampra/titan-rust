@@ -737,7 +737,10 @@ mod tests {
         let rust = generate_source(&source);
 
         let (avisos, output) = compila_e_executa(&rust, "hello");
-        assert!(avisos.is_empty(), "warnings no Rust gerado:\n{avisos}\n{rust}");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "Olá, mundo!\n");
         assert_eq!(output.status.code(), Some(0));
     }
@@ -957,7 +960,10 @@ end"#;
         // Critério da fase: Rust gerado sem nenhum warning do rustc — nem
         // `let mut` sobrando, nem parênteses redundantes, nem `args` não
         // usado (corrigido via `_`-prefixing de parâmetros não lidos).
-        assert!(avisos.is_empty(), "warnings no Rust gerado:\n{avisos}\n{rust}");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let linhas: Vec<&str> = stdout.lines().collect();
@@ -1052,7 +1058,10 @@ end"#;
         let rust = generate_source(source);
         let (avisos, output) = compila_e_executa(&rust, "for-t15");
 
-        assert!(avisos.is_empty(), "warnings no Rust gerado:\n{avisos}\n{rust}");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
 
         // Linha a linha: `for i = 1, 5` crescente (a1..a5) ·
         // `for i = 5, 1, -1` decrescente (b5..b1) · `for i = 1, 10, 2`

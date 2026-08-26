@@ -285,11 +285,11 @@ const CASOS_FORA_DE_ESCOPO_FASE_1: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "indexacao_de_array",
         fonte: "function main(args: {string}): integer\n    print(args[1])\n    return 0\nend",
-        // Desde a T20 (PRD.md), `[` é um token válido (`LBracket`) — a rejeição
-        // deixou de ser léxica. O parser desta fase (T11) ainda não tem sufixo
-        // de indexação (isso é T23), então o erro agora vem da regra de
-        // chamada de função, que não espera `[` depois do argumento.
-        trecho_esperado: "Esperava ')' para fechar os argumentos da chamada",
+        // Desde a T23 (PRD.md), o parser tem sufixo de indexação (`v[i]` vira
+        // `VarBracket`) — a rejeição deixou de ser sintática. O checker desta
+        // fase ainda não sabe verificar indexação (isso é T25+/T29), então o
+        // erro agora vem dele.
+        trecho_esperado: "indexação",
     },
     CasoNegativo {
         nome: "construtor_de_array",
