@@ -25,7 +25,8 @@
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
 
 use crate::checker::{
-    BinOp, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedTopLevel, UnOp,
+    BinOp, Callee, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedTopLevel,
+    UnOp,
 };
 use crate::types::Type;
 use std::collections::HashSet;
@@ -939,8 +940,21 @@ fn emit_concat(exps: &[TypedExp], ctx: Ctx) -> String {
 /// verdade — nunca o valor clonado que `array_get` devolveria — faz a
 /// mutação de `f` alcançar `mat`). O resto segue a posição delimitada
 /// normal.
-fn emit_call(callee: &str, args: &[TypedExp], ctx: Ctx) -> String {
-    if let Some(builtin) = crate::builtins::lookup(callee) {
+fn emit_call(callee: &Callee, args: &[TypedExp], ctx: Ctx) -> String {
+    // `Module`/`Method` (T39/T40) resolvem contra a tabela de capabilities
+    // no checker; a emissão qualificada em si (`titan_data::...`, receptor
+    // por `emit_place_mut`) é escopo da T42 — aqui só o suficiente para o
+    // `match` continuar exaustivo enquanto o checker já produz esses nós.
+    let name = match callee {
+        Callee::Direct(name) => name,
+        Callee::Module { module, name } => {
+            unimplemented!("emissão de chamada qualificada '{module}.{name}' é escopo da T42")
+        }
+        Callee::Method { module, name, .. } => {
+            unimplemented!("emissão de método '{module}.{name}' é escopo da T42")
+        }
+    };
+    if let Some(builtin) = crate::builtins::lookup(name) {
         let rendered_args: Vec<String> = args.iter().map(|a| borrow_runtime_str(a, ctx)).collect();
         return format!("{}({})", builtin.rust_path, rendered_args.join(", "));
     }
@@ -956,7 +970,7 @@ fn emit_call(callee: &str, args: &[TypedExp], ctx: Ctx) -> String {
             }
         })
         .collect();
-    format!("{}({})", mangle_fn_name(callee), rendered_args.join(", "))
+    format!("{}({})", mangle_fn_name(name), rendered_args.join(", "))
 }
 
 /// `v[i]` em posição de leitura (T30): `array_get`/`map_get` do runtime —

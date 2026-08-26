@@ -83,13 +83,31 @@ impl Capability {
     }
 }
 
-/// Módulo `data`, com um único tipo opaco `DataFrame` e nenhuma
-/// função/método ainda — o suficiente para o checker (T38) resolver
-/// `import data` e `data.DataFrame`. T41 é quem acrescenta o crate real
-/// `titan-data` e passa a popular `functions`.
+/// Módulo `data`, com um único tipo opaco `DataFrame` — o suficiente para o
+/// checker (T38) resolver `import data` e `data.DataFrame`. T41 é quem
+/// acrescenta o crate real `titan-data` por trás deste stub.
 const DATA_OPAQUE_TYPES: &[OpaqueType] = &[OpaqueType {
     titan_name: "DataFrame",
     rust_path: "titan_data::DataFrame",
+}];
+
+/// `read_csv` é a única função de módulo de `data` até a T41 trazer o
+/// restante da superfície (`soma`, `media`, etc. — a maioria métodos sobre
+/// `DataFrame`, escopo da T40). `rettype` de um `Opaque` fica com
+/// `module`/`name`/`rust_path` vazios porque uma declaração `const` não
+/// constrói `String` não-vazia; o checker (`requalify_rettype`, T39)
+/// preenche o placeholder com o módulo real da chamada antes de devolvê-lo
+/// — mesmo espírito do `FAKE_FUNCTIONS` de teste abaixo.
+const DATA_FUNCTIONS: &[CapabilityFn] = &[CapabilityFn {
+    titan_name: "read_csv",
+    receiver: None,
+    rust_path: "titan_data::read_csv",
+    params: &[Type::String],
+    rettype: Type::Opaque {
+        module: String::new(),
+        name: String::new(),
+        rust_path: String::new(),
+    },
 }];
 
 pub const CAPABILITIES: &[Capability] = &[Capability {
@@ -97,7 +115,7 @@ pub const CAPABILITIES: &[Capability] = &[Capability {
     crate_name: "titan-data",
     crate_path: "crates/titan-data",
     opaque_types: DATA_OPAQUE_TYPES,
-    functions: &[],
+    functions: DATA_FUNCTIONS,
 }];
 
 /// Busca um módulo de capability pelo nome usado em `import`.
