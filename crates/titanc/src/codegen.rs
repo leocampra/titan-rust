@@ -417,21 +417,46 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                 // `base` é o array/map inteiro — [`emit_place_mut`] resolve
                 // um `&mut` de verdade a ele, mesmo quando `base` é ele
                 // mesmo aninhado (`m["a"][1] = x`, `xs[i][j] = x`).
+                // Índice e valor são pré-computados em variáveis `let` antes
+                // do `&mut` do `base` ser tomado: o índice pode ler o
+                // próprio `base` (`res[#res + 1] = x`, o idioma de "append"
+                // da decisão 5 da Fase 2), e `emit_place_mut(base)` produz um
+                // empréstimo mutável que o rustc não consegue provar
+                // disjunto de um segundo empréstimo do mesmo `base` dentro
+                // dos argumentos da mesma chamada — mesmo sendo
+                // semanticamente sequencial (E0502). Nomes prefixados com
+                // `titan_` seguem a convenção de mangling existente.
                 TypedLValue::Index { base, index } => match &base.ty {
                     Type::Array { .. } => {
                         out.push_str(&format!(
-                            "titan_runtime::array_set({}, {}, {});\n",
-                            emit_place_mut(base, ctx),
-                            emit_delimited_exp(index, ctx),
+                            "let titan_idx = {};\n",
+                            emit_delimited_exp(index, ctx)
+                        ));
+                        indent(out, depth);
+                        out.push_str(&format!(
+                            "let titan_val = {};\n",
                             emit_slot_value(&value.ty, value, ctx)
+                        ));
+                        indent(out, depth);
+                        out.push_str(&format!(
+                            "titan_runtime::array_set({}, titan_idx, titan_val);\n",
+                            emit_place_mut(base, ctx),
                         ));
                     }
                     Type::Map { .. } => {
                         out.push_str(&format!(
-                            "titan_runtime::map_set({}, {}, {});\n",
-                            emit_place_mut(base, ctx),
-                            emit_slot_value(&index.ty, index, ctx),
+                            "let titan_key = {};\n",
+                            emit_slot_value(&index.ty, index, ctx)
+                        ));
+                        indent(out, depth);
+                        out.push_str(&format!(
+                            "let titan_val = {};\n",
                             emit_slot_value(&value.ty, value, ctx)
+                        ));
+                        indent(out, depth);
+                        out.push_str(&format!(
+                            "titan_runtime::map_set({}, titan_key, titan_val);\n",
+                            emit_place_mut(base, ctx),
                         ));
                     }
                     other => unreachable!(
@@ -1536,7 +1561,9 @@ end"#;
 end"#;
         let rust = generate_source(source);
         assert!(rust.contains("let mut xs: Vec<i64> = vec![10, 20, 30];"));
-        assert!(rust.contains("titan_runtime::array_set(&mut xs, 1, 99);"));
+        assert!(rust.contains("let titan_idx = 1;"));
+        assert!(rust.contains("let titan_val = 99;"));
+        assert!(rust.contains("titan_runtime::array_set(&mut xs, titan_idx, titan_val);"));
         assert!(rust.contains("titan_runtime::array_get(&xs, 1)"));
         assert!(rust.contains("titan_runtime::array_len(&xs)"));
     }
@@ -1553,7 +1580,9 @@ end"#;
         assert!(rust.contains(
             "let mut m: std::collections::HashMap<String, i64> = std::collections::HashMap::from([(\"a\".to_string(), 1)]);"
         ));
-        assert!(rust.contains("titan_runtime::map_set(&mut m, \"b\".to_string(), 2);"));
+        assert!(rust.contains("let titan_key = \"b\".to_string();"));
+        assert!(rust.contains("let titan_val = 2;"));
+        assert!(rust.contains("titan_runtime::map_set(&mut m, titan_key, titan_val);"));
         assert!(rust.contains("titan_runtime::map_get(&m, &\"a\".to_string())"));
     }
 
@@ -1571,7 +1600,7 @@ end"#;
         let rust = generate_source(source);
         assert!(rust.contains("pub fn titan_dobra_primeiro(xs: &mut Vec<i64>)"));
         // Dentro do corpo, `xs` já é a referência — sem `&mut xs` duplicado.
-        assert!(rust.contains("titan_runtime::array_set(xs, 1,"));
+        assert!(rust.contains("titan_runtime::array_set(xs, titan_idx, titan_val);"));
         assert!(rust.contains("titan_runtime::array_get(xs, 1)"));
         // No chamador, `v` é uma local dona — precisa do empréstimo.
         assert!(rust.contains("titan_dobra_primeiro(&mut v);"));

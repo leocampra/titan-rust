@@ -9,6 +9,10 @@
 //! - caminho feliz da Fase 1 (PRD.md, T17): compila `examples/nucleo.titan`
 //!   — aritmética, `if`, `while`, `for` e atribuição em funções reais
 //!   (fatorial e fibonacci) — e confere stdout completo e exit code;
+//! - caminho feliz da Fase 2 (PRD.md, T32): compila `examples/compostos.titan`
+//!   — arrays, records e maps, incluindo mutação in-place via `&mut` e
+//!   semântica de valor na atribuição — e confere stdout completo e exit
+//!   code;
 //! - suíte de negativos de T4/T5 rodando pelo pipeline completo: cada
 //!   construção fora do subconjunto da Fase 0 precisa produzir uma mensagem
 //!   de erro clara na saída do `titanc`, nunca um panic (sem "thread
@@ -116,6 +120,56 @@ fn compila_e_executa_nucleo_titan_conferindo_stdout_e_exit_code() {
         String::from_utf8_lossy(&run_output.stdout),
         "Fatorial de 5: 120\nFibonacci de 10: 55\n"
     );
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Caminho feliz da Fase 2 (PRD.md, T32): compila `examples/compostos.titan`
+/// — record (construção por contexto, leitura e escrita de campo), array
+/// (literal, `#`, indexação, mutação in-place por função, push via
+/// `#res+1`), array de floats e map — e confere stdout completo e exit code.
+/// As duas linhas mais importantes provam as decisões da fase: "Original
+/// preservado" prova a semântica de valor (decisão 1, `local copia = qs;
+/// copia[1] = 999` não altera `qs`); "Primeiro estoque dobrado" prova
+/// parâmetros compostos por `&mut` (decisão 4, `dobrar_estoque(qs)` muda o
+/// que o chamador vê).
+#[test]
+fn compila_e_executa_compostos_titan_conferindo_stdout_e_exit_code() {
+    let out_dir = temp_dir("compostos");
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(examples_dir().join("compostos.titan"))
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar compostos.titan: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("compostos");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./compostos");
+    let esperado = "Estoque: Parafuso x10\n\
+                    Apos reposicao: 15\n\
+                    Original preservado: 5\n\
+                    Ordenado: 1,2,3,4,5\n\
+                    Res tamanho: 5\n\
+                    Res ultimo: 50\n\
+                    Soma pesos: 6.75\n\
+                    Primeiro estoque: Parafuso x10\n\
+                    Primeiro estoque dobrado: 20\n\
+                    Segundo estoque dobrado: 40\n\
+                    Preco parafuso: 0.5\n\
+                    Preco arruela: 0.1\n";
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));
 
     let _ = std::fs::remove_dir_all(&out_dir);
