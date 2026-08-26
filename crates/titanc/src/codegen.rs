@@ -5,19 +5,19 @@
 //! variante de `Stat`/`Exp`, `codestat`/`codeexp`), mas emitindo Rust em vez
 //! de C acoplado à API interna do Lua (PRD.md, resumo executivo).
 //!
-//! Mapeamento de tipos da Fase 0 (PRD.md, T6) — mantido isolado em
-//! [`rust_type_name`] e [`rust_param_type_name`] para que a Fase 2 (arrays,
-//! maps, records) possa trocar o modelo de memória sem espalhar a mudança:
+//! Mapeamento de tipos (PRD.md, T6; `string` unificado na T24) — mantido
+//! isolado em [`rust_type_name`] e [`rust_param_type_name`] para que a Fase 2
+//! (arrays, maps, records) possa trocar o modelo de memória sem espalhar a
+//! mudança:
 //!
 //! | Titan | Rust |
 //! |---|---|
 //! | `integer` | `i64` |
 //! | `float` | `f64` |
 //! | `boolean` | `bool` |
-//! | `string` (literal) | `&'static str` |
-//! | `string` (computada) | `String` |
+//! | `string` (qualquer posição) | `String` |
 //! | `nil` (retorno) | `()` |
-//! | `{string}` (só param de `main`) | `&[String]` |
+//! | `{string}` (só param de `main`) | `&mut Vec<String>` |
 //!
 //! Nada aqui assume que valores são `Copy` — ver aviso no PRD.md sobre a
 //! Fase 2.
@@ -46,8 +46,8 @@ pub fn generate(program: &TypedProgram) -> String {
 /// argumentos da linha de comando e usa o código de saída retornado.
 const ENTRY_SHIM: &str = "\
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    std::process::exit(titan_main(&args) as i32);
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::exit(titan_main(&mut args) as i32);
 }
 ";
 
@@ -394,17 +394,27 @@ fn emit_delimited_exp(exp: &TypedExp) -> String {
 }
 
 /// Valor emitido para um "slot" cujo tipo Rust vem de [`rust_type_name`] —
-/// inicializador de `let`, lado direito de atribuição, valor de `return`.
-/// Slot de tipo `string` é `String` dona: literal (`&'static str`) e variável
-/// (`String` local ou `&str` parâmetro) ganham `.to_string()`, que cobre os
-/// dois casos e, na variável, copia em vez de mover — a original continua
-/// utilizável depois de `local a: string = b`. Concat e chamada já produzem
-/// `String` e passam direto.
+/// inicializador de `let`, lado direito de atribuição, valor de `return`,
+/// argumento de chamada a função Titan (T24: `string` é sempre `String`, em
+/// toda posição — parâmetros de função Titan não são mais `&str`). Slot de
+/// tipo `string` sempre precisa de uma `String` dona: literal ganha
+/// `.to_string()`; variável ganha `.clone()` — copia em vez de mover, a
+/// original continua utilizável depois de `local a: string = b`. Concat e
+/// chamada já produzem `String` e passam direto.
+fn emit_owned_string(exp: &TypedExp) -> String {
+    match &exp.kind {
+        TypedExpKind::String(_) => format!("{}.to_string()", emit_exp(exp)),
+        TypedExpKind::Var(_) => format!("{}.clone()", emit_exp(exp)),
+        _ => emit_delimited_exp(exp),
+    }
+}
+
+/// Valor emitido para um "slot" — como [`emit_owned_string`], mas para
+/// qualquer tipo: aplica a regra de `string` quando `slot_ty` é `String` e
+/// delega para [`emit_delimited_exp`] no resto.
 fn emit_slot_value(slot_ty: &Type, value: &TypedExp) -> String {
-    if *slot_ty == Type::String
-        && matches!(value.kind, TypedExpKind::String(_) | TypedExpKind::Var(_))
-    {
-        format!("{}.to_string()", emit_exp(value))
+    if *slot_ty == Type::String {
+        emit_owned_string(value)
     } else {
         emit_delimited_exp(value)
     }
@@ -450,7 +460,7 @@ fn emit_binop(op: BinOp, lhs: &TypedExp, rhs: &TypedExp, result_ty: &Type) -> St
             emit_numeric_operand(rhs, result_ty)
         ),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-            emit_comparison(op, symbol, lhs, rhs)
+            emit_comparison(symbol, lhs, rhs)
         }
         // Boolean estrito dos dois lados (decisão 7 da Fase 1) — mapeamento
         // direto para os operadores de curto-circuito do Rust.
@@ -462,7 +472,7 @@ fn emit_binop(op: BinOp, lhs: &TypedExp, rhs: &TypedExp, result_ty: &Type) -> St
 /// Comparações — o checker (T13) já validou as combinações: número com
 /// número (com coerção int→float quando os lados divergem), string com
 /// string, e boolean com boolean (só `==`/`~=`).
-fn emit_comparison(op: BinOp, symbol: &str, lhs: &TypedExp, rhs: &TypedExp) -> String {
+fn emit_comparison(symbol: &str, lhs: &TypedExp, rhs: &TypedExp) -> String {
     if matches!(lhs.ty, Type::Integer | Type::Float) {
         // Mesma regra de `numeric_result`: qualquer Float promove os dois
         // lados para f64.
@@ -477,23 +487,18 @@ fn emit_comparison(op: BinOp, symbol: &str, lhs: &TypedExp, rhs: &TypedExp) -> S
             emit_numeric_operand(rhs, &target)
         );
     }
-    if lhs.ty == Type::String && matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge) {
-        return format!("{} {symbol} {}", str_ord_operand(lhs), str_ord_operand(rhs));
+    if lhs.ty == Type::String {
+        // `String` não implementa `PartialOrd`/`PartialEq` cruzado com `&str`
+        // no std — os dois lados precisam nascer como `String` mesmo em
+        // `==`/`~=`, daí reusar [`emit_owned_string`] em vez de `emit_exp`.
+        return format!(
+            "{} {symbol} {}",
+            emit_owned_string(lhs),
+            emit_owned_string(rhs)
+        );
     }
-    // Igualdade de string/boolean: os impls cruzados de `PartialEq` do std
-    // (`String == &str` e vice-versa) cobrem todas as combinações.
+    // Igualdade de boolean: `bool == bool` direto.
     format!("{} {symbol} {}", emit_exp(lhs), emit_exp(rhs))
-}
-
-/// Operando string de `<`/`>`/`<=`/`>=`: o std não implementa `PartialOrd`
-/// cruzado entre `String` e `&str`, então os dois lados são nivelados para
-/// `&str` com `&…[..]` — que funciona igualmente sobre `String` (local) e
-/// `&str` (parâmetro/literal). Literal já é `&str` e passa direto.
-fn str_ord_operand(exp: &TypedExp) -> String {
-    match &exp.kind {
-        TypedExpKind::String(_) => emit_exp(exp),
-        _ => format!("&{}[..]", emit_exp(exp)),
-    }
 }
 
 /// Operando numérico já validado pelo checker: `Integer` em posição cujo
@@ -539,81 +544,73 @@ fn format_string_literal(v: &str) -> String {
 }
 
 /// `..` do Titan é N-ário; `titan_runtime::concat` é binário — encadeia par a
-/// par, associando à esquerda. O acumulador vira `String` a partir do
-/// primeiro par, então os pares seguintes o recebem por `&` (deref-coercion
-/// `&String → &str`).
+/// par, associando à esquerda. `titan_runtime::concat` continua pedindo
+/// `&str` nos dois lados (T24 não muda a fronteira do runtime); o valor
+/// devolvido aqui é o `String` **cru** que o `concat` produz (sem `&` — quem
+/// precisar emprestá-lo usa [`borrow_runtime_str`], que sabe envolver
+/// qualquer expressão, inclusive esta).
 fn emit_concat(exps: &[TypedExp]) -> String {
     let mut parts = exps.iter();
     let first = parts
         .next()
         .expect("checker garante ExpConcat com ao menos um operando");
-    let mut acc = concat_operand(first);
-    let mut acc_is_owned = false;
+    // `acc` guarda sempre um `String` **cru** (sem `&`) — o que `concat`
+    // devolve. Cada chamada empresta `acc` na hora de alimentar a próxima
+    // (`&{acc}`); a última iteração deixa o resultado sem `&`, pronto para
+    // ser usado como slot (`let`/atribuição/`return`) ou por
+    // [`borrow_runtime_str`], que sabe emprestar qualquer expressão.
+    let mut acc = borrow_runtime_str(first);
+    let mut acc_is_raw = false;
     for e in parts {
-        let borrow = if acc_is_owned { "&" } else { "" };
-        acc = format!(
-            "titan_runtime::concat({borrow}{acc}, {})",
-            concat_operand(e)
-        );
-        acc_is_owned = true;
+        let lhs = if acc_is_raw {
+            format!("&{acc}")
+        } else {
+            acc
+        };
+        acc = format!("titan_runtime::concat({lhs}, {})", borrow_runtime_str(e));
+        acc_is_raw = true;
     }
     acc
 }
 
-/// Operando de `..`: número (`Integer`/`Float`, decisão 4 da Fase 1) vira
-/// `&x.to_string()` para casar com o `titan_runtime::concat(&str, &str)`
-/// existente; string segue a coerção padrão de argumento.
-fn concat_operand(exp: &TypedExp) -> String {
-    if matches!(exp.ty, Type::Integer | Type::Float) {
-        return format!("&{}.to_string()", emit_exp(exp));
-    }
-    coerce_to_borrowed_str(exp)
-}
-
+/// Argumentos de uma chamada a função **Titan** (T24: parâmetros de tipo
+/// `string` são sempre `String` dona — sem `&str`, sem alocação implícita
+/// escondida do chamador). Reusa [`emit_owned_string`] para strings; o resto
+/// segue a posição delimitada normal.
 fn emit_call(callee: &str, args: &[TypedExp]) -> String {
-    let rendered_args: Vec<String> = args.iter().map(coerce_to_borrowed_str).collect();
     if callee == "print" {
-        format!("titan_runtime::print({})", rendered_args.join(", "))
+        let rendered_args: Vec<String> = args.iter().map(borrow_runtime_str).collect();
+        return format!("titan_runtime::print({})", rendered_args.join(", "));
+    }
+    let rendered_args: Vec<String> = args
+        .iter()
+        .map(|a| {
+            if a.ty == Type::String {
+                emit_owned_string(a)
+            } else {
+                emit_delimited_exp(a)
+            }
+        })
+        .collect();
+    format!("{}({})", mangle_fn_name(callee), rendered_args.join(", "))
+}
+
+/// Coage uma expressão numérica ou `string` para `&str`/referência esperada
+/// pelo `titan-runtime` (`print(&str)`, `concat(&str, &str)`) — a única
+/// fronteira que ainda pede empréstimo em vez de posse (T24: dentro do
+/// programa gerado, `string` é sempre `String`). Número vira
+/// `&x.to_string()` (decisão 4 da Fase 1); string usa [`emit_owned_string`]
+/// e empresta o resultado.
+fn borrow_runtime_str(exp: &TypedExp) -> String {
+    if matches!(exp.ty, Type::Integer | Type::Float) {
+        format!("&{}.to_string()", emit_exp(exp))
     } else {
-        format!("{}({})", mangle_fn_name(callee), rendered_args.join(", "))
+        format!("&{}", emit_owned_string(exp))
     }
 }
 
-/// Coage uma expressão para `&str` quando seu tipo Rust nasce como `String`
-/// (string computada) — todo parâmetro de função da Fase 0 que recebe string
-/// espera `&str` (ver `titan_runtime::print` e `titan_runtime::concat`).
-/// Literais (`&'static str`) e variáveis já `&str`-compatíveis passam direto.
-/// Argumento de chamada é posição delimitada — binop/unop numéricos/boolean
-/// saem sem parênteses externos (strings nunca são binop/unop: `..` é nó
-/// próprio).
-fn coerce_to_borrowed_str(exp: &TypedExp) -> String {
-    let rendered = emit_delimited_exp(exp);
-    if exp.ty == Type::String && is_owned_string_expr(exp) {
-        format!("&{rendered}")
-    } else {
-        rendered
-    }
-}
-
-/// Uma expressão de tipo `string` nasce como `String` (em vez de
-/// `&'static str`) somente quando é uma concatenação, uma chamada de função
-/// que devolve string, ou uma variável cujo valor seria uma dessas — na
-/// Fase 0 só existe `local` para introduzir variáveis, e o tipo Rust de uma
-/// variável espelha o da expressão original; como o checker não anota o
-/// nascimento da variável aqui, tratamos qualquer `Var` de tipo `string` como
-/// potencialmente `String` e coagimos sempre, o que é seguro tanto para
-/// `String` quanto para `&str`/`&'static str` (`&String` faz deref-coercion
-/// para `&str` automaticamente).
-fn is_owned_string_expr(exp: &TypedExp) -> bool {
-    matches!(
-        exp.kind,
-        TypedExpKind::Concat(_) | TypedExpKind::Call { .. } | TypedExpKind::Var(_)
-    )
-}
-
-/// Tipo Rust de uma variável/expressão `string`, conforme o mapeamento da
-/// Fase 0 (PRD.md, T6): computada → `String`, o resto (primitivas e o `{string}`
-/// de `main`) segue [`rust_type_name`].
+/// Tipo Rust de uma variável/expressão, em qualquer posição: `string` é
+/// sempre `String` (T24 — zero casos especiais por posição).
 fn rust_type_name(ty: &Type) -> String {
     match ty {
         Type::Nil => "()".to_string(),
@@ -621,19 +618,19 @@ fn rust_type_name(ty: &Type) -> String {
         Type::Integer => "i64".to_string(),
         Type::Float => "f64".to_string(),
         Type::String => "String".to_string(),
-        Type::Array { elem } if **elem == Type::String => "&[String]".to_string(),
+        Type::Array { elem } if **elem == Type::String => "Vec<String>".to_string(),
         other => unreachable!(
-            "tipo '{other:?}' fora do subconjunto de codegen da Fase 0 — checker deveria ter rejeitado antes"
+            "tipo '{other:?}' fora do subconjunto de codegen suportado — checker deveria ter rejeitado antes"
         ),
     }
 }
 
 /// Tipo Rust de um **parâmetro** de função: idêntico a [`rust_type_name`],
-/// exceto que `string` em posição de parâmetro usa `&str` (parâmetros não são
-/// donos do valor na Fase 0 — só `main` recebe `{string}`, que já é `&[String]`).
+/// exceto o único parâmetro composto desta fase — `{string}` (só `main`) —
+/// que sai por `&mut Vec<String>` em vez de por valor.
 fn rust_param_type_name(ty: &Type) -> String {
     match ty {
-        Type::String => "&str".to_string(),
+        Type::Array { elem } if **elem == Type::String => "&mut Vec<String>".to_string(),
         other => rust_type_name(other),
     }
 }
@@ -672,11 +669,11 @@ mod tests {
 
         // `args` não é lido no corpo de `hello.titan` — sai `_args` para o
         // Rust gerado não emitir `unused_variables`.
-        assert!(rust.contains("pub fn titan_main(_args: &[String]) -> i64 {"));
-        assert!(rust.contains("titan_runtime::print(\"Olá, mundo!\");"));
+        assert!(rust.contains("pub fn titan_main(_args: &mut Vec<String>) -> i64 {"));
+        assert!(rust.contains("titan_runtime::print(&\"Olá, mundo!\".to_string());"));
         assert!(rust.contains("return 0;"));
         assert!(rust.contains("fn main() {"));
-        assert!(rust.contains("std::process::exit(titan_main(&args) as i32);"));
+        assert!(rust.contains("std::process::exit(titan_main(&mut args) as i32);"));
     }
 
     /// Compila `rust` com o rustc real (linkando o titan-runtime) e executa
@@ -754,9 +751,9 @@ mod tests {
 end"#;
         let rust = generate_source(source);
         assert!(rust.contains(
-            "let a: String = titan_runtime::concat(&titan_runtime::concat(\"x\", \"y\"), \"z\");"
+            "let a: String = titan_runtime::concat(&titan_runtime::concat(&\"x\".to_string(), &\"y\".to_string()), &\"z\".to_string());"
         ));
-        assert!(rust.contains("titan_runtime::print(&a);"));
+        assert!(rust.contains("titan_runtime::print(&a.clone());"));
     }
 
     #[test]
@@ -789,8 +786,8 @@ function main(args: {string}): integer
     return conta(args)
 end"#;
         let rust = generate_source(source);
-        assert!(rust.contains("fn titan_conta(_a: &[String]) -> i64 {"));
-        assert!(rust.contains("fn titan_main(args: &[String]) -> i64 {"));
+        assert!(rust.contains("fn titan_conta(_a: &mut Vec<String>) -> i64 {"));
+        assert!(rust.contains("fn titan_main(args: &mut Vec<String>) -> i64 {"));
         assert!(rust.contains("return titan_conta(args);"));
     }
 
@@ -886,9 +883,9 @@ end"#;
     return 0
 end"#;
         let rust = generate_source(source);
-        assert!(rust.contains("titan_runtime::concat(\"i: \", &42.to_string())"));
-        assert!(rust.contains("titan_runtime::concat(\"f: \", &1.5.to_string())"));
-        assert!(rust.contains("titan_runtime::concat(\"exp: \", &(1 + 2).to_string())"));
+        assert!(rust.contains("titan_runtime::concat(&\"i: \".to_string(), &42.to_string())"));
+        assert!(rust.contains("titan_runtime::concat(&\"f: \".to_string(), &1.5.to_string())"));
+        assert!(rust.contains("titan_runtime::concat(&\"exp: \".to_string(), &(1 + 2).to_string())"));
     }
 
     #[test]
@@ -903,12 +900,12 @@ end"#;
 end"#;
         let rust = generate_source(source);
         assert!(rust.contains("let a: String = \"oi\".to_string();"));
-        assert!(rust.contains("let mut b: String = a.to_string();"));
+        assert!(rust.contains("let mut b: String = a.clone();"));
         assert!(rust.contains("b = \"tchau\".to_string();"));
     }
 
     #[test]
-    fn comparacao_de_strings_nivela_ordem_para_str() {
+    fn comparacao_de_strings_usa_string_dos_dois_lados() {
         let source = r#"function main(args: {string}): integer
     local a: string = "abc"
     local menor: boolean = a < "abd"
@@ -919,10 +916,11 @@ end"#;
     return 1
 end"#;
         let rust = generate_source(source);
-        // Ordem precisa nivelar `String`/`&str` (sem PartialOrd cruzado no
-        // std); igualdade usa os impls cruzados de PartialEq direto.
-        assert!(rust.contains("let menor: bool = &a[..] < \"abd\";"));
-        assert!(rust.contains("let igual: bool = a == \"abc\";"));
+        // T24: `string` é sempre `String` — sem `PartialOrd`/`PartialEq`
+        // cruzado com `&str` no std, os dois lados nascem como `String`
+        // mesmo em `==`.
+        assert!(rust.contains("let menor: bool = a.clone() < \"abd\".to_string();"));
+        assert!(rust.contains("let igual: bool = a.clone() == \"abc\".to_string();"));
     }
 
     #[test]

@@ -82,10 +82,9 @@ codegen.
 | `integer` | `i64` |
 | `float` | `f64` |
 | `boolean` | `bool` |
-| `string` (literal) | `&'static str` |
-| `string` (computada, ex.: resultado de `..`) | `String` |
+| `string` (qualquer posição) | `String` |
 | `nil` (retorno) | `()` |
-| `{string}` (só o parâmetro de `main`) | `&[String]` |
+| `{string}` (só o parâmetro de `main`) | `&mut Vec<String>` |
 
 `print` e `concat` (suporte ao operador `..`) não são geradas pelo compilador
 — vêm de `titan-runtime`, um crate Rust comum, referenciado por caminho

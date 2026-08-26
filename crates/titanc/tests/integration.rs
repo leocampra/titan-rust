@@ -170,8 +170,8 @@ fn emit_rust_imprime_o_rust_gerado_sem_compilar() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // `args` não é lido no corpo de `hello.titan` — sai `_args` para o Rust
     // gerado não emitir `unused_variables`.
-    assert!(stdout.contains("fn titan_main(_args: &[String]) -> i64"));
-    assert!(stdout.contains("titan_runtime::print(\"Olá, mundo!\");"));
+    assert!(stdout.contains("fn titan_main(_args: &mut Vec<String>) -> i64"));
+    assert!(stdout.contains("titan_runtime::print(&\"Olá, mundo!\".to_string());"));
     assert!(
         !out_dir.join("build").exists(),
         "--emit-rust não deveria gerar build/"
