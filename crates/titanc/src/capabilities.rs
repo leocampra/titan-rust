@@ -91,24 +91,34 @@ const DATA_OPAQUE_TYPES: &[OpaqueType] = &[OpaqueType {
     rust_path: "titan_data::DataFrame",
 }];
 
-/// `read_csv` é a única função de módulo de `data` até a T41 trazer o
-/// restante da superfície (`soma`, `media`, etc. — a maioria métodos sobre
-/// `DataFrame`, escopo da T40). `rettype` de um `Opaque` fica com
-/// `module`/`name`/`rust_path` vazios porque uma declaração `const` não
-/// constrói `String` não-vazia; o checker (`requalify_rettype`, T39)
-/// preenche o placeholder com o módulo real da chamada antes de devolvê-lo
-/// — mesmo espírito do `FAKE_FUNCTIONS` de teste abaixo.
-const DATA_FUNCTIONS: &[CapabilityFn] = &[CapabilityFn {
-    titan_name: "read_csv",
-    receiver: None,
-    rust_path: "titan_data::read_csv",
-    params: &[Type::String],
-    rettype: Type::Opaque {
-        module: String::new(),
-        name: String::new(),
-        rust_path: String::new(),
+/// `read_csv` (função de módulo) e `soma` (método sobre `DataFrame`, T40) —
+/// o restante da superfície (`media`, `minimo`, `maximo`, etc.) fica para a
+/// T41 trazer o crate `titan-data` de verdade por trás do stub. `rettype` de
+/// um `Opaque` fica com `module`/`name`/`rust_path` vazios porque uma
+/// declaração `const` não constrói `String` não-vazia; o checker
+/// (`requalify_rettype`, T39) preenche o placeholder com o módulo real da
+/// chamada antes de devolvê-lo — mesmo espírito do `FAKE_FUNCTIONS` de teste
+/// abaixo. `soma` devolve sempre `float` (decisão 9 do PRD.md, T41).
+const DATA_FUNCTIONS: &[CapabilityFn] = &[
+    CapabilityFn {
+        titan_name: "read_csv",
+        receiver: None,
+        rust_path: "titan_data::read_csv",
+        params: &[Type::String],
+        rettype: Type::Opaque {
+            module: String::new(),
+            name: String::new(),
+            rust_path: String::new(),
+        },
     },
-}];
+    CapabilityFn {
+        titan_name: "soma",
+        receiver: Some("DataFrame"),
+        rust_path: "titan_data::soma",
+        params: &[Type::String],
+        rettype: Type::Float,
+    },
+];
 
 pub const CAPABILITIES: &[Capability] = &[Capability {
     titan_name: "data",
