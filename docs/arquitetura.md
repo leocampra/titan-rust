@@ -14,6 +14,7 @@ flowchart LR
     bin -->|copia| out["./&lt;nome&gt;\n(executável final)"]
 
     rt["titan-runtime\n(print, concat)"] -.link em tempo de build.-> proj
+    data["titan-data\n(import data:\nCSV + agregações\nsobre Polars)"] -.link só se houver `import`.-> proj
 ```
 
 Cada seta é uma função pura de um módulo para o próximo — `lex(&str) ->
@@ -90,7 +91,8 @@ adiada; o modelo escolhido é **semântica de valor com `clone()`**, sem
 | `{K: V}` (map) | `std::collections::HashMap<K, V>` |
 | `record Nome` | `struct Nome` própria, `#[derive(Clone, Debug, PartialEq)]` |
 | `{string}` (parâmetro de `main`) | `&mut Vec<String>` |
-| parâmetro de função de tipo composto | `&mut T` (array/map/record) |
+| parâmetro de função de tipo composto | `&mut T` (array/map/record/opaco) |
+| tipo opaco de capability (`data.DataFrame`) | caminho Rust do runtime (`titan_data::DataFrame`), `#[derive(Clone)]` obrigatório — [ADR 0013](adr/0013-tipo-opaco-composto-por-heranca.md) |
 
 `print` e `concat` (suporte ao operador `..`) não são geradas pelo compilador
 — vêm de `titan-runtime`, um crate Rust comum, referenciado por caminho
@@ -111,6 +113,45 @@ mensagem em português em vez de produzir um valor `T?` como no original (ver
 - `string` segue a mesma regra de clone que os demais compostos desde a
   Fase 2 — não há mais distinção entre string "literal" e "computada" no
   codegen ([ADR 0010](adr/0010-string-sempre-string.md)).
+
+## Capability runtimes (`import`, módulos, tipos opacos)
+
+A Fase 3 acrescenta um mecanismo para trazer funcionalidade de um crate Rust
+externo ao `titan-runtime` para dentro de um programa Titan, sem exigir FFI
+do usuário: `import data` (declaração de topo,
+[ADR 0011](adr/0011-import-como-acucar-sintatico.md)) declara `data` como um
+módulo — `SymbolKind::Module`, não um `Type`
+([ADR 0012](adr/0012-modulo-como-symbolkind-nao-tipo.md)) — cujos membros
+(`data.read_csv`, `data.DataFrame`) são resolvidos contra uma tabela de
+capabilities (`capabilities.rs`), a fonte única de verdade que o checker, o
+codegen e o `driver.rs` consultam para saber, respectivamente, o tipo de
+retorno de uma função de módulo, o caminho Rust a emitir, e qual crate
+entra como dependência do projeto gerado.
+
+Um tipo exportado por um módulo (`data.DataFrame`) é opaco
+(`Type::Opaque`): o programa Titan carrega e passa adiante, mas não
+inspeciona os campos. `Opaque` entra no mesmo grupo de `Array`/`Map`/`Record`
+em `is_composite` — herda `&mut` em parâmetro de função e receptor de método
+sem exigir código novo no checker, ao custo de exigir `Clone` de todo tipo
+de runtime usado dessa forma
+([ADR 0013](adr/0013-tipo-opaco-composto-por-heranca.md)). Método é sempre
+chamado com `.`, nunca `:` — `df.soma("valor")` é açúcar de
+`data.soma(df, "valor")`, resolvido pelo checker ao ver que a base tem
+`Type::Opaque`
+([ADR 0014](adr/0014-metodo-com-ponto-nao-dois-pontos.md)).
+
+`titan-data` é a primeira capability implementada sobre esse mecanismo:
+leitura de CSV e agregações sobre Polars, com a ressalva de que Polars é
+**detalhe interno** — o programa Titan só enxerga a API `data.*`, nunca um
+tipo do crate `polars` diretamente
+([ADR 0015](adr/0015-api-data-como-contrato-backend-trocavel.md)). Isso tem
+um custo mensurável: um programa com `import data` leva **~2min de build** e
+deixa **~3GB** em `build/<nome>/target/`, porque o `titanc` gera um projeto
+Cargo por programa. `collect_deps` (`driver.rs`) só inclui `titan-data` nas
+dependências do `Cargo.toml` gerado quando o programa de fato importa
+`data` — o `Cargo.toml` gerado não tem mais uma lista fixa de dependências;
+é montado por módulo importado, e um programa sem `import` nunca paga esse
+custo.
 
 ## Duas armadilhas do Cargo (por que `driver.rs` faz o que faz)
 
