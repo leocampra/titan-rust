@@ -25,7 +25,8 @@
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
 
 use crate::checker::{
-    BinOp, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedTopLevel, UnOp,
+    BinOp, Callee, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedTopLevel,
+    UnOp,
 };
 use crate::types::Type;
 use std::collections::HashSet;
@@ -263,7 +264,16 @@ fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::Ha
         TypedExpKind::Var(name) => {
             names.insert(name.clone());
         }
-        TypedExpKind::Call { args, .. } => {
+        TypedExpKind::Call { callee, args } => {
+            // `Callee::Method` (T40/T42) embute o receptor (`df` em
+            // `df.soma(...)`) como uma expressão própria — se for um
+            // parâmetro só lido através do método, ele conta como "usado"
+            // tanto quanto qualquer outro `Var`, senão a assinatura sairia
+            // `_df` (`unused_variables`) mesmo com o corpo lendo `df` de
+            // verdade.
+            if let Callee::Method { recv, .. } = callee {
+                collect_referenced_names_exp(recv, names);
+            }
             for a in args {
                 collect_referenced_names_exp(a, names);
             }
@@ -640,9 +650,15 @@ fn emit_slot_value(slot_ty: &Type, value: &TypedExp, ctx: Ctx) -> String {
 
 /// `true` para os tipos que este backend passa por `&mut` em posição de
 /// parâmetro (T30) — mesmo critério usado pelo checker (`is_composite` em
-/// `checker.rs`) para decidir se um uso é mutável.
+/// `checker.rs`) para decidir se um uso é mutável. `Opaque` entra na T42
+/// (decisão 8 do PRD.md): o receptor de `df.soma(...)` herda de graça a
+/// mesma máquina de lugares (`&mut` em parâmetro, `clone()` na atribuição,
+/// `emit_place_mut`/`emit_place_expr`).
 fn is_composite(ty: &Type) -> bool {
-    matches!(ty, Type::Array { .. } | Type::Map { .. } | Type::Record { .. })
+    matches!(
+        ty,
+        Type::Array { .. } | Type::Map { .. } | Type::Record { .. } | Type::Opaque { .. }
+    )
 }
 
 /// Empresta uma expressão composta (`array`/`map`/`record`) para uma posição
@@ -939,24 +955,82 @@ fn emit_concat(exps: &[TypedExp], ctx: Ctx) -> String {
 /// verdade — nunca o valor clonado que `array_get` devolveria — faz a
 /// mutação de `f` alcançar `mat`). O resto segue a posição delimitada
 /// normal.
-fn emit_call(callee: &str, args: &[TypedExp], ctx: Ctx) -> String {
-    if let Some(builtin) = crate::builtins::lookup(callee) {
-        let rendered_args: Vec<String> = args.iter().map(|a| borrow_runtime_str(a, ctx)).collect();
-        return format!("{}({})", builtin.rust_path, rendered_args.join(", "));
-    }
-    let rendered_args: Vec<String> = args
-        .iter()
-        .map(|a| {
-            if a.ty == Type::String {
-                emit_owned_string(a, ctx)
-            } else if is_composite(&a.ty) {
-                emit_place_mut(a, ctx)
-            } else {
-                emit_delimited_exp(a, ctx)
+fn emit_call(callee: &Callee, args: &[TypedExp], ctx: Ctx) -> String {
+    match callee {
+        Callee::Direct(name) => {
+            if let Some(builtin) = crate::builtins::lookup(name) {
+                let rendered_args = emit_args_by_param(args, builtin.params, ctx);
+                return format!("{}({})", builtin.rust_path, rendered_args.join(", "));
             }
+            let rendered_args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a.ty == Type::String {
+                        emit_owned_string(a, ctx)
+                    } else if is_composite(&a.ty) {
+                        emit_place_mut(a, ctx)
+                    } else {
+                        emit_delimited_exp(a, ctx)
+                    }
+                })
+                .collect();
+            format!("{}({})", mangle_fn_name(name), rendered_args.join(", "))
+        }
+        // `data.read_csv(...)` (T39): chamada de função de módulo — sem
+        // receptor, argumentos por posição contra a assinatura da
+        // capability (mesma ABI por-parâmetro do builtin/função Titan).
+        Callee::Module { module, name } => {
+            let capability = crate::capabilities::lookup_module(module)
+                .expect("checker só produz Callee::Module para módulo importado existente");
+            let function = capability
+                .find_function(name)
+                .expect("checker só produz Callee::Module para função existente na capability");
+            let rendered_args = emit_args_by_param(args, function.params, ctx);
+            format!("{}({})", function.rust_path, rendered_args.join(", "))
+        }
+        // `df.soma(...)` (T40): método sobre tipo opaco — o receptor entra
+        // como primeiro argumento posicional da função Rust do runtime, por
+        // `emit_place_mut` (T42: `Opaque` já é `is_composite`, reusa a
+        // mesma máquina de lugares da Fase 2 em vez de um caminho à parte).
+        Callee::Method { recv, module, name } => {
+            let capability = crate::capabilities::lookup_module(module)
+                .expect("checker só produz Callee::Method para módulo importado existente");
+            let Type::Opaque {
+                name: receiver_type,
+                ..
+            } = &recv.ty
+            else {
+                unreachable!("checker só produz Callee::Method com receptor de tipo Opaque")
+            };
+            let method = capability
+                .find_method(receiver_type, name)
+                .expect("checker só produz Callee::Method para método existente na capability");
+            let rendered_recv = emit_place_mut(recv, ctx);
+            let rendered_args = emit_args_by_param(args, method.params, ctx);
+            let mut all_args = vec![rendered_recv];
+            all_args.extend(rendered_args);
+            format!("{}({})", method.rust_path, all_args.join(", "))
+        }
+    }
+}
+
+/// Renderiza os argumentos de uma chamada **contra a assinatura declarada**
+/// (`params`, por posição) — generaliza a ABI que antes só o caminho de
+/// função Titan seguia (risco 3 do PRD.md, T42): builtin/módulo/método
+/// passavam *todos* os argumentos por [`borrow_runtime_str`], correto só
+/// enquanto `print` (que recebe `&str`) era o único caso. `String` empresta
+/// (`&str`, molde do runtime); composto sai por [`emit_place_mut`] (T42:
+/// `Opaque` incluso via [`is_composite`]); o resto é a posição delimitada
+/// normal.
+fn emit_args_by_param(args: &[TypedExp], params: &[Type], ctx: Ctx) -> Vec<String> {
+    args.iter()
+        .zip(params)
+        .map(|(a, p)| match p {
+            Type::String => borrow_runtime_str(a, ctx),
+            p if is_composite(p) => emit_place_mut(a, ctx),
+            _ => emit_delimited_exp(a, ctx),
         })
-        .collect();
-    format!("{}({})", mangle_fn_name(callee), rendered_args.join(", "))
+        .collect()
 }
 
 /// `v[i]` em posição de leitura (T30): `array_get`/`map_get` do runtime —
@@ -1070,6 +1144,10 @@ fn rust_type_name(ty: &Type) -> String {
             )
         }
         Type::Record { name, .. } => name.clone(),
+        // Tipo opaco de capability (T42): o caminho Rust totalmente
+        // qualificado que o checker já resolveu via `requalify_rettype`
+        // (`titan_data::DataFrame`), nunca o `name` Titan cru.
+        Type::Opaque { rust_path, .. } => rust_path.clone(),
         other => unreachable!(
             "tipo '{other:?}' fora do subconjunto de codegen suportado — checker deveria ter rejeitado antes"
         ),
@@ -1800,5 +1878,118 @@ end"#;
         let esperado = "c1i1: 100\nc2i1: 6\np.x: 2\n";
         assert_eq!(String::from_utf8_lossy(&output.stdout), esperado);
         assert_eq!(output.status.code(), Some(0));
+    }
+
+    // ---- T42: emissão de chamada qualificada e de método ------------------
+    //
+    // Estes testes checam só o Rust **emitido** (`generate_source`), não a
+    // compilação real — `compila_e_executa` linka apenas `titan-runtime`, e
+    // `titan_data::*` puxaria `polars` (custo de build alto, PRD.md T41) só
+    // para provar texto que já é conferível estaticamente.
+
+    #[test]
+    fn chamada_de_modulo_emite_caminho_qualificado_do_runtime() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    return 0
+end"#;
+        let rust = generate_source(source);
+
+        assert!(
+            rust.contains(r#"titan_data::read_csv(&"v.csv".to_string())"#),
+            "esperava chamada qualificada de módulo no Rust gerado:\n{rust}"
+        );
+        // `Opaque` mapeado para o `rust_path` da capability, não o nome
+        // Titan cru (`rust_type_name`, T42).
+        assert!(
+            rust.contains("let df: titan_data::DataFrame = titan_data::read_csv"),
+            "esperava tipo opaco mapeado para titan_data::DataFrame:\n{rust}"
+        );
+    }
+
+    #[test]
+    fn chamada_de_metodo_emite_receptor_por_referencia_mutavel() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df.soma("valor")
+    return 0
+end"#;
+        let rust = generate_source(source);
+
+        // Receptor (`df`, variável local dona de um `Opaque`) por
+        // `emit_place_mut` — `Opaque` é composto (T42), então o lugar é
+        // `&mut df` (não `df` cru: só parâmetro composto já é `&mut T`).
+        assert!(
+            rust.contains(r#"titan_data::soma(&mut df, &"valor".to_string())"#),
+            "esperava método emitido com receptor por &mut e argumento string:\n{rust}"
+        );
+    }
+
+    #[test]
+    fn variavel_de_tipo_opaco_como_parametro_e_mut_por_referencia() {
+        // `Opaque` entra em `is_composite` (T42, decisão 8 do PRD.md):
+        // receber um `data.DataFrame` como parâmetro de função Titan segue
+        // a mesma ABI `&mut T` de array/map/record (`rust_param_type_name`).
+        let source = r#"import data
+
+function processa(df: data.DataFrame): nil
+    local total: float = df.soma("valor")
+end
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    processa(df)
+    return 0
+end"#;
+        let rust = generate_source(source);
+
+        assert!(
+            rust.contains("fn titan_processa(df: &mut titan_data::DataFrame)"),
+            "esperava parâmetro opaco por &mut titan_data::DataFrame:\n{rust}"
+        );
+        // Argumento de chamada Titan (não builtin/módulo/método) para
+        // parâmetro composto sai por `emit_place_mut` também — `df` é
+        // variável local **dona** (não um parâmetro já `&mut T`), então o
+        // lugar é `&mut df` (mesma regra de qualquer array/map/record local
+        // passado a outra função, T30).
+        assert!(
+            rust.contains("titan_processa(&mut df)"),
+            "esperava argumento de chamada Titan emprestado por &mut df:\n{rust}"
+        );
+    }
+
+    /// A ABI de argumentos por-parâmetro (risco 3 do PRD.md, T42): antes da
+    /// generalização, `emit_call` passava *todos* os argumentos de builtin
+    /// por `borrow_runtime_str`, o que só estava correto porque `print`
+    /// (único builtin) recebe exclusivamente `string`. Prova diretamente em
+    /// [`emit_args_by_param`] — sem depender de a stdlib ganhar um builtin
+    /// de assinatura mista de verdade — que um `integer` na assinatura sai
+    /// pela posição delimitada normal (`42`), não por `&42.to_string()`
+    /// (que só é correto para os builtins de hoje, todos `&str`).
+    #[test]
+    fn emit_args_by_param_usa_a_posicao_certa_por_tipo_do_parametro() {
+        let loc = crate::ast::Loc { line: 0, col: 0 };
+        let ctx: HashSet<String> = HashSet::new();
+        let args = vec![
+            TypedExp {
+                loc,
+                ty: Type::Integer,
+                kind: TypedExpKind::Integer(42),
+            },
+            TypedExp {
+                loc,
+                ty: Type::String,
+                kind: TypedExpKind::String("oi".to_string()),
+            },
+        ];
+        let params = [Type::Integer, Type::String];
+
+        let rendered = emit_args_by_param(&args, &params, &ctx);
+
+        assert_eq!(rendered, vec!["42", r#"&"oi".to_string()"#]);
     }
 }

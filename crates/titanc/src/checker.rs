@@ -247,6 +247,24 @@ pub struct TypedExp {
     pub kind: TypedExpKind,
 }
 
+/// A quem uma chamada (`TypedExpKind::Call`) resolve (T39). Três formas —
+/// `f(x)`/`print(x)` direto, `data.read_csv(x)` qualificado por módulo
+/// (T39) e `df.soma(x)` método sobre um tipo opaco (T40) — que o codegen
+/// (T42) emite de três jeitos distintos.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Callee {
+    Direct(String),
+    Module {
+        module: String,
+        name: String,
+    },
+    Method {
+        recv: Box<TypedExp>,
+        module: String,
+        name: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExpKind {
     Nil,
@@ -256,7 +274,7 @@ pub enum TypedExpKind {
     String(String),
     Var(String),
     Call {
-        callee: String,
+        callee: Callee,
         args: Vec<TypedExp>,
     },
     Concat(Vec<TypedExp>),
@@ -2053,6 +2071,17 @@ impl Checker {
             }
             Var::VarDot { loc, exp, name } => {
                 let base = self.check_exp(exp, None)?;
+                if let Type::Opaque { .. } = &base.ty {
+                    self.error(
+                        base.loc,
+                        format!(
+                            "'{}' não tem campos acessíveis: é um tipo opaco, só é \
+                             possível chamar métodos sobre ele.",
+                            type_name(&base.ty)
+                        ),
+                    );
+                    return None;
+                }
                 let Type::Record { name: rname, fields } = &base.ty else {
                     self.error(
                         base.loc,
@@ -2083,7 +2112,16 @@ impl Checker {
         }
     }
 
-    fn check_call(&mut self, loc: &Loc, callee: &Exp, args: &Args) -> Option<TypedExp> {
+    /// Resolve a quem uma chamada se refere — extraído de `check_call` (T39)
+    /// antes de acrescentar o segundo braço (`VarDot` de módulo), no
+    /// espírito do risco 4 do PRD.md: a função já tinha ~120 linhas.
+    /// Devolve o `Callee` já resolvido, um nome para mensagens de erro, e a
+    /// assinatura (`params`/`rettypes`) contra a qual tipar os argumentos.
+    fn resolve_callee(
+        &mut self,
+        loc: &Loc,
+        callee: &Exp,
+    ) -> Option<(Callee, String, Vec<Type>, Vec<Type>)> {
         let Exp::ExpVar { var, .. } = callee else {
             self.error(
                 *loc,
@@ -2091,28 +2129,137 @@ impl Checker {
             );
             return None;
         };
-        let Var::VarName { name, .. } = var.as_ref() else {
-            self.error(
-                *loc,
-                "só é possível chamar um nome de função diretamente nesta fase.",
-            );
+        match var.as_ref() {
+            Var::VarName { name, .. } => {
+                let Some(symbol) = self.st.find_symbol(name).cloned() else {
+                    self.error(*loc, format!("função '{name}' não foi declarada."));
+                    return None;
+                };
+                let Type::Function { params, rettypes } = symbol.ty else {
+                    self.error(*loc, format!("'{name}' não é uma função."));
+                    return None;
+                };
+                Some((Callee::Direct(name.clone()), name.clone(), params, rettypes))
+            }
+            // `data.read_csv(...)` (T39): base é o símbolo de um módulo
+            // importado — resolve contra a tabela de capabilities em vez da
+            // pilha de escopos.
+            Var::VarDot { exp, name, .. } if self.dot_base_module(exp).is_some() => {
+                let module = self.dot_base_module(exp).expect("checado acima");
+                let capability = *self
+                    .modules
+                    .get(&module)
+                    .expect("dot_base_module só devolve módulo importado");
+                let Some(function) = capability.find_function(name) else {
+                    self.error(
+                        *loc,
+                        format!("o módulo '{module}' não tem função '{name}'."),
+                    );
+                    return None;
+                };
+                Some((
+                    Callee::Module {
+                        module: module.clone(),
+                        name: name.clone(),
+                    },
+                    format!("{module}.{name}"),
+                    function.params.to_vec(),
+                    vec![requalify_rettype(&function.rettype, &module)],
+                ))
+            }
+            // `df.soma(...)` (T40): base é uma expressão cujo *tipo* é
+            // `Opaque` — resolve o método contra a capability do módulo que
+            // originou o opaco (`Type::Opaque::module`, preenchido por
+            // `requalify_rettype` em T39). O receptor conta como uso mutável
+            // pela mesma regra de `checker.rs:2079-2110` (`is_composite`
+            // inclui `Opaque` — ver `is_composite` abaixo).
+            Var::VarDot { exp, name, .. } => {
+                let receiver = self.check_exp(exp, None)?;
+                let Type::Opaque {
+                    module,
+                    name: type_name_,
+                    ..
+                } = &receiver.ty
+                else {
+                    self.error(
+                        *loc,
+                        format!(
+                            "só é possível chamar um nome de função diretamente nesta fase, \
+                             encontrado {}.",
+                            type_name(&receiver.ty)
+                        ),
+                    );
+                    return None;
+                };
+                let capability = crate::capabilities::lookup_module(module)
+                    .expect("Opaque só é construído com módulo de capability existente");
+                let Some(method) = capability.find_method(type_name_, name) else {
+                    self.error(
+                        *loc,
+                        format!("o tipo '{module}.{type_name_}' não tem método '{name}'."),
+                    );
+                    return None;
+                };
+                let module = module.clone();
+                let recv_name = format!("{module}.{type_name_}");
+                if let Exp::ExpVar { var, .. } = exp.as_ref()
+                    && let Some(root_name) = root_var_name(var)
+                    && let Some(Symbol {
+                        kind: SymbolKind::Local { decl_id },
+                        ..
+                    }) = self.st.find_symbol(&root_name)
+                {
+                    self.assigned.insert(*decl_id);
+                }
+                Some((
+                    Callee::Method {
+                        recv: Box::new(receiver),
+                        module: module.clone(),
+                        name: name.clone(),
+                    },
+                    format!("{recv_name}.{name}"),
+                    method.params.to_vec(),
+                    vec![requalify_rettype(&method.rettype, &module)],
+                ))
+            }
+            _ => {
+                self.error(
+                    *loc,
+                    "só é possível chamar um nome de função diretamente nesta fase.",
+                );
+                None
+            }
+        }
+    }
+
+    /// Se `exp` é `ExpVar(VarName(nome))` e `nome` está registrado como
+    /// módulo importado, devolve o nome do módulo — usado por
+    /// `resolve_callee` para reconhecer a base de `data.read_csv(...)`
+    /// (T39) e, mais adiante, distingui-la da base opaca de `df.soma(...)`
+    /// (T40).
+    fn dot_base_module(&self, exp: &Exp) -> Option<String> {
+        let Exp::ExpVar { var, .. } = exp else {
             return None;
         };
+        let Var::VarName { name, .. } = var.as_ref() else {
+            return None;
+        };
+        match self.st.find_symbol(name) {
+            Some(Symbol {
+                kind: SymbolKind::Module { .. },
+                ..
+            }) => Some(name.clone()),
+            _ => None,
+        }
+    }
 
+    fn check_call(&mut self, loc: &Loc, callee: &Exp, args: &Args) -> Option<TypedExp> {
         let Args::ArgsFunc { args: arg_exps, .. } = args else {
             self.error(*loc, "chamada de método não é suportada nesta fase.");
             return None;
         };
 
-        let Some(symbol) = self.st.find_symbol(name).cloned() else {
-            self.error(*loc, format!("função '{name}' não foi declarada."));
-            return None;
-        };
-
-        let Type::Function { params, rettypes } = symbol.ty else {
-            self.error(*loc, format!("'{name}' não é uma função."));
-            return None;
-        };
+        let (callee, name, params, rettypes) = self.resolve_callee(loc, callee)?;
 
         let mut typed_args = Vec::with_capacity(arg_exps.len());
         let mut ok = true;
@@ -2199,7 +2346,7 @@ impl Checker {
             loc: *loc,
             ty,
             kind: TypedExpKind::Call {
-                callee: name.clone(),
+                callee,
                 args: typed_args,
             },
         })
@@ -2247,9 +2394,35 @@ fn is_numeric(ty: &Type) -> bool {
 /// `true` para os tipos passados por `&mut` no Rust gerado (T29): um
 /// parâmetro composto aceita `xs[i] = v`, e passá-lo a outra função é uso
 /// mutável (`check_call` insere seu `DeclId` em `assigned`). Consulta apenas
-/// o tipo, sem inflar `SymbolKind` com mais uma variante.
+/// o tipo, sem inflar `SymbolKind` com mais uma variante. `Opaque` entra na
+/// T40: o receptor de `df.soma(...)` é `&mut` pelo mesmo motivo.
 fn is_composite(ty: &Type) -> bool {
-    matches!(ty, Type::Array { .. } | Type::Map { .. } | Type::Record { .. })
+    matches!(
+        ty,
+        Type::Array { .. } | Type::Map { .. } | Type::Record { .. } | Type::Opaque { .. }
+    )
+}
+
+/// Preenche o placeholder `Type::Opaque` vazio de `CapabilityFn::rettype`
+/// (`capabilities.rs`, T39: uma declaração `const` não constrói `String`
+/// não-vazia) com o `module` real da chamada — `name`/`rust_path` vêm do
+/// tipo opaco correspondente na mesma capability. Tipos não-opacos (`Float`
+/// em `soma`, por exemplo) passam adiante sem mudança.
+fn requalify_rettype(rettype: &Type, module: &str) -> Type {
+    let Type::Opaque { name, .. } = rettype else {
+        return rettype.clone();
+    };
+    let capability =
+        crate::capabilities::lookup_module(module).expect("módulo já resolvido pelo chamador");
+    let opaque = capability
+        .find_opaque(name)
+        .or_else(|| capability.opaque_types.first())
+        .expect("capability com rettype opaco precisa expor ao menos um tipo opaco");
+    Type::Opaque {
+        module: module.to_string(),
+        name: opaque.titan_name.to_string(),
+        rust_path: opaque.rust_path.to_string(),
+    }
 }
 
 /// Desce a cadeia de `VarBracket`/`VarDot` (`v[i]`, `p.campo`,
@@ -2636,6 +2809,178 @@ end"#;
             errs.iter()
                 .any(|e| e.message.contains("'data' é um módulo, não um valor"))
         );
+    }
+
+    // ---- T39: chamada qualificada `data.f(...)` ---------------------------
+
+    #[test]
+    fn chamada_qualificada_de_funcao_de_modulo_e_aceita_e_tipa_o_opaco() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    return 0
+end"#;
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava TypedTopLevel::Func, obteve {:?}", typed[0]);
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava TypedStat::Block, obteve {body:?}");
+        };
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(
+            value.ty,
+            Type::Opaque {
+                module: "data".to_string(),
+                name: "DataFrame".to_string(),
+                rust_path: "titan_data::DataFrame".to_string(),
+            }
+        );
+        assert!(matches!(
+            &value.kind,
+            TypedExpKind::Call {
+                callee: Callee::Module { module, name },
+                ..
+            } if module == "data" && name == "read_csv"
+        ));
+    }
+
+    #[test]
+    fn funcao_inexistente_no_modulo_produz_erro_claro() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.foo("v.csv")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("o módulo 'data' não tem função 'foo'"))
+        );
+    }
+
+    #[test]
+    fn chamada_qualificada_com_aridade_errada_produz_erro() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv", "extra")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("espera")));
+    }
+
+    #[test]
+    fn chamada_qualificada_com_argumento_de_tipo_errado_produz_erro() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv(42)
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("incompatível")));
+    }
+
+    // ---- T40: método sobre tipo opaco `df.f(...)` -------------------------
+
+    #[test]
+    fn metodo_sobre_opaco_e_aceito_e_tipa_float() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df.soma("valor")
+    return 0
+end"#;
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava TypedTopLevel::Func, obteve {:?}", typed[0]);
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava TypedStat::Block, obteve {body:?}");
+        };
+        let TypedStat::Decl { value, .. } = &stats[1] else {
+            panic!("esperava TypedStat::Decl, obteve {:?}", stats[1]);
+        };
+        assert_eq!(value.ty, Type::Float);
+        assert!(matches!(
+            &value.kind,
+            TypedExpKind::Call {
+                callee: Callee::Method { module, name, .. },
+                ..
+            } if module == "data" && name == "soma"
+        ));
+    }
+
+    #[test]
+    fn metodo_inexistente_no_opaco_produz_erro_distinto_de_funcao_de_modulo() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df.foo("valor")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'data.DataFrame' não tem método 'foo'"))
+        );
+        // Mensagem distinta da de função de módulo inexistente (T39).
+        assert!(
+            errs.iter()
+                .all(|e| !e.message.contains("não tem função"))
+        );
+    }
+
+    #[test]
+    fn acessar_campo_de_opaco_e_rejeitado_com_mensagem_especifica() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local x = df.campo
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| {
+            e.message.contains("não tem campos acessíveis") && e.message.contains("tipo opaco")
+        }));
+    }
+
+    #[test]
+    fn metodo_com_argumento_de_tipo_errado_produz_erro() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df.soma(42)
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("incompatível")));
     }
 
     #[test]
