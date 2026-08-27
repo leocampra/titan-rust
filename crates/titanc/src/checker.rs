@@ -2507,6 +2507,28 @@ pub fn check(program: &Program) -> Result<TypedProgram, Vec<CheckError>> {
     }
 }
 
+/// Módulos importados por `import` no programa (T43), na ordem em que
+/// aparecem — usado pelo driver para montar as dependências do `Cargo.toml`
+/// gerado. Só é chamado depois de `check` ter aceitado o programa (nenhum
+/// erro de import), então cada `modname` resolve contra
+/// [`crate::capabilities::lookup_module`]; duplicatas (rejeitadas pelo
+/// checker) não se repetem aqui.
+pub fn imported_capabilities(program: &Program) -> Vec<&'static crate::capabilities::Capability> {
+    let mut seen = std::collections::HashSet::new();
+    program
+        .iter()
+        .filter_map(|node| match node {
+            TopLevel::TopLevelImport { modname, .. } => {
+                if !seen.insert(modname.clone()) {
+                    return None;
+                }
+                crate::capabilities::lookup_module(modname)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
