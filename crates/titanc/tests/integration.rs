@@ -35,7 +35,10 @@
 //!   em tipo opaco, opaco usado como record, módulo usado como valor ou
 //!   atribuído, `import ... as ...`, `import` como expressão e método com
 //!   dois-pontos — é rejeitado com erro claro, sem pagar o build do Polars
-//!   (`--emit-rust` em todo caso negativo).
+//!   (`--emit-rust` em todo caso negativo);
+//! - a prova ponta a ponta da Fase 3 (PRD.md, T45): compila e executa
+//!   `examples/dados.titan` — único caminho feliz desta suíte que paga o
+//!   build do Polars de propósito — conferindo stdout completo e exit code.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,6 +49,13 @@ fn titanc_bin() -> PathBuf {
 
 fn examples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples")
+}
+
+/// Raiz do workspace — `dados.titan` lê `examples/vendas.csv` por caminho
+/// relativo a ela, então o executável gerado precisa rodar com este
+/// diretório como cwd (T45).
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 /// Diretório temporário isolado por teste, para não colidir `build/` entre
@@ -178,6 +188,52 @@ fn compila_e_executa_compostos_titan_conferindo_stdout_e_exit_code() {
                     Segundo estoque dobrado: 40\n\
                     Preco parafuso: 0.5\n\
                     Preco arruela: 0.1\n";
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// A prova da Fase 3 (PRD.md, T45): compila `examples/dados.titan` —
+/// `import data`, leitura de `examples/vendas.csv`, dimensões (`linhas`/
+/// `colunas`), extração de uma coluna como array Titan (soma via `for`,
+/// exercitando a Fase 2 sobre o resultado) e as quatro agregações, incluindo
+/// `soma` **pelas duas formas** (`data.soma(df, "valor")` e
+/// `df.soma("valor")`) — e confere stdout completo e exit code. O binário
+/// gerado roda com `workspace_root()` como cwd porque `dados.titan` lê o CSV
+/// por caminho relativo à raiz do projeto.
+#[test]
+fn compila_e_executa_dados_titan_conferindo_stdout_e_exit_code() {
+    let out_dir = temp_dir("dados");
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(examples_dir().join("dados.titan"))
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar dados.titan: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("dados");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .current_dir(workspace_root())
+        .output()
+        .expect("executa ./dados");
+    let esperado = "Linhas: 4\n\
+                    Colunas: produto,quantidade,valor\n\
+                    Total de unidades (array Titan): 360\n\
+                    Soma do valor (data.soma): 1250.74\n\
+                    Soma do valor (df.soma): 1250.74\n\
+                    Media do valor: 312.685\n\
+                    Minimo do valor: 20\n\
+                    Maximo do valor: 999.99\n";
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));
 

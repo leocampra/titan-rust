@@ -13,6 +13,8 @@
 //! `BUILTINS` (`builtins.rs`) continua existindo sem mudança de
 //! comportamento — `print` não é membro de nenhum módulo.
 
+use std::sync::LazyLock;
+
 use crate::types::Type;
 
 /// Um tipo opaco exportado por um módulo (`data.DataFrame`): o programa
@@ -91,42 +93,118 @@ const DATA_OPAQUE_TYPES: &[OpaqueType] = &[OpaqueType {
     rust_path: "titan_data::DataFrame",
 }];
 
-/// `read_csv` (função de módulo) e `soma` (método sobre `DataFrame`, T40) —
-/// o restante da superfície (`media`, `minimo`, `maximo`, etc.) fica para a
-/// T41 trazer o crate `titan-data` de verdade por trás do stub. `rettype` de
-/// um `Opaque` fica com `module`/`name`/`rust_path` vazios porque uma
-/// declaração `const` não constrói `String` não-vazia; o checker
-/// (`requalify_rettype`, T39) preenche o placeholder com o módulo real da
-/// chamada antes de devolvê-lo — mesmo espírito do `FAKE_FUNCTIONS` de teste
-/// abaixo. `soma` devolve sempre `float` (decisão 9 do PRD.md, T41).
-const DATA_FUNCTIONS: &[CapabilityFn] = &[
-    CapabilityFn {
-        titan_name: "read_csv",
-        receiver: None,
-        rust_path: "titan_data::read_csv",
-        params: &[Type::String],
-        rettype: Type::Opaque {
-            module: String::new(),
-            name: String::new(),
-            rust_path: String::new(),
-        },
-    },
-    CapabilityFn {
-        titan_name: "soma",
-        receiver: Some("DataFrame"),
-        rust_path: "titan_data::soma",
-        params: &[Type::String],
-        rettype: Type::Float,
-    },
-];
+/// Tipo do parâmetro `data.DataFrame` em `data.soma(df, ...)` e similares —
+/// `rust_path` vazio porque só `module`+`name` entram em `Type::equals`
+/// (`types.rs:76-86`), mas `module` precisa ser `"data"` de verdade: é
+/// exatamente isso que `Type::equals` compara contra o valor real (que tem
+/// `module` preenchido por `requalify_rettype`, T39).
+fn df_param() -> Type {
+    Type::Opaque {
+        module: "data".to_string(),
+        name: "DataFrame".to_string(),
+        rust_path: String::new(),
+    }
+}
 
-pub const CAPABILITIES: &[Capability] = &[Capability {
-    titan_name: "data",
-    crate_name: "titan-data",
-    crate_path: "crates/titan-data",
-    opaque_types: DATA_OPAQUE_TYPES,
-    functions: DATA_FUNCTIONS,
-}];
+/// Toda a superfície do `titan-data` (T41): `read_csv` (função de módulo,
+/// devolve o opaco), `linhas`/`colunas`/`coluna_integer`/`coluna_float`
+/// (inspeção, só método — não fazem sentido como função solta) e as quatro
+/// agregações (`soma`/`media`/`minimo`/`maximo`) **nas duas formas** exigidas
+/// pela T45 (`data.soma(df, "valor")` e `df.soma("valor")`): uma entrada sem
+/// receptor com o `DataFrame` como primeiro parâmetro posicional, e uma com
+/// receptor — mesmo `rust_path`, porque `Callee::Method` (`codegen.rs:995`)
+/// já antepõe o receptor aos demais argumentos antes de chamar.
+///
+/// `rettype` de um `Opaque` fica com `module`/`rust_path` vazios pela mesma
+/// razão de `df_param`: o checker (`requalify_rettype`, T39) preenche o
+/// placeholder com o módulo real da chamada antes de devolvê-lo — mesmo
+/// espírito do `FAKE_FUNCTIONS` de teste abaixo. Agregações devolvem sempre
+/// `float` (decisão 9 do PRD.md, T41).
+fn data_functions() -> Vec<CapabilityFn> {
+    let agregacoes: [(&'static str, &'static str); 4] = [
+        ("soma", "titan_data::soma"),
+        ("media", "titan_data::media"),
+        ("minimo", "titan_data::minimo"),
+        ("maximo", "titan_data::maximo"),
+    ];
+
+    let mut functions = vec![
+        CapabilityFn {
+            titan_name: "read_csv",
+            receiver: None,
+            rust_path: "titan_data::read_csv",
+            params: Box::leak(Box::new([Type::String])),
+            rettype: Type::Opaque {
+                module: String::new(),
+                name: String::new(),
+                rust_path: String::new(),
+            },
+        },
+        CapabilityFn {
+            titan_name: "linhas",
+            receiver: Some("DataFrame"),
+            rust_path: "titan_data::linhas",
+            params: &[],
+            rettype: Type::Integer,
+        },
+        CapabilityFn {
+            titan_name: "colunas",
+            receiver: Some("DataFrame"),
+            rust_path: "titan_data::colunas",
+            params: &[],
+            rettype: Type::Array {
+                elem: Box::new(Type::String),
+            },
+        },
+        CapabilityFn {
+            titan_name: "coluna_integer",
+            receiver: Some("DataFrame"),
+            rust_path: "titan_data::coluna_integer",
+            params: Box::leak(Box::new([Type::String])),
+            rettype: Type::Array {
+                elem: Box::new(Type::Integer),
+            },
+        },
+        CapabilityFn {
+            titan_name: "coluna_float",
+            receiver: Some("DataFrame"),
+            rust_path: "titan_data::coluna_float",
+            params: Box::leak(Box::new([Type::String])),
+            rettype: Type::Array {
+                elem: Box::new(Type::Float),
+            },
+        },
+    ];
+
+    for (titan_name, rust_path) in agregacoes {
+        functions.push(CapabilityFn {
+            titan_name,
+            receiver: None,
+            rust_path,
+            params: Box::leak(Box::new([df_param(), Type::String])),
+            rettype: Type::Float,
+        });
+        functions.push(CapabilityFn {
+            titan_name,
+            receiver: Some("DataFrame"),
+            rust_path,
+            params: Box::leak(Box::new([Type::String])),
+            rettype: Type::Float,
+        });
+    }
+
+    functions
+}
+
+pub static CAPABILITIES: LazyLock<Vec<Capability>> = LazyLock::new(|| {
+    vec![Capability {
+        titan_name: "data",
+        crate_name: "titan-data",
+        crate_path: "crates/titan-data",
+        opaque_types: DATA_OPAQUE_TYPES,
+        functions: Box::leak(data_functions().into_boxed_slice()),
+    }]
+});
 
 /// Busca um módulo de capability pelo nome usado em `import`.
 pub fn lookup_module(titan_name: &str) -> Option<&'static Capability> {

@@ -1,0 +1,27 @@
+import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("examples/vendas.csv")
+
+    print("Linhas: " .. df.linhas())
+    local colunas: {string} = df.colunas()
+    print("Colunas: " .. colunas[1] .. "," .. colunas[2] .. "," .. colunas[3])
+
+    local quantidades: {integer} = df.coluna_integer("quantidade")
+    local total_unidades: integer = 0
+    for i: integer = 1, #quantidades do
+        total_unidades = total_unidades + quantidades[i]
+    end
+    print("Total de unidades (array Titan): " .. total_unidades)
+
+    local soma_por_modulo: float = data.soma(df, "valor")
+    local soma_por_metodo: float = df.soma("valor")
+    print("Soma do valor (data.soma): " .. soma_por_modulo)
+    print("Soma do valor (df.soma): " .. soma_por_metodo)
+
+    print("Media do valor: " .. df.media("valor"))
+    print("Minimo do valor: " .. df.minimo("valor"))
+    print("Maximo do valor: " .. df.maximo("valor"))
+
+    return 0
+end
