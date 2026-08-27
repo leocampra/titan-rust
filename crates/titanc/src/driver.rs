@@ -4,14 +4,15 @@
 //! Fluxo (`compile`):
 //! 1. lê o fonte → lexer → parser → checker;
 //! 2. gera `<out_dir>/<nome>/src/main.rs` e `<out_dir>/<nome>/Cargo.toml`
-//!    (com `titan-runtime` referenciado por caminho absoluto);
+//!    (com `titan-runtime` e uma entrada por módulo importado, cada um
+//!    referenciado por caminho absoluto, T43);
 //! 3. invoca `cargo build --release` nesse diretório;
 //! 4. copia o executável para o diretório atual como `<nome>`.
 //!
 //! Duas armadilhas do Cargo evitadas aqui (PRD.md, T7):
 //! - o `Cargo.toml` gerado leva um `[workspace]` **vazio**, senão o cargo
 //!   tenta anexá-lo ao workspace pai e a build quebra;
-//! - `titan-runtime` é referenciado por **caminho absoluto**, sem rede nem
+//! - cada dependência é referenciada por **caminho absoluto**, sem rede nem
 //!   registry.
 
 use std::path::{Path, PathBuf};
@@ -116,18 +117,56 @@ fn io_err(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> CompileE
     move |source| CompileError::Io { context, source }
 }
 
-/// `Cargo.toml` do projeto gerado: `[workspace]` vazio (para não ser anexado
-/// ao workspace pai) e `titan-runtime` por caminho absoluto.
-fn generate_cargo_toml(name: &str, runtime_path: &Path) -> String {
-    format!(
-        "[workspace]\n\n[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ntitan-runtime = {{ path = {runtime_path:?} }}\n"
-    )
+/// Uma dependência do `Cargo.toml` gerado: nome do crate e caminho absoluto.
+struct CrateDep {
+    name: &'static str,
+    path: PathBuf,
 }
 
-/// Caminho absoluto de `crates/titan-runtime`, relativo à raiz do workspace
-/// deste binário (`CARGO_MANIFEST_DIR` é `crates/titanc` em tempo de build).
+/// `Cargo.toml` do projeto gerado: `[workspace]` vazio (para não ser anexado
+/// ao workspace pai) e uma entrada `[dependencies]` por `deps`, cada uma por
+/// caminho absoluto. `deps` sempre inclui `titan-runtime`, mais uma por
+/// módulo importado pelo programa (T43) — programa sem `import` não paga o
+/// build das capabilities que não usa.
+fn generate_cargo_toml(name: &str, deps: &[CrateDep]) -> String {
+    let mut out = format!(
+        "[workspace]\n\n[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"
+    );
+    for dep in deps {
+        out.push_str(&format!("{} = {{ path = {:?} }}\n", dep.name, dep.path));
+    }
+    out
+}
+
+/// Caminho absoluto de um crate do workspace a partir do caminho relativo à
+/// raiz do workspace (`Capability::crate_path`, ex. `crates/titan-data`).
+/// `CARGO_MANIFEST_DIR` é `crates/titanc` em tempo de build, daí o `../..`
+/// até a raiz.
+fn workspace_crate_path(relative_to_root: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative_to_root)
+}
+
+/// Caminho absoluto de `crates/titan-runtime`.
 fn runtime_crate_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../titan-runtime")
+    workspace_crate_path("crates/titan-runtime")
+}
+
+/// Monta a lista de dependências do `Cargo.toml` gerado: `titan-runtime`
+/// sempre primeiro, mais uma por módulo importado pelo programa (T43).
+fn collect_deps(program: &crate::ast::Program) -> Vec<CrateDep> {
+    let mut deps = vec![CrateDep {
+        name: "titan-runtime",
+        path: runtime_crate_path(),
+    }];
+    for capability in checker::imported_capabilities(program) {
+        deps.push(CrateDep {
+            name: capability.crate_name,
+            path: workspace_crate_path(capability.crate_path),
+        });
+    }
+    deps
 }
 
 /// Executa o pipeline completo. Devolve o caminho do executável final.
@@ -159,7 +198,7 @@ pub fn compile(opts: &Options) -> Result<PathBuf, CompileError> {
         "não foi possível escrever o main.rs gerado".to_string(),
     ))?;
 
-    let cargo_toml = generate_cargo_toml(&name, &runtime_crate_path());
+    let cargo_toml = generate_cargo_toml(&name, &collect_deps(&program));
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml).map_err(io_err(
         "não foi possível escrever o Cargo.toml gerado".to_string(),
     ))?;
@@ -234,10 +273,43 @@ mod tests {
     #[test]
     fn gera_cargo_toml_com_workspace_vazio_e_path_absoluto() {
         let runtime_path = runtime_crate_path();
-        let toml = generate_cargo_toml("hello", &runtime_path);
+        let deps = vec![CrateDep {
+            name: "titan-runtime",
+            path: runtime_path.clone(),
+        }];
+        let toml = generate_cargo_toml("hello", &deps);
         assert!(toml.starts_with("[workspace]\n"));
         assert!(runtime_path.is_absolute());
         assert!(toml.contains(&format!("path = {runtime_path:?}")));
+    }
+
+    #[test]
+    fn programa_sem_import_so_depende_do_titan_runtime() {
+        let source = "function main(args: {string}): integer\n    print(\"oi\")\n    return 0\nend";
+        let tokens = lexer::lex(source).unwrap();
+        let program = parser::parse(&tokens).unwrap();
+
+        let deps = collect_deps(&program);
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "titan-runtime");
+    }
+
+    #[test]
+    fn programa_com_import_ganha_dependencia_do_modulo() {
+        let source = "import data\n\nfunction main(args: {string}): integer\n    return 0\nend";
+        let tokens = lexer::lex(source).unwrap();
+        let program = parser::parse(&tokens).unwrap();
+
+        let deps = collect_deps(&program);
+
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "titan-runtime");
+        assert_eq!(deps[1].name, "titan-data");
+
+        let toml = generate_cargo_toml("com_data", &deps);
+        assert!(toml.contains("titan-runtime = "));
+        assert!(toml.contains("titan-data = "));
     }
 
     #[test]
