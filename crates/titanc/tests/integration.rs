@@ -27,6 +27,15 @@
 //!   processados (compilam ou falham com erro claro), e os que usam somente
 //!   o idioma de arrays já suportado (`sieve.titan`, `selection_sort.titan`)
 //!   compilam e executam de verdade quando envolvidos por um `main`.
+//! - suíte consolidada da Fase 3 (PRD.md, T44): `import data` (a forma de
+//!   topo sem alias/string) virou caminho feliz — saiu da tabela de fora de
+//!   escopo, mesmo movimento já feito para `indexacao_de_array` etc. na
+//!   T30/T31; e o que segue fora de escopo depois de `import`/capabilities
+//!   serem aceitos — capability inexistente, membro inexistente em módulo ou
+//!   em tipo opaco, opaco usado como record, módulo usado como valor ou
+//!   atribuído, `import ... as ...`, `import` como expressão e método com
+//!   dois-pontos — é rejeitado com erro claro, sem pagar o build do Polars
+//!   (`--emit-rust` em todo caso negativo).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -239,6 +248,39 @@ fn emit_rust_imprime_o_rust_gerado_sem_compilar() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+/// `import_de_modulo` saiu da tabela de fora-de-escopo na T44: desde a T35 a
+/// forma de topo `import data` (sem alias, sem string) é aceita pelo parser e
+/// resolvida pelo checker (T38). Usa `--emit-rust` para não pagar o build do
+/// Polars (risco 1) — o precedente é o mesmo movimento já feito na T30/T31
+/// para `indexacao_de_array`/`construtor_de_array`/`operador_length`.
+#[test]
+fn emit_rust_de_import_data_compila_sem_erro() {
+    let out_dir = temp_dir("emit-rust-import-data");
+
+    let source = "import data\n\nfunction main(args: {string}): integer\n    return 0\nend";
+    let source_path = write_source(&out_dir, "caso.titan", source);
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&output);
+    assert!(
+        output.status.success(),
+        "titanc --emit-rust falhou para `import data`: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !out_dir.join("build").exists(),
+        "--emit-rust não deveria gerar build/"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 /// Um caso negativo: fonte, trecho esperado na mensagem de erro em stderr.
 struct CasoNegativo {
     nome: &'static str,
@@ -294,6 +336,7 @@ fn verifica_caso_negativo(caso: &CasoNegativo, label: &str) {
     let source_path = write_source(&out_dir, "caso.titan", caso.fonte);
 
     let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
         .arg("--out")
         .arg(&out_dir)
         .arg(&source_path)
@@ -360,16 +403,6 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         // ao encontrar `:`, que não inicia nem sufixo nem expressão válida.
         fonte: "function main(args: {string}): integer\n    local p = ponto:dist()\n    return 0\nend",
         trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
-    },
-    CasoNegativo {
-        nome: "import_de_modulo",
-        fonte: "local m = import \"foo\"\n\nfunction main(args: {string}): integer\n    return 0\nend",
-        // Desde a T34 (PRD.md), `import` é um token válido (`KwImport`) — a
-        // rejeição deixou de vir do checker (`TopLevelImport`) e passou a ser
-        // léxica/sintática: `import` não é mais um `Name` válido à direita de
-        // `=`, então o parser falha ao tentar iniciar uma expressão ali. A
-        // forma de topo `import data` só existe a partir da T35.
-        trecho_esperado: "Esperava uma expressão",
     },
     CasoNegativo {
         nome: "repeat_until",
@@ -472,6 +505,72 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
 fn construcoes_fora_de_escopo_da_fase_2_produzem_erro_claro_sem_panic() {
     for caso in CASOS_FORA_DE_ESCOPO_FASE_2 {
         verifica_caso_negativo(caso, "fora-de-escopo");
+    }
+}
+
+/// Fora de escopo da Fase 3 (PRD.md, T44): a Fase 3 ensinou o pipeline a
+/// aceitar `import data` e as duas formas de chamada de capability
+/// (`data.f(...)` e `df.f(...)`) — esta tabela garante que ela não afrouxou
+/// nada além do pretendido. Todos os casos falham no checker ou no parser,
+/// antes de o driver chegar a invocar `cargo build`, então nenhum deles paga
+/// o build do Polars.
+const CASOS_FORA_DE_ESCOPO_FASE_3: &[CasoNegativo] = &[
+    CasoNegativo {
+        nome: "capability_inexistente",
+        fonte: "import inexistente\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "capability 'inexistente' não existe",
+    },
+    CasoNegativo {
+        nome: "funcao_inexistente_no_modulo",
+        fonte: "import data\n\nfunction main(args: {string}): integer\n    local df: data.DataFrame = data.foo(\"v.csv\")\n    return 0\nend",
+        trecho_esperado: "o módulo 'data' não tem função 'foo'",
+    },
+    CasoNegativo {
+        nome: "metodo_inexistente_no_opaco",
+        fonte: "import data\n\nfunction main(args: {string}): integer\n    local df: data.DataFrame = data.read_csv(\"v.csv\")\n    local total: float = df.foo(\"valor\")\n    return 0\nend",
+        trecho_esperado: "o tipo 'data.DataFrame' não tem método 'foo'",
+    },
+    CasoNegativo {
+        nome: "acesso_a_campo_de_opaco",
+        fonte: "import data\n\nfunction main(args: {string}): integer\n    local df: data.DataFrame = data.read_csv(\"v.csv\")\n    local x = df.campo\n    return 0\nend",
+        trecho_esperado: "não tem campos acessíveis",
+    },
+    CasoNegativo {
+        nome: "modulo_usado_como_valor",
+        fonte: "import data\n\nfunction main(args: {string}): integer\n    local x = data\n    return 0\nend",
+        trecho_esperado: "'data' é um módulo, não um valor",
+    },
+    CasoNegativo {
+        nome: "atribuicao_a_modulo",
+        fonte: "import data\n\nfunction main(args: {string}): integer\n    data = 1\n    return 0\nend",
+        trecho_esperado: "não é possível atribuir ao módulo 'data'",
+    },
+    CasoNegativo {
+        nome: "import_data_as_d",
+        fonte: "import data as d\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "'import ... as ...' não é suportado",
+    },
+    CasoNegativo {
+        nome: "local_m_igual_import_data",
+        // `import` é palavra-chave desde a T34 — não é mais um `Name` válido
+        // à direita de `=`, então o parser falha ao tentar iniciar uma
+        // expressão ali (mesmo mecanismo do antigo `import_de_modulo`, que
+        // saiu desta tabela na T44 porque a forma de topo `import data` virou
+        // caso positivo).
+        fonte: "local m = import \"data\"\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "Esperava uma expressão",
+    },
+    CasoNegativo {
+        nome: "metodo_com_dois_pontos_em_df",
+        fonte: "import data\n\nfunction main(args: {string}): integer\n    local df: data.DataFrame = data.read_csv(\"v.csv\")\n    local total: float = df:soma(\"valor\")\n    return 0\nend",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+    },
+];
+
+#[test]
+fn construcoes_fora_de_escopo_da_fase_3_produzem_erro_claro_sem_panic() {
+    for caso in CASOS_FORA_DE_ESCOPO_FASE_3 {
+        verifica_caso_negativo(caso, "fora-de-escopo-fase-3");
     }
 }
 
