@@ -1856,7 +1856,7 @@ dois-pontos.
 | **0. Hello world** | pipeline completo, subconjunto mínimo | ✅ **Concluída** |
 | **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
 | **2. Tipos compostos** | arrays, maps, records, strings dinâmicas | ✅ **Concluída** |
-| **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | Em andamento |
+| **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | ✅ **Concluída** |
 | 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
 | 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
 | 4. Self-hosting / LSP | compilador escrito na própria linguagem | Pendente |

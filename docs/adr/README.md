@@ -12,3 +12,8 @@
 | [0008](0008-indexacao-checada-e-variancia-invariante.md) | Indexação checada no runtime (`T`, não `T?`); `Array`/`Map` invariantes em `compatible` |
 | [0009](0009-records-como-struct-rust-nominal.md) | Records como `struct` Rust nominal |
 | [0010](0010-string-sempre-string.md) | `string` é sempre `String` — fim da dualidade `&str`/`String` |
+| [0011](0011-import-como-acucar-sintatico.md) | `import data` como declaração de topo, `data` como nome fixo (diverge do original) |
+| [0012](0012-modulo-como-symbolkind-nao-tipo.md) | Módulo é `SymbolKind`, não `Type` (diverge do `Type.Module` do original) |
+| [0013](0013-tipo-opaco-composto-por-heranca.md) | Tipo opaco `Type::Opaque`, composto por herança (exige `Clone`) |
+| [0014](0014-metodo-com-ponto-nao-dois-pontos.md) | Método chamado com `.`, não `:` (diverge do original) |
+| [0015](0015-api-data-como-contrato-backend-trocavel.md) | API `data.*` é o contrato; o backend (Polars) é detalhe interno trocável |
