@@ -176,6 +176,12 @@ pub enum Stat {
         loc: Loc,
         exps: Vec<Exp>,
     },
+    /// `break` (Fase 4, T55) — o primeiro nó de AST realmente novo do
+    /// projeto (decisão técnica 8): o Titan original não tem `break`
+    /// (`titan/titan-compiler/ast.lua:33-42`).
+    StatBreak {
+        loc: Loc,
+    },
 }
 
 /// Ramo `then` de um `if` (`ast.lua`: `Then.Then`).

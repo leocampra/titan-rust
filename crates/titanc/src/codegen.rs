@@ -239,6 +239,7 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             collect_referenced_names_lvalue(target, names);
             collect_referenced_names_exp(value, names);
         }
+        TypedStat::Break { .. } => {}
     }
 }
 
@@ -549,6 +550,10 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str("}\n");
             indent(out, depth);
             out.push_str("}\n");
+        }
+        TypedStat::Break { .. } => {
+            indent(out, depth);
+            out.push_str("break;\n");
         }
     }
 }
