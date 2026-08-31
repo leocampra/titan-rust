@@ -1,30 +1,15 @@
 //! Compilador da linguagem Titan.
 //!
-//! CLI que amarra o pipeline completo — lexer, parser, checker, codegen e
-//! driver (invocação do `cargo`) — e produz o executável nativo (PRD.md, T7).
+//! CLI fina sobre `titanc` (lib): amarra o pipeline completo — lexer, parser,
+//! checker, codegen e driver (invocação do `cargo`) — e produz o executável
+//! nativo (PRD.md, T7).
 //!
 //! Uso: `titanc [--emit-rust] [--out DIR] [-v] <arquivo.titan>`
-
-// `enum_variant_names`: os nós mantêm o prefixo do `ast.lua` (`ExpString`,
-// `StatCall`, ...) de propósito, para que o Titan original continue servindo
-// de referência viva — ver PRD.md, tarefa T1.
-#[allow(dead_code, clippy::enum_variant_names)]
-mod ast;
-mod builtins;
-#[allow(dead_code)]
-mod capabilities;
-mod checker;
-mod codegen;
-mod driver;
-mod lexer;
-mod parser;
-#[allow(dead_code)]
-mod types;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use driver::Options;
+use titanc::driver::{self, Options};
 
 const USO: &str = "uso: titanc [--emit-rust] [--out DIR] [-v] <arquivo.titan>";
 

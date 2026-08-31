@@ -1859,4 +1859,449 @@ dois-pontos.
 | **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | ✅ **Concluída** |
 | 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
 | 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
-| 4. Self-hosting / LSP | compilador escrito na própria linguagem | Pendente |
+| **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ⬅ **próxima** (T47–T58) |
+| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | Pendente |
+
+---
+---
+
+# PRD — Titan-Rust · Fase 4: Self-hosting / LSP
+
+> Continuação da Fase 3 (T34–T46, **concluída**). Objetivos da fase: (a) abrir
+> um `.titan` no VS Code e ver erros sublinhados, tipos no hover e
+> go-to-definition, servidos por um `titan-lsp` que reusa o pipeline sem
+> invocar o `cargo`; (b) `titanc examples/lexer.titan && ./lexer
+> examples/nucleo.titan` imprimir a lista de tokens — um pedaço do compilador
+> rodando na própria linguagem. Tarefas T47–T58.
+
+## Resumo executivo
+
+O roadmap sempre listou a Fase 4 como *"compilador escrito na própria
+linguagem — complexidade muito alta"*, sem detalhá-la. A investigação que abre
+a fase mostra que **self-hosting completo não cabe numa fase**, e recorta o que
+cabe.
+
+**As lacunas medidas** (para escrever o `titanc` em Titan), em ordem de
+gravidade:
+
+| Lacuna | Onde é rejeitada | Consequência |
+|---|---|---|
+| Tipos soma (`enum`/`match`) | não existem (`types.rs:11-46`) | um `Exp` de 13 variantes (`ast.rs:210-275`) não tem representação |
+| Módulos de usuário | `driver.rs:174` lê **um** arquivo | o compilador (4144 linhas só de `checker.rs`) teria de caber num único `.titan` |
+| Ler arquivo | não há capability de I/O | o compilador não alcança o próprio fonte |
+| Acesso a caractere de string | `checker.rs:2035-2038` | um lexer não avança sobre o fonte |
+| `string` ↔ número | não há `tonumber`/`tostring` | literal numérico não vira valor |
+| `break`/`continue` | nem são keywords (`lexer.rs:457-500`) | laço de scan vira flag booleana |
+| Retornos múltiplos | `checker.rs:1483-1486` | `(token, pos)` vira record ou `&mut` |
+
+**Ponto de partida favorável do lado do LSP** (o inverso do quadro acima):
+
+- **Bloqueador estrutural, mas barato:** o `titanc` é só um binário —
+  `main.rs:11-23` declara os módulos como `mod` privados, sem `lib.rs`, então
+  nada pode reusar o pipeline como biblioteca.
+- **`lex`/`parse`/`check`/`generate` já são funções puras** — o LSP roda o
+  pipeline sobre o buffer em memória e para antes do `cargo`.
+- **Todo erro já carrega `Loc { line, col }`** (`ast.rs:9-13`), e
+  `checker::check` já devolve `Vec<CheckError>` (`driver.rs:32`): vários
+  diagnósticos numa publicação só, que é exatamente o que um LSP faz.
+- **A ABI de argumentos já cobre `texto`:** `emit_args_by_param`
+  (`codegen.rs:1025-1034`) emite corretamente uma assinatura
+  `(string, integer) -> integer`, então `texto.byte(s, i)` cabe sem tocar em
+  checker nem codegen (generalização feita na T42).
+- **`collect_deps` (`driver.rs:158-170`) já monta dependências condicionais** a
+  partir de `imported_capabilities` — `texto` e `io` entram sem mudança, e as
+  deps do LSP não têm como vazar para o `Cargo.toml` gerado.
+
+**Decisões fixadas (confirmadas com o usuário):**
+
+1. **Escopo**: LSP em Rust (Parte A) + fundação de self-hosting provada pelo
+   lexer em Titan (Parte B). Tipos soma, módulos de usuário e parser/checker
+   auto-hospedados ficam para a Fase 5.
+2. **Acesso a texto por capability `texto`** — não builtins globais (a tabela
+   de `builtins.rs` é plana, sem namespace), não `s[i]` (assimétrico: leitura
+   sim, escrita não, e ainda deixaria `sub`/`para_inteiro` sem casa).
+3. **I/O numa capability `io` à parte** de `texto`: `texto` é puro, `io` toca o
+   sistema.
+4. **`break` sim, `continue` não** — ver decisão técnica 7.
+5. **LSP sobre `tower-lsp` + `tokio` + `serde_json`**, com extensão VS Code
+   mínima versionada em `editors/vscode/` (sem extensão, a fase não é
+   demonstrável).
+
+**Decisões técnicas derivadas:**
+
+6. **O LSP nunca invoca o `cargo`.** Roda `lex → parse → check` sobre o buffer
+   e para aí — nunca gera projeto, nunca compila. É o que torna o diagnóstico
+   instantâneo, e só é possível porque o pipeline é feito de funções puras.
+7. **`continue` fica fora porque o `for` é desaçucarado para `while` com o
+   incremento no fim do corpo** (T15, ADR 0004): um `continue` pularia o
+   incremento e daria laço infinito — bug silencioso, sem erro de compilação,
+   no idioma mais comum de um lexer. `break` não tem esse problema e mapeia
+   direto para o `break` do Rust.
+8. **`StatBreak` é o primeiro nó de AST realmente novo do projeto.** Nas fases
+   anteriores a `ast.rs` já vinha completa e a tarefa era ensinar parser,
+   checker e codegen a usá-la. O Titan original também não tem `break`
+   (`titan/titan-compiler/ast.lua:33-42`), então o nó não existe em lugar
+   nenhum.
+9. **As deps do LSP entram no workspace do compilador, nunca no `Cargo.toml`
+   gerado** por programa.
+
+**Convenções de trabalho** (herdadas, seguem valendo):
+- `titan/` e `lua/` são **somente leitura**.
+- Cada tarefa termina com `cargo test` verde antes da seguinte, e um commit.
+- Mensagens de erro do compilador em português — nunca panic.
+
+**Grafo de dependências:**
+Parte A: `T47 → T48 → T49 → T50 → T51 → T52`.
+Parte B: `T53 ∥ T54 ∥ T55 → T56 → T57 → T58`.
+As duas partes são independentes entre si; T52 (revisão) fecha a Parte A antes
+de a Parte B começar.
+
+---
+
+## T47 — `titanc` vira `lib.rs` + `bin`
+
+**Objetivo:** pré-requisito estrutural de toda a Parte A — o pipeline precisa
+ser uma biblioteca antes de qualquer coisa poder reusá-lo.
+
+**Detalhes:**
+- `crates/titanc/src/lib.rs` **novo**: move para lá a declaração dos módulos
+  hoje em `main.rs:11-23`, tornando públicos `lexer`, `parser`, `checker`,
+  `codegen`, `ast`, `types`, `capabilities`, `builtins` e `driver`.
+- `main.rs` vira um bin fino sobre a lib (`use titanc::...`), mantendo o
+  parsing de CLI e a chamada a `driver::compile` sem mudança de comportamento.
+- **Atenção aos `#[allow(dead_code)]`** de `main.rs:11-23`: o que era morto num
+  binário passa a ser API pública de uma lib — vários devem sair, e o que
+  sobrar precisa de justificativa.
+
+**Critério de aceite:** `cargo test` verde; `titanc` com saída byte-a-byte
+idêntica em `hello`, `nucleo`, `compostos` e `dados`.
+
+**Depende de:** —
+
+**Skills:** `rust-pro` · `architect-review` · `clean-code`
+
+---
+
+## T48 — `crates/titan-lsp`: esqueleto e diagnósticos
+
+**Objetivo:** o coração da Parte A — abrir um `.titan` e ver o erro sublinhado.
+
+**Detalhes:**
+- Crate novo `titan-lsp` com `tower-lsp`, `tokio` e `serde_json`.
+- `initialize`, `textDocument/didOpen`, `didChange`, `didClose` e
+  `publishDiagnostics`.
+- Rodar `lex → parse → check` sobre o buffer **em memória**; nunca invocar o
+  `cargo` (decisão 6).
+- `checker::check` devolve `Vec<CheckError>` — todos os erros de tipo saem numa
+  publicação só. `LexError`/`ParseError` param no primeiro; aceitável nesta
+  fase, mas documentar.
+- **Conversão de posição, a armadilha da tarefa:** `Loc` é 1-indexado e o LSP é
+  0-indexado; e `Loc.col` conta **bytes**, enquanto o LSP usa UTF-16 por
+  padrão. Declarar `positionEncoding: "utf-8"` no `initialize` ou converter —
+  em fonte ASCII coincide, mas o projeto inteiro escreve em português, então
+  um `.titan` com acento vai expor o erro.
+
+**Critério de aceite:** teste de integração falando JSON-RPC de verdade —
+`didOpen` de um `.titan` com erro de tipo devolve `publishDiagnostics` com
+linha, coluna e mensagem em português corretas.
+
+**Depende de:** T47.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T49 — Hover e go-to-definition
+
+**Objetivo:** o item mais caro da Parte A, porque exige preservar informação
+que o checker hoje **descarta**.
+
+**Detalhes:**
+- A symtab (`checker.rs:101-115`) é uma pilha de `HashMap` que some ao fechar o
+  bloco, e nada indexa símbolo por posição.
+- Acrescentar ao `TypedProgram` um **índice colateral** — algo como
+  `Vec<(Loc, Símbolo, Loc_da_definição)>` — preenchido durante a passada 2
+  (`checker.rs:865`). Sem alterar a semântica de checagem: só registra o que já
+  é conhecido no momento em que é conhecido.
+- **hover**: tipo do símbolo sob o cursor, formatado por `type_name`, o mesmo
+  que o checker já usa nas mensagens de erro.
+- **go-to-definition**: local da declaração — `local`, parâmetro, função
+  top-level, record e campo de record.
+
+**Critério de aceite:** hover sobre `qs` em `examples/compostos.titan` mostra
+`{integer}`; go-to-definition sobre uma chamada salta para a `function`.
+
+**Depende de:** T48.
+
+**Skills:** `rust-pro` · `architect-review` · `test-driven-development`
+
+---
+
+## T50 — Autocomplete
+
+**Objetivo:** completar contra as tabelas que já são fonte única de verdade.
+
+**Detalhes:** três contextos, nenhum exigindo estrutura nova —
+- depois de `data.` / `texto.` / `io.` → membros da capability
+  (`capabilities.rs`, `find_function`);
+- depois de `df.` onde `df: data.DataFrame` → métodos do opaco (`find_method`);
+- em posição de expressão → símbolos em escopo (índice da T49) + `BUILTINS` +
+  keywords do `lexer.rs`.
+
+**Critério de aceite:** completar `data.` lista `read_csv`, `soma`, `media`,
+`minimo`, `maximo`.
+
+**Depende de:** T49.
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T51 — Extensão VS Code
+
+**Objetivo:** sem cliente, a fase não é demonstrável.
+
+**Detalhes:**
+- `editors/vscode/` com `package.json`, gramática TextMate
+  (`syntaxes/titan.tmLanguage.json`) e cliente `vscode-languageclient` que sobe
+  o binário `titan-lsp`.
+- README: como rodar em modo de desenvolvimento (F5).
+- **Não** publicar no marketplace nesta fase.
+
+**Critério de aceite:** abrir `examples/nucleo.titan` no VS Code mostra realce
+de sintaxe; introduzir um erro de tipo sublinha a linha com a mensagem em
+português.
+
+**Depende de:** T50.
+
+**Skills:** `typescript-pro` · `readme`
+
+---
+
+## T52 — Revisão de qualidade da Parte A
+
+**Objetivo:** fechar a Parte A antes de a Parte B começar, como nas fases
+anteriores (revisão ao fim de T42 e T45).
+
+**Skills:** `code-reviewer` · `architect-review` · `find-bugs`
+
+**Depende de:** T51.
+
+---
+
+## T53 — Capability `texto`
+
+**Objetivo:** dar à linguagem o que um lexer precisa para andar sobre o fonte.
+
+**Detalhes:** `crates/titan-texto`, no molde exato de `titan-data` (uma entrada
+em `capabilities.rs:199-207` mais um crate; nenhuma mudança em checker ou
+codegen). Superfície:
+
+| Titan | Rust | Nota |
+|---|---|---|
+| `texto.byte(s, i): integer` | `titan_texto::byte` | 1-indexado, coerente com arrays; fora da faixa → erro em português |
+| `texto.sub(s, i, j): string` | `titan_texto::sub` | 1-indexado, `j` inclusivo, como o Lua |
+| `texto.para_inteiro(s): integer` | `titan_texto::para_inteiro` | sem `Option`: string inválida aborta com mensagem clara |
+| `texto.de_inteiro(n): string` | `titan_texto::de_inteiro` | o `tostring` que falta |
+| `texto.tamanho(s): integer` | `titan_texto::tamanho` | espelha `#s` (bytes), para uso explícito |
+
+- Todas operam sobre **bytes**, consistentes com `#s`
+  (`titan-runtime/src/lib.rs:134-136`, que já conta bytes). Documentar a
+  limitação: fonte ASCII; string com acento tem comportamento definido (bytes),
+  mas não é "caracteres".
+- Seguir o padrão de `titan-data`: cada função com um par `_checked` devolvendo
+  `Result<_, String>` e um wrapper que aborta com a mensagem em português.
+
+**Critério de aceite:** `cargo test -p titan-texto`; `--emit-rust` de um
+`.titan` com `import texto` gera o Rust esperado, sem invocar o `cargo`.
+
+**Depende de:** —
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T54 — Capability `io`
+
+**Objetivo:** o mínimo para um compilador alcançar o próprio fonte.
+
+**Detalhes:**
+- `crates/titan-io` com `io.ler_arquivo(caminho: string): string`.
+- `io.escrever_arquivo` entra se sair de graça; não é exigido pelo lexer.
+- Mesmo padrão `_checked`/wrapper: arquivo inexistente ou ilegível vira
+  mensagem em português, nunca panic.
+
+**Critério de aceite:** um `.titan` que lê um arquivo e imprime seu tamanho
+compila e roda.
+
+**Depende de:** —
+
+**Skills:** `rust-pro` · `test-driven-development`
+
+---
+
+## T55 — `break`
+
+**Objetivo:** o único item da fase que toca o compilador de verdade — e é
+pequeno, mas espalhado por cinco arquivos.
+
+**Detalhes:**
+- `lexer.rs:457-500`: `TokenKind::KwBreak` em `lex_name_or_keyword`.
+  **Registrar a quebra compatível** — `break` deixa de ser identificador
+  válido, como aconteceu com `as` (T20) e `import` (T34).
+- `ast.rs`: nó `StatBreak { loc }` — **novo** (decisão técnica 8).
+- `parser.rs:392-433`: um braço em `parse_stat`.
+- `checker.rs`: variante em `TypedStat` e rejeição de `break` fora de laço,
+  exigindo rastrear profundidade de laço no `Checker`.
+- `codegen.rs`: emite `break;`.
+- **`continue` não entra** (decisão 7): rejeitado com mensagem explicando que
+  pularia o incremento do `for` desaçucarado.
+
+**Critério de aceite** (execução real): `break` sai de `while` e de `for`;
+`break` fora de laço dá erro claro; `continue` dá erro claro; casos negativos
+no `integration.rs`.
+
+**Depende de:** —
+
+**Skills:** `rust-pro` · `test-driven-development` · `architect-review`
+
+---
+
+## T56 — `examples/lexer.titan`: o lexer do Titan escrito em Titan
+
+**Objetivo:** **a prova da fase.** Um lexer para um subconjunto do Titan,
+escrito em Titan, que lê um `.titan` passado por `args`, tokeniza e imprime a
+lista de tokens.
+
+**Detalhes:** o estilo é imposto pelo que a linguagem tem hoje — e é
+deliberadamente registrado, não disfarçado (risco 4):
+- `TokenKind` é `integer`, não tipo soma. Sem variáveis de topo
+  (`checker.rs:674-677`), as constantes viram funções sem argumento
+  (`function TK_IF(): integer return 1 end`).
+- `record Token { kind: integer, lexeme: string, linha: integer, coluna: integer }`,
+  acumulados em `{Token}` (append por `#res+1`, o idioma da Fase 2).
+- Sem retornos múltiplos: a posição corrente anda num record `Estado` passado
+  por `&mut` — ADR 0007 trabalhando a favor.
+- Reatribuir parâmetro escalar é proibido (`checker.rs:1293-1296`), o que é
+  justamente por que o estado é um record e não um `pos: integer`.
+- Entrada pelo `args` de `main`, que já chega ao programa pelo shim
+  (`codegen.rs:113-119`).
+
+**Critério de aceite:** `titanc examples/lexer.titan && ./lexer
+examples/nucleo.titan` imprime os tokens e sai com 0; teste de integração
+conferindo stdout e exit code, no molde de
+`compila_e_executa_dados_titan_conferindo_stdout_e_exit_code`
+(`integration.rs:206`).
+
+**Depende de:** T53, T54, T55.
+
+**Skills:** `test-driven-development` · `verification-before-completion`
+
+---
+
+## T57 — Curadoria dos testes de integração
+
+**Objetivo:** garantir que o que continua fora segue rejeitado com erro claro, e
+que nada regrediu.
+
+**Detalhes:**
+- Casos negativos para `continue`, tipos soma, `.titan` importando `.titan`,
+  `s[i]`, `break` fora de laço.
+- Regressão de `hello`, `nucleo`, `compostos` e `dados` com saída idêntica.
+- Manter a disciplina de custo da Fase 3 (risco 1 daquela fase): **um** caso
+  ponta a ponta por capability pesada; todo o resto usa `--emit-rust`, que não
+  invoca o `cargo`.
+- Teste que confere o `Cargo.toml` gerado **não** contém dependência do LSP
+  (risco 5).
+
+**Depende de:** T56.
+
+**Skills:** `test-driven-development` · `find-bugs`
+
+---
+
+## T58 — ADRs, documentação e fechamento da Fase 4
+
+**Objetivo:** deixar as decisões não-óbvias registradas e o projeto
+compreensível.
+
+**Entregáveis:**
+- ADRs `0016`–`0020` no formato Status/Contexto/Decisão/Consequências,
+  seguindo `0015-api-data-como-contrato-backend-trocavel.md`:
+
+  | ADR | Decisão |
+  |---|---|
+  | 0016 | Acesso a texto por capability `texto`, não builtins globais nem `s[i]` |
+  | 0017 | `break` sim, `continue` não (o `for` desaçucarado perderia o incremento) |
+  | 0018 | `titanc` exposto como lib: o LSP reusa o pipeline sem invocar o `cargo` |
+  | 0019 | LSP sobre `tower-lsp`; deps do servidor nunca entram no `Cargo.toml` gerado |
+  | 0020 | Self-hosting por etapas: lexer na Fase 4, parser/checker na Fase 5 |
+
+- `docs/adr/README.md`: acrescentar as 5 linhas à tabela.
+- `README.md`: estado → Fase 4; mover `break`, `texto`, `io` para o coberto;
+  acrescentar `examples/lexer.titan`; como rodar o LSP e a extensão.
+- `docs/arquitetura.md`: o LSP como **segundo consumidor** do pipeline (que
+  para antes do `driver`); `texto`/`io` no diagrama.
+- `PRD.md`: marcar a Fase 4 como concluída no roadmap.
+
+**Depende de:** T57.
+
+**Skills:** `readme` · `docs-architect` · `architecture-decision-records`
+
+---
+
+## Revisão de qualidade (contínua)
+
+Como nas fases anteriores: revisão de código ao fim de **T52** (que fecha a
+Parte A) e novamente ao fim de **T56**, antes de seguir.
+
+**Skills:** `code-reviewer` · `architect-review` · `find-bugs`
+
+---
+
+## Riscos da fase
+
+1. **T49 (hover/go-to-definition) é o item mais caro da Parte A**, porque exige
+   preservar informação que o checker hoje joga fora ao fechar escopos. Se
+   apertar, T49/T50 podem ser reduzidos a hover apenas — diagnósticos (T48) e
+   editor (T51) já entregam o valor central da parte.
+2. **`Loc.col` em bytes vs. UTF-16 do LSP** produz erro **silencioso** de
+   posicionamento em fonte com acento — e o projeto escreve tudo em português.
+   Tratar explicitamente na T48, não deixar para o cliente descobrir.
+3. **`break` altera o lexer:** deixa de ser identificador válido. Quebra
+   compatível, do mesmo tipo de `as` (T20) e `import` (T34) — registrar.
+4. **`examples/lexer.titan` vai ficar deselegante** (constantes como funções,
+   record de estado, tag inteira). Isso é dado, não defeito: é a evidência
+   empírica que justifica os tipos soma e as variáveis de topo da Fase 5.
+   Registrar no ADR 0020 em vez de disfarçar — e resistir à tentação de
+   "consertar" a linguagem no meio da fase.
+5. **Deps do LSP não podem vazar** para o `Cargo.toml` gerado por programa.
+   `collect_deps` (`driver.rs:158-170`) só olha `imported_capabilities`, então
+   o risco é baixo — um teste na T57 o fecha de vez.
+
+---
+
+## Fora de escopo nesta fase
+
+Rejeitar com erro claro (nunca panic): tipos soma e `match`, `continue`,
+módulos definidos pelo usuário (um `.titan` importando outro `.titan`), parser
+e checker auto-hospedados, `Option`/`?`, cast (`as`), retornos múltiplos,
+multi-assign, declaração múltipla, `repeat`/`until`, `for`-in, bitwise
+(`& | ~ << >>`), `//`, `foreign import`, `import` com alias e `df:metodo()`.
+
+**Redox OS** segue fora de escopo — compilar para Linux nativo.
+
+---
+
+## Roadmap atualizado (fim da Fase 4)
+
+| Fase | Escopo | Estado |
+|---|---|---|
+| **0. Hello world** | pipeline completo, subconjunto mínimo | ✅ **Concluída** |
+| **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
+| **2. Tipos compostos** | arrays, maps, records, strings dinâmicas | ✅ **Concluída** |
+| **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | ✅ **Concluída** |
+| **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ⬅ **esta fase** (T47–T58) |
+| 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
+| 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
+| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | Pendente |
