@@ -4,11 +4,14 @@
 //! funções internas.
 //!
 //! Cobre a armadilha central da tarefa: `Loc.col` é 1-indexado e conta
-//! **bytes**, enquanto o LSP por padrão usa posição 0-indexada em UTF-16. O
-//! servidor evita a conversão anunciando `positionEncoding: "utf-8"` em
-//! `initialize` — este teste manda um `.titan` com acento (o projeto inteiro
-//! escreve em português) para expor um eventual erro de posicionamento que
-//! só apareceria em fonte não-ASCII.
+//! **caracteres Unicode** (o lexer itera `.chars()`, não bytes), enquanto o
+//! LSP usa posição 0-indexada em UTF-16 (`positionEncoding: "utf-16"`,
+//! `main.rs` — o cliente VS Code real não aceita outro valor). Este teste
+//! manda um `.titan` com acento (o projeto inteiro escreve em português)
+//! para expor um eventual erro de posicionamento em fonte não-ASCII; acentos
+//! do português são todos do BMP (1 char = 1 unidade UTF-16), então não
+//! cobrem char→UTF-16 de verdade — isso fica a cargo do teste unitário com
+//! emoji em `analysis.rs`.
 //!
 //! `hover_sobre_local_array_mostra_o_tipo` e
 //! `goto_definition_sobre_chamada_salta_para_a_funcao` cobrem os dois
@@ -150,14 +153,15 @@ fn did_open_com_erro_de_tipo_publica_diagnostico_com_posicao_correta() {
     );
     assert_eq!(
         init["result"]["capabilities"]["positionEncoding"],
-        json!("utf-8"),
-        "servidor precisa anunciar positionEncoding utf-8 para Loc (bytes) valer como offset direto"
+        json!("utf-16"),
+        "servidor precisa anunciar positionEncoding utf-16 — é o único valor que o cliente VS Code real aceita"
     );
     client.notify("initialized", json!({}));
 
-    // Identificador acentuado ("preço") antes do erro de tipo: em UTF-16 a
-    // coluna do erro seria diferente da contagem em bytes que `Loc` usa —
-    // é exatamente a armadilha que este teste precisa expor.
+    // Identificador acentuado ("preço") antes do erro de tipo: em UTF-8
+    // (bytes) a coluna do erro seria diferente da contagem por caractere que
+    // `Loc` usa — é a armadilha que este teste expõe (acentos do português
+    // são BMP, então coincidem em UTF-16 e em contagem de char).
     let source = "function main(args: {string}): integer\n    local preço: integer = \"oi\"\n    return 0\nend";
     let uri = "file:///teste_acento.titan";
 
@@ -346,6 +350,16 @@ fn goto_definition_sobre_chamada_salta_para_a_funcao() {
         range["start"]["line"].as_u64(),
         Some(0),
         "go-to-definition deveria saltar para a linha da `function ajuda`, resultado: {response:?}"
+    );
+    // A coluna importa tanto quanto a linha: sem isso o teste passaria mesmo
+    // se o destino fosse a palavra-chave `function` (coluna 0) em vez do
+    // nome `ajuda` (coluna 9) — exatamente o bug que este teste precisa
+    // travar (checker.rs, `collect_signature`, usava a `Loc` do início do
+    // statement em vez da `Loc` do nome).
+    assert_eq!(
+        range["start"]["character"].as_u64(),
+        Some(9),
+        "go-to-definition deveria apontar para o nome `ajuda`, não para a palavra-chave `function`, resultado: {response:?}"
     );
 
     client.shutdown_and_exit();

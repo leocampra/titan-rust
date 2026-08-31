@@ -33,21 +33,14 @@ use titanc::capabilities::{self, Capability};
 use titanc::checker::{CheckedProgram, ScopeSnapshot};
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Position};
 
+use crate::position::{position_to_loc, utf16_col_to_char_index};
+
 /// Identificador usado para tapar o buraco onde o usuário está digitando —
 /// precisa ser um `Name` válido do lexer e não colidir com nada real.
 const PLACEHOLDER: &str = "titan_lsp_cursor";
 /// Nome do `local` fictício que torna a linha remendada um `StatDecl`
 /// válido — nunca lido, só existe para o parser aceitar a linha.
 const STMT_NAME: &str = "titan_lsp_stmt";
-
-/// Palavras-chave do léxico (`lexer.rs:469-493`) oferecidas em posição de
-/// expressão — mesma lista literal que `lex_name_or_keyword` mapeia, porque
-/// o lexer não expõe essa tabela como dado.
-const KEYWORDS: &[&str] = &[
-    "function", "local", "return", "end", "true", "false", "nil", "and", "or", "not", "if", "then",
-    "elseif", "else", "while", "do", "for", "boolean", "integer", "float", "string", "value",
-    "record", "as", "import",
-];
 
 /// Caracteres válidos num `Name` do Titan (`lexer.rs`: letras, dígitos e
 /// `_`, sem começar por dígito — irrelevante aqui pois só andamos para trás
@@ -75,9 +68,18 @@ fn patch_and_classify(text: &str, position: Position) -> (String, Context) {
     let lines: Vec<&str> = text.split('\n').collect();
     let line_idx = (position.line as usize).min(lines.len().saturating_sub(1));
     let line = lines.get(line_idx).copied().unwrap_or("");
-    let col = (position.character as usize).min(line.len());
+    // `position.character` conta unidades UTF-16 (positionEncoding:
+    // "utf-16", `main.rs`), não bytes nem chars — o corte precisa achar o
+    // índice de byte do char correspondente, nunca indexar `line`
+    // diretamente pelo offset (panic em fronteira de char multibyte).
+    let char_idx = utf16_col_to_char_index(line, position.character);
+    let byte_col = line
+        .char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
 
-    let before = &line[..col];
+    let before = &line[..byte_col];
     let indent_end = before
         .find(|c: char| !c.is_whitespace())
         .unwrap_or(before.len());
@@ -112,15 +114,6 @@ fn patch_and_classify(text: &str, position: Position) -> (String, Context) {
     (patched_lines.join("\n"), context)
 }
 
-/// Converte `Position` do LSP (0-indexado) para `Loc` do checker
-/// (1-indexado) — mesma conversão de `analysis.rs`.
-fn position_to_loc(pos: Position) -> Loc {
-    Loc {
-        line: pos.line as usize + 1,
-        col: pos.character as usize + 1,
-    }
-}
-
 /// O snapshot mais interno (intervalo mais estreito) que contém `cursor` —
 /// blocos aninhados produzem snapshots aninhados (`checker.rs`,
 /// `ScopeSnapshot`), então o de menor extensão é o mais específico.
@@ -136,9 +129,9 @@ fn innermost_scope(scopes: &[ScopeSnapshot], cursor: Loc) -> Option<&ScopeSnapsh
 }
 
 fn keyword_items() -> Vec<CompletionItem> {
-    KEYWORDS
+    titanc::lexer::KEYWORDS
         .iter()
-        .map(|kw| CompletionItem {
+        .map(|(kw, _)| CompletionItem {
             label: kw.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
             ..CompletionItem::default()
@@ -160,8 +153,8 @@ fn builtin_items() -> Vec<CompletionItem> {
 
 /// Contexto 3: símbolos em escopo no ponto do cursor (T49's `ScopeSnapshot`)
 /// + `BUILTINS` + palavras-chave.
-fn expression_items(checked: &CheckedProgram, position: Position) -> Vec<CompletionItem> {
-    let cursor = position_to_loc(position);
+fn expression_items(checked: &CheckedProgram, text: &str, position: Position) -> Vec<CompletionItem> {
+    let cursor = position_to_loc(text, &position);
     let mut items = Vec::new();
 
     if let Some(scope) = innermost_scope(&checked.scopes, cursor) {
@@ -194,10 +187,11 @@ fn expression_items(checked: &CheckedProgram, position: Position) -> Vec<Complet
 /// `"módulo.Tipo"` por `checker::type_name`.
 fn member_items(
     checked: &CheckedProgram,
+    text: &str,
     position: Position,
     receiver: &str,
 ) -> Vec<CompletionItem> {
-    let cursor = position_to_loc(position);
+    let cursor = position_to_loc(text, &position);
     let Some(scope) = innermost_scope(&checked.scopes, cursor) else {
         return Vec::new();
     };
@@ -279,7 +273,7 @@ pub fn complete(text: &str, position: Position) -> Vec<CompletionItem> {
     let checked = titanc::checker::check_partial(&program);
 
     match context {
-        Context::Expression => expression_items(&checked, position),
-        Context::Member { receiver } => member_items(&checked, position, &receiver),
+        Context::Expression => expression_items(&checked, text, position),
+        Context::Member { receiver } => member_items(&checked, text, position, &receiver),
     }
 }

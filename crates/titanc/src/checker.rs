@@ -101,57 +101,68 @@ struct Symbol {
     def_loc: Loc,
 }
 
-/// Pilha de escopos léxicos. Cada bloco é um `HashMap` de nome → símbolo.
+/// Pilha de escopos léxicos. `blocks` guarda, por bloco aberto, os nomes
+/// declarados nele — só para `close_block` saber o que desempilhar de
+/// `by_name`. `by_name` é o índice de verdade: cada nome mapeia à pilha dos
+/// símbolos declarados com esse nome, do mais externo ao mais interno, então
+/// o topo é sempre o que está em escopo agora (shadowing).
 struct SymTab {
-    blocks: Vec<HashMap<String, Symbol>>,
+    blocks: Vec<Vec<String>>,
+    by_name: HashMap<String, Vec<Symbol>>,
 }
 
 impl SymTab {
     fn new() -> Self {
         SymTab {
-            blocks: vec![HashMap::new()],
+            blocks: vec![Vec::new()],
+            by_name: HashMap::new(),
         }
     }
 
     fn open_block(&mut self) {
-        self.blocks.push(HashMap::new());
+        self.blocks.push(Vec::new());
     }
 
     fn close_block(&mut self) {
-        self.blocks.pop();
+        let declared = self.blocks.pop().expect("symtab sempre tem pelo menos um bloco");
+        for name in declared {
+            if let Some(stack) = self.by_name.get_mut(&name) {
+                stack.pop();
+                if stack.is_empty() {
+                    self.by_name.remove(&name);
+                }
+            }
+        }
     }
 
     fn add_symbol(&mut self, name: &str, ty: Type, kind: SymbolKind, def_loc: Loc) {
         self.blocks
             .last_mut()
             .expect("symtab sempre tem pelo menos um bloco")
-            .insert(
-                name.to_string(),
-                Symbol {
-                    ty,
-                    kind,
-                    def_loc,
-                },
-            );
+            .push(name.to_string());
+        self.by_name.entry(name.to_string()).or_default().push(Symbol {
+            ty,
+            kind,
+            def_loc,
+        });
     }
 
     fn find_symbol(&self, name: &str) -> Option<&Symbol> {
-        self.blocks.iter().rev().find_map(|block| block.get(name))
+        self.by_name.get(name).and_then(|stack| stack.last())
     }
 
-    /// Todos os nomes visíveis agora, do bloco mais externo ao mais interno —
-    /// um bloco interno sobrescreve o nome do externo (shadowing), no mesmo
-    /// espírito de `find_symbol`. Usado para o snapshot de escopo do
-    /// autocomplete (T50): `find_symbol` resolve *um* nome já sabido, isto
-    /// aqui lista *todos* para uma posição do cursor ainda sem nome nenhum.
+    /// Todos os nomes visíveis agora — o topo da pilha de cada nome em
+    /// `by_name` já é, por construção, o símbolo do bloco mais interno que o
+    /// declara (shadowing), então isto é uma coleta linear no número de
+    /// nomes distintos em escopo, não uma soma sobre todos os blocos
+    /// abertos. Usado para o snapshot de escopo do autocomplete (T50):
+    /// `find_symbol` resolve *um* nome já sabido, isto aqui lista *todos*
+    /// para uma posição do cursor ainda sem nome nenhum.
     fn visible_symbols(&self) -> HashMap<String, Symbol> {
-        let mut visible = HashMap::new();
-        for block in &self.blocks {
-            for (name, symbol) in block {
-                visible.insert(name.clone(), symbol.clone());
-            }
-        }
-        visible
+        self.by_name
+            .iter()
+            .filter_map(|(name, stack)| stack.last().map(|symbol| (name.clone(), symbol.clone())))
+            .collect()
     }
 }
 
