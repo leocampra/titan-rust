@@ -238,6 +238,178 @@ fn compila_e_executa_dados_titan_conferindo_stdout_e_exit_code() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+/// A prova da Fase 4 (PRD.md, T56): compila e executa
+/// `examples/lexer.titan` — o lexer do Titan escrito em Titan, self-hosting
+/// desta fase — apontando para `examples/nucleo.titan` como entrada e
+/// conferindo **stdout completo e exit code**, no molde de
+/// `compila_e_executa_dados_titan_conferindo_stdout_e_exit_code`. `args[1]`
+/// chega pelo shim de `main` (`codegen.rs:113-119`), e a leitura do arquivo
+/// usa `io.ler_arquivo` (T54) sobre bytes indexados por `texto` (T53).
+#[test]
+fn compila_e_executa_lexer_titan_sobre_nucleo_titan_conferindo_stdout_e_exit_code() {
+    let out_dir = temp_dir("lexer");
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(examples_dir().join("lexer.titan"))
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar lexer.titan: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("lexer");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .arg(examples_dir().join("nucleo.titan"))
+        .output()
+        .expect("executa ./lexer examples/nucleo.titan");
+    let esperado = "PALAVRA_CHAVE 'function' 1:1\n\
+                    NOME 'fatorial' 1:10\n\
+                    SIMBOLO '(' 1:18\n\
+                    NOME 'n' 1:19\n\
+                    SIMBOLO ':' 1:20\n\
+                    PALAVRA_CHAVE 'integer' 1:22\n\
+                    SIMBOLO ')' 1:29\n\
+                    SIMBOLO ':' 1:30\n\
+                    PALAVRA_CHAVE 'integer' 1:32\n\
+                    PALAVRA_CHAVE 'if' 2:5\n\
+                    NOME 'n' 2:8\n\
+                    SIMBOLO '<=' 2:10\n\
+                    INTEIRO '1' 2:13\n\
+                    PALAVRA_CHAVE 'then' 2:15\n\
+                    PALAVRA_CHAVE 'return' 3:9\n\
+                    INTEIRO '1' 3:16\n\
+                    PALAVRA_CHAVE 'end' 4:5\n\
+                    PALAVRA_CHAVE 'local' 5:5\n\
+                    NOME 'resultado' 5:11\n\
+                    SIMBOLO ':' 5:20\n\
+                    PALAVRA_CHAVE 'integer' 5:22\n\
+                    SIMBOLO '=' 5:30\n\
+                    INTEIRO '1' 5:32\n\
+                    PALAVRA_CHAVE 'local' 6:5\n\
+                    NOME 'i' 6:11\n\
+                    SIMBOLO ':' 6:12\n\
+                    PALAVRA_CHAVE 'integer' 6:14\n\
+                    SIMBOLO '=' 6:22\n\
+                    INTEIRO '2' 6:24\n\
+                    PALAVRA_CHAVE 'while' 7:5\n\
+                    NOME 'i' 7:11\n\
+                    SIMBOLO '<=' 7:13\n\
+                    NOME 'n' 7:16\n\
+                    PALAVRA_CHAVE 'do' 7:18\n\
+                    NOME 'resultado' 8:9\n\
+                    SIMBOLO '=' 8:19\n\
+                    NOME 'resultado' 8:21\n\
+                    SIMBOLO '*' 8:31\n\
+                    NOME 'i' 8:33\n\
+                    NOME 'i' 9:9\n\
+                    SIMBOLO '=' 9:11\n\
+                    NOME 'i' 9:13\n\
+                    SIMBOLO '+' 9:15\n\
+                    INTEIRO '1' 9:17\n\
+                    PALAVRA_CHAVE 'end' 10:5\n\
+                    PALAVRA_CHAVE 'return' 11:5\n\
+                    NOME 'resultado' 11:12\n\
+                    PALAVRA_CHAVE 'end' 12:1\n\
+                    PALAVRA_CHAVE 'function' 14:1\n\
+                    NOME 'fibonacci' 14:10\n\
+                    SIMBOLO '(' 14:19\n\
+                    NOME 'n' 14:20\n\
+                    SIMBOLO ':' 14:21\n\
+                    PALAVRA_CHAVE 'integer' 14:23\n\
+                    SIMBOLO ')' 14:30\n\
+                    SIMBOLO ':' 14:31\n\
+                    PALAVRA_CHAVE 'integer' 14:33\n\
+                    PALAVRA_CHAVE 'if' 15:5\n\
+                    NOME 'n' 15:8\n\
+                    SIMBOLO '<=' 15:10\n\
+                    INTEIRO '1' 15:13\n\
+                    PALAVRA_CHAVE 'then' 15:15\n\
+                    PALAVRA_CHAVE 'return' 16:9\n\
+                    NOME 'n' 16:16\n\
+                    PALAVRA_CHAVE 'end' 17:5\n\
+                    PALAVRA_CHAVE 'local' 18:5\n\
+                    NOME 'a' 18:11\n\
+                    SIMBOLO ':' 18:12\n\
+                    PALAVRA_CHAVE 'integer' 18:14\n\
+                    SIMBOLO '=' 18:22\n\
+                    INTEIRO '0' 18:24\n\
+                    PALAVRA_CHAVE 'local' 19:5\n\
+                    NOME 'b' 19:11\n\
+                    SIMBOLO ':' 19:12\n\
+                    PALAVRA_CHAVE 'integer' 19:14\n\
+                    SIMBOLO '=' 19:22\n\
+                    INTEIRO '1' 19:24\n\
+                    PALAVRA_CHAVE 'for' 20:5\n\
+                    NOME 'j' 20:9\n\
+                    SIMBOLO '=' 20:11\n\
+                    INTEIRO '2' 20:13\n\
+                    SIMBOLO ',' 20:14\n\
+                    NOME 'n' 20:16\n\
+                    PALAVRA_CHAVE 'do' 20:18\n\
+                    PALAVRA_CHAVE 'local' 21:9\n\
+                    NOME 'prox' 21:15\n\
+                    SIMBOLO ':' 21:19\n\
+                    PALAVRA_CHAVE 'integer' 21:21\n\
+                    SIMBOLO '=' 21:29\n\
+                    NOME 'a' 21:31\n\
+                    SIMBOLO '+' 21:33\n\
+                    NOME 'b' 21:35\n\
+                    NOME 'a' 22:9\n\
+                    SIMBOLO '=' 22:11\n\
+                    NOME 'b' 22:13\n\
+                    NOME 'b' 23:9\n\
+                    SIMBOLO '=' 23:11\n\
+                    NOME 'prox' 23:13\n\
+                    PALAVRA_CHAVE 'end' 24:5\n\
+                    PALAVRA_CHAVE 'return' 25:5\n\
+                    NOME 'b' 25:12\n\
+                    PALAVRA_CHAVE 'end' 26:1\n\
+                    PALAVRA_CHAVE 'function' 28:1\n\
+                    NOME 'main' 28:10\n\
+                    SIMBOLO '(' 28:14\n\
+                    NOME 'args' 28:15\n\
+                    SIMBOLO ':' 28:19\n\
+                    SIMBOLO '{' 28:21\n\
+                    PALAVRA_CHAVE 'string' 28:22\n\
+                    SIMBOLO '}' 28:28\n\
+                    SIMBOLO ')' 28:29\n\
+                    SIMBOLO ':' 28:30\n\
+                    PALAVRA_CHAVE 'integer' 28:32\n\
+                    NOME 'print' 29:5\n\
+                    SIMBOLO '(' 29:10\n\
+                    STRING 'Fatorial de 5: ' 29:11\n\
+                    SIMBOLO '..' 29:29\n\
+                    NOME 'fatorial' 29:32\n\
+                    SIMBOLO '(' 29:40\n\
+                    INTEIRO '5' 29:41\n\
+                    SIMBOLO ')' 29:42\n\
+                    SIMBOLO ')' 29:43\n\
+                    NOME 'print' 30:5\n\
+                    SIMBOLO '(' 30:10\n\
+                    STRING 'Fibonacci de 10: ' 30:11\n\
+                    SIMBOLO '..' 30:31\n\
+                    NOME 'fibonacci' 30:34\n\
+                    SIMBOLO '(' 30:43\n\
+                    INTEIRO '10' 30:44\n\
+                    SIMBOLO ')' 30:46\n\
+                    SIMBOLO ')' 30:47\n\
+                    PALAVRA_CHAVE 'return' 31:5\n\
+                    INTEIRO '0' 31:12\n\
+                    PALAVRA_CHAVE 'end' 32:1\n\
+                    EOF '' 33:1\n";
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 /// A verificação do T17 pede o `--emit-rust` do `nucleo.titan` "sem warnings
 /// de mut" — a decisão 6 da Fase 1 exige `let mut` apenas nas variáveis
 /// reatribuídas. Conferimos as duas direções: quem é reatribuída
