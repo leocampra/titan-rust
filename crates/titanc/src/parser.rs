@@ -412,6 +412,30 @@ impl<'a> Parser<'a> {
             return self.parse_stat_for(loc);
         }
 
+        if self.eat(&TokenKind::KwBreak) {
+            self.eat(&TokenKind::Semicolon);
+            return Ok(Stat::StatBreak { loc });
+        }
+
+        // `continue` não é keyword (decisão técnica 7 do PRD.md): o `for` é
+        // desaçucarado para `while` com o incremento no fim do corpo (T15,
+        // ADR 0004), então um `continue` pularia o incremento e daria laço
+        // infinito silencioso. Detectado aqui, antes de virar uma expressão
+        // sufixada comum, para dar um erro claro em vez de deixar `continue`
+        // ser usado como identificador.
+        if let TokenKind::Name(name) = &self.peek().kind
+            && name == "continue"
+        {
+            return Err(ParseError {
+                message: "`continue` não é suportado: o `for` é desaçucarado para `while` \
+                          com o incremento no fim do corpo, e um `continue` pularia esse \
+                          incremento, causando um laço infinito silencioso. Reestruture o \
+                          laço com `if`/`break`."
+                    .to_string(),
+                loc,
+            });
+        }
+
         // Chamada ou atribuição — desambiguadas sem backtracking, como no
         // original (`suffixedexp` + checar `ASSIGN`, `parser.lua:354-358`):
         // parseia a expressão sufixada e o token seguinte decide.
@@ -422,7 +446,7 @@ impl<'a> Parser<'a> {
         if !matches!(exp, Exp::ExpCall { .. }) {
             return Err(ParseError {
                 message: "Esperava um comando (`local`, `return`, `if`, `while`, `for`, \
-                          uma atribuição ou uma chamada de função)."
+                          `break`, uma atribuição ou uma chamada de função)."
                     .to_string(),
                 loc,
             });

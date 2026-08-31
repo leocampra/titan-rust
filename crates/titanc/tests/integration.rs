@@ -600,7 +600,10 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// no codegen). `chamada_de_metodo` e `tipo_option` continuam rejeitados,
 /// mas por outra camada: com `.` e `[` lexados e o parser sabendo indexação,
 /// a rejeição de `chamada_de_metodo` já não vem do lexer, e sim do parser não
-/// reconhecer `:` como início de chamada de método.
+/// reconhecer `:` como início de chamada de método. `break_fora_de_escopo`
+/// saiu desta tabela na T55 (Fase 4): `break` é keyword e vira caso positivo
+/// dentro de laço — os negativos de `break`/`continue` da T55 têm tabela
+/// própria, [`CASOS_FORA_DE_ESCOPO_FASE_4`].
 const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "retornos_multiplos",
@@ -618,11 +621,6 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "repeat_until",
         fonte: "function main(args: {string}): integer\n    repeat print(\"x\") until true\n    return 0\nend",
-        trecho_esperado: "Esperava um comando",
-    },
-    CasoNegativo {
-        nome: "break_fora_de_escopo",
-        fonte: "function main(args: {string}): integer\n    while true do\n        break\n    end\n    return 0\nend",
         trecho_esperado: "Esperava um comando",
     },
     CasoNegativo {
@@ -783,6 +781,131 @@ fn construcoes_fora_de_escopo_da_fase_3_produzem_erro_claro_sem_panic() {
     for caso in CASOS_FORA_DE_ESCOPO_FASE_3 {
         verifica_caso_negativo(caso, "fora-de-escopo-fase-3");
     }
+}
+
+/// Negativos da Fase 4 (PRD.md, T55): `break` é keyword e é aceito dentro de
+/// `while`/`for`, mas continua rejeitado fora de laço — agora por erro de
+/// tipos (`checker.rs`), não mais de sintaxe, já que o parser aceita `break`
+/// em qualquer posição de comando. `continue` nunca foi keyword (decisão
+/// técnica 7 do PRD.md) e é rejeitado explicando o motivo (o `for`
+/// desaçucarado para `while` teria seu incremento pulado).
+const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
+    CasoNegativo {
+        nome: "break_fora_de_laco",
+        fonte: "function main(args: {string}): integer\n    break\n    return 0\nend",
+        trecho_esperado: "`break` fora de um laço",
+    },
+    CasoNegativo {
+        nome: "break_depois_do_laco",
+        fonte: "function main(args: {string}): integer\n    while false do\n    end\n    break\n    return 0\nend",
+        trecho_esperado: "`break` fora de um laço",
+    },
+    CasoNegativo {
+        nome: "break_como_identificador",
+        // `break` deixou de ser identificador válido (quebra compatível,
+        // como `as` na T20 e `import` na T34): usá-lo como nome de variável
+        // agora é erro de sintaxe, não mais uma declaração comum.
+        fonte: "function main(args: {string}): integer\n    local break = 1\n    return 0\nend",
+        trecho_esperado: "Esperava um nome de variável",
+    },
+    CasoNegativo {
+        nome: "continue_em_while",
+        fonte: "function main(args: {string}): integer\n    while true do\n        continue\n    end\n    return 0\nend",
+        trecho_esperado: "`continue` não é suportado",
+    },
+    CasoNegativo {
+        nome: "continue_em_for",
+        fonte: "function main(args: {string}): integer\n    for i = 1, 10 do\n        continue\n    end\n    return 0\nend",
+        trecho_esperado: "`continue` não é suportado",
+    },
+    CasoNegativo {
+        nome: "continue_fora_de_laco",
+        // Fora de laço `continue` também é rejeitado — é a mesma checagem
+        // léxica/sintática, independente de haver ou não um laço em volta.
+        fonte: "function main(args: {string}): integer\n    continue\n    return 0\nend",
+        trecho_esperado: "`continue` não é suportado",
+    },
+];
+
+#[test]
+fn construcoes_fora_de_escopo_da_fase_4_produzem_erro_claro_sem_panic() {
+    for caso in CASOS_FORA_DE_ESCOPO_FASE_4 {
+        verifica_caso_negativo(caso, "fora-de-escopo-fase-4");
+    }
+}
+
+/// Critério de aceite da T55 (execução real): `break` sai de `while` e de
+/// `for` de verdade — não é só aceito pelo checker, o `break;` do Rust
+/// gerado realmente interrompe o laço no ponto certo. Compila fonte gerado
+/// em memória (não paga nenhuma capability pesada) e confere stdout e exit
+/// code do binário.
+#[test]
+fn compila_e_executa_break_saindo_de_while_e_de_for() {
+    let out_dir = temp_dir("break-execucao-real");
+
+    let source = concat!(
+        "function main(args: {string}): integer\n",
+        "    local i: integer = 1\n",
+        "    while true do\n",
+        "        if i > 3 then\n",
+        "            break\n",
+        "        end\n",
+        "        print(texto_de_i(i))\n",
+        "        i = i + 1\n",
+        "    end\n",
+        "    for j = 1, 10 do\n",
+        "        if j > 2 then\n",
+        "            break\n",
+        "        end\n",
+        "        print(texto_de_j(j))\n",
+        "    end\n",
+        "    return 0\n",
+        "end\n",
+        "\n",
+        "function texto_de_i(i: integer): string\n",
+        "    if i == 1 then\n",
+        "        return \"while-1\"\n",
+        "    elseif i == 2 then\n",
+        "        return \"while-2\"\n",
+        "    else\n",
+        "        return \"while-3\"\n",
+        "    end\n",
+        "end\n",
+        "\n",
+        "function texto_de_j(j: integer): string\n",
+        "    if j == 1 then\n",
+        "        return \"for-1\"\n",
+        "    else\n",
+        "        return \"for-2\"\n",
+        "    end\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "break_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de break: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("break_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./break_exec");
+    let esperado = "while-1\nwhile-2\nwhile-3\nfor-1\nfor-2\n";
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
 }
 
 /// Nomes de arquivos `.titan` **reais** do Titan original (relativos a

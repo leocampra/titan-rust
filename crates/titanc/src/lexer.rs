@@ -28,6 +28,10 @@
 //! A Fase 3 (T34 do PRD.md) acrescenta a palavra-chave `import`, usada para
 //! trazer uma capability para o programa. Como `as`, deixa de poder ser usada
 //! como identificador.
+//!
+//! A Fase 4 (T55 do PRD.md) acrescenta a palavra-chave `break`. Como `as` e
+//! `import`, deixa de poder ser usada como identificador. `continue` fica de
+//! fora (decisão técnica 7 do PRD.md) — não é keyword.
 
 use crate::ast::Loc;
 
@@ -80,6 +84,9 @@ pub enum TokenKind {
 
     // Palavra-chave de capabilities (Fase 3)
     KwImport,
+
+    // Palavra-chave de controle de laço (Fase 4, T55)
+    KwBreak,
 
     // Símbolos
     LParen,
@@ -145,6 +152,7 @@ pub const KEYWORDS: &[(&str, TokenKind)] = &[
     ("record", TokenKind::KwRecord),
     ("as", TokenKind::KwAs),
     ("import", TokenKind::KwImport),
+    ("break", TokenKind::KwBreak),
 ];
 
 /// Erro léxico com posição (`lexer.lua` reporta via `lpeglabel`; aqui viramos

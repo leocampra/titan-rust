@@ -249,6 +249,11 @@ pub enum TypedStat {
         target: TypedLValue,
         value: TypedExp,
     },
+    /// `break` (Fase 4, T55) — só produzido dentro de `while`/`for`;
+    /// `check_stat` rejeita fora de laço antes de chegar aqui.
+    Break {
+        loc: Loc,
+    },
 }
 
 /// Alvo de uma atribuição já verificado (T25 — estrutural; T29/T30 são quem
@@ -496,6 +501,10 @@ struct Checker {
     /// Local de declaração de cada campo de record — `(nome do record, nome
     /// do campo) -> Loc`, pela mesma razão de `record_def_locs`.
     field_def_locs: HashMap<(String, String), Loc>,
+    /// Profundidade de `while`/`for` aninhados (Fase 4, T55) — `break` só é
+    /// válido quando `> 0`. Incrementada/decrementada em `check_stat` ao
+    /// entrar/sair do bloco do laço.
+    loop_depth: usize,
 }
 
 /// Loc sentinela para símbolos sem declaração em arquivo Titan (builtins da
@@ -532,6 +541,7 @@ impl Checker {
             last_loc: Loc { line: 0, col: 0 },
             record_def_locs: HashMap::new(),
             field_def_locs: HashMap::new(),
+            loop_depth: 0,
         }
     }
 
@@ -1307,7 +1317,9 @@ impl Checker {
                 block,
             } => {
                 let condition = self.check_condition(condition, "while");
+                self.loop_depth += 1;
                 let block = self.check_stat(block, rettypes);
+                self.loop_depth -= 1;
                 Some(TypedStat::While {
                     loc: *loc,
                     condition: condition?,
@@ -1336,6 +1348,13 @@ impl Checker {
                     return None;
                 }
                 self.check_assign(*loc, &vars[0], &exps[0])
+            }
+            Stat::StatBreak { loc } => {
+                if self.loop_depth == 0 {
+                    self.error(*loc, "`break` fora de um laço (`while`/`for`).");
+                    return None;
+                }
+                Some(TypedStat::Break { loc: *loc })
             }
         }
     }
@@ -1441,7 +1460,9 @@ impl Checker {
         // Hover sobre a própria variável de controle no `for nome: tipo =
         // ...` (T49).
         self.record_use(decl.loc, decl.loc, &decl.name, &var_ty);
+        self.loop_depth += 1;
         let typed_block = self.check_stat(block, rettypes);
+        self.loop_depth -= 1;
         self.close_scope(decl.loc);
 
         Some(TypedStat::For {
@@ -2621,7 +2642,10 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
         TypedStat::While { block, .. } | TypedStat::For { block, .. } => {
             fixup_mutability(block, assigned);
         }
-        TypedStat::Call { .. } | TypedStat::Return { .. } | TypedStat::Assign { .. } => {}
+        TypedStat::Call { .. }
+        | TypedStat::Return { .. }
+        | TypedStat::Assign { .. }
+        | TypedStat::Break { .. } => {}
     }
 }
 
@@ -2709,7 +2733,8 @@ fn stat_loc(stat: &Stat) -> Loc {
         | Stat::StatAssign { loc, .. }
         | Stat::StatDecl { loc, .. }
         | Stat::StatCall { loc, .. }
-        | Stat::StatReturn { loc, .. } => *loc,
+        | Stat::StatReturn { loc, .. }
+        | Stat::StatBreak { loc, .. } => *loc,
     }
 }
 
