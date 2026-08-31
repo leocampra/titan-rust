@@ -241,6 +241,30 @@ fn texto_functions() -> Vec<CapabilityFn> {
     ]
 }
 
+/// Toda a superfície do `titan-io` (T54): `ler_arquivo` e `escrever_arquivo`,
+/// ambas função de módulo, sem receptor e sem tipo opaco — o mínimo para um
+/// compilador alcançar o próprio fonte. `texto` é puro; `io` toca o sistema
+/// (decisão 3 do PRD.md, Fase 4). Nenhuma mudança em checker ou codegen: o
+/// caminho de função de módulo já existe desde `data.read_csv` (T38/T41).
+fn io_functions() -> Vec<CapabilityFn> {
+    vec![
+        CapabilityFn {
+            titan_name: "ler_arquivo",
+            receiver: None,
+            rust_path: "titan_io::ler_arquivo",
+            params: Box::leak(Box::new([Type::String])),
+            rettype: Type::String,
+        },
+        CapabilityFn {
+            titan_name: "escrever_arquivo",
+            receiver: None,
+            rust_path: "titan_io::escrever_arquivo",
+            params: Box::leak(Box::new([Type::String, Type::String])),
+            rettype: Type::Nil,
+        },
+    ]
+}
+
 pub static CAPABILITIES: LazyLock<Vec<Capability>> = LazyLock::new(|| {
     vec![
         Capability {
@@ -256,6 +280,13 @@ pub static CAPABILITIES: LazyLock<Vec<Capability>> = LazyLock::new(|| {
             crate_path: "crates/titan-texto",
             opaque_types: &[],
             functions: Box::leak(texto_functions().into_boxed_slice()),
+        },
+        Capability {
+            titan_name: "io",
+            crate_name: "titan-io",
+            crate_path: "crates/titan-io",
+            opaque_types: &[],
+            functions: Box::leak(io_functions().into_boxed_slice()),
         },
     ]
 });
@@ -354,7 +385,7 @@ mod tests {
     fn capability_inexistente_reporta_lista_de_disponiveis() {
         // Mesma função de listagem que o checker (T38) usa para montar a
         // mensagem de erro "capability 'foo' não existe; disponíveis: ...".
-        assert_eq!(available_module_names(), vec!["data", "texto"]);
+        assert_eq!(available_module_names(), vec!["data", "texto", "io"]);
     }
 
     #[test]
@@ -367,6 +398,15 @@ mod tests {
         assert!(texto.find_function("para_inteiro").is_some());
         assert!(texto.find_function("de_inteiro").is_some());
         assert!(texto.find_function("tamanho").is_some());
+    }
+
+    #[test]
+    fn lookup_module_io_por_nome_titan() {
+        // Módulo real da T54: só funções, sem tipo opaco.
+        let io = lookup_module("io").expect("módulo io deveria existir");
+        assert!(io.opaque_types.is_empty());
+        assert!(io.find_function("ler_arquivo").is_some());
+        assert!(io.find_function("escrever_arquivo").is_some());
     }
 
     #[test]

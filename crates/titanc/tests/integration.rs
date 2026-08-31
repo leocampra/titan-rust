@@ -173,9 +173,7 @@ fn compila_e_executa_compostos_titan_conferindo_stdout_e_exit_code() {
     let binary = out_dir.join("compostos");
     assert!(binary.exists(), "esperava executável em {binary:?}");
 
-    let run_output = Command::new(&binary)
-        .output()
-        .expect("executa ./compostos");
+    let run_output = Command::new(&binary).output().expect("executa ./compostos");
     let esperado = "Estoque: Parafuso x10\n\
                     Apos reposicao: 15\n\
                     Original preservado: 5\n\
@@ -389,6 +387,108 @@ fn emit_rust_de_import_texto_compila_sem_erro() {
         "--emit-rust não deveria gerar build/"
     );
 
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Mesmo precedente de `emit_rust_de_import_texto_compila_sem_erro`, para o
+/// módulo `io` (T54): usa `--emit-rust` para não pagar o build real e
+/// confirma que `import io` mais uma chamada de cada função de módulo
+/// resolve e gera Rust sem erro.
+#[test]
+fn emit_rust_de_import_io_compila_sem_erro() {
+    let out_dir = temp_dir("emit-rust-import-io");
+
+    let source = concat!(
+        "import io\n\n",
+        "function main(args: {string}): integer\n",
+        "    local conteudo: string = io.ler_arquivo(\"caso.titan\")\n",
+        "    io.escrever_arquivo(\"saida.txt\", conteudo)\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "caso.titan", source);
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&output);
+    assert!(
+        output.status.success(),
+        "titanc --emit-rust falhou para `import io`: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("titan_io::ler_arquivo("),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("titan_io::escrever_arquivo("),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !out_dir.join("build").exists(),
+        "--emit-rust não deveria gerar build/"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T54 (execução real): um `.titan` que lê um arquivo
+/// e imprime seu tamanho compila e roda. Lê o próprio fonte gerado
+/// (`caso.titan`) por caminho relativo ao cwd do executável — igual ao
+/// precedente de `dados.titan` (T45), que também lê por caminho relativo.
+#[test]
+fn compila_e_executa_import_io_lendo_arquivo_e_imprimindo_tamanho() {
+    let out_dir = temp_dir("run-import-io");
+
+    let conteudo_arquivo = "abcde";
+    let arquivo_lido = write_source(&out_dir, "entrada.txt", conteudo_arquivo);
+
+    let source = concat!(
+        "import io\n",
+        "import texto\n\n",
+        "function main(args: {string}): integer\n",
+        "    local conteudo: string = io.ler_arquivo(\"entrada.txt\")\n",
+        "    local tam: integer = texto.tamanho(conteudo)\n",
+        "    print(texto.de_inteiro(tam))\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "caso.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar `import io`: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("caso");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .current_dir(&out_dir)
+        .output()
+        .expect("executa ./caso");
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        format!("{}\n", conteudo_arquivo.len())
+    );
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_file(&arquivo_lido);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
@@ -794,7 +894,10 @@ fn arquivos_que_a_fase_2_espera_compilar_compilam_de_verdade() {
 
         let binary_name = source_path.file_stem().unwrap().to_str().unwrap();
         let binary = out_dir.join(binary_name);
-        assert!(binary.exists(), "[{relativo}] esperava executável em {binary:?}");
+        assert!(
+            binary.exists(),
+            "[{relativo}] esperava executável em {binary:?}"
+        );
 
         let run_output = Command::new(&binary)
             .output()
