@@ -1,0 +1,282 @@
+import io
+import texto
+
+-- Lexer do Titan escrito em Titan (PRD.md, T56).
+--
+-- Prova de self-hosting da Fase 4: tokeniza um subconjunto do proprio Titan
+-- usando apenas o que a linguagem tem hoje. O estilo deselegante abaixo e
+-- deliberado, nao defeito (PRD.md, risco 4):
+--   - sem tipo soma, TokenKind vira `integer`, e as constantes viram funcoes
+--     sem argumento (TK_NAME(): integer return 1 end).
+--   - estado da varredura (posicao, linha, coluna) anda num `record` passado
+--     por parametro, porque reatribuir um parametro escalar e proibido
+--     (checker.rs:1293-1296) e a linguagem nao tem retorno multiplo.
+--   - tokens acumulam num `{Token}` via `res[#res + 1] = ...`.
+--
+-- Cobre o subconjunto que aparece em examples/nucleo.titan: identificadores e
+-- palavras-chave, inteiros, strings entre aspas duplas com escapes `\n \" \\`,
+-- comentarios de linha `--`, e os simbolos usados pelo idioma da Fase 1/2.
+
+record Estado
+    fonte: string
+    tamanho: integer
+    pos: integer
+    linha: integer
+    coluna: integer
+end
+
+record Token
+    kind: integer
+    lexeme: string
+    linha: integer
+    coluna: integer
+end
+
+function TK_EOF(): integer return 0 end
+function TK_NAME(): integer return 1 end
+function TK_INTEGER(): integer return 2 end
+function TK_STRING(): integer return 3 end
+function TK_KEYWORD(): integer return 4 end
+function TK_SYMBOL(): integer return 5 end
+
+function novo_estado(fonte: string): Estado
+    return {fonte = fonte, tamanho = texto.tamanho(fonte), pos = 1, linha = 1, coluna = 1}
+end
+
+function fim(e: Estado): boolean
+    return e.pos > e.tamanho
+end
+
+function atual(e: Estado): integer
+    if fim(e) then
+        return 0
+    end
+    return texto.byte(e.fonte, e.pos)
+end
+
+function avancar(e: Estado): nil
+    if texto.byte(e.fonte, e.pos) == 10 then
+        e.linha = e.linha + 1
+        e.coluna = 1
+    else
+        e.coluna = e.coluna + 1
+    end
+    e.pos = e.pos + 1
+end
+
+function eh_digito(b: integer): boolean
+    return b >= 48 and b <= 57
+end
+
+function eh_letra_ou_underscore(b: integer): boolean
+    return (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
+end
+
+function eh_alfanumerico(b: integer): boolean
+    return eh_letra_ou_underscore(b) or eh_digito(b)
+end
+
+function eh_espaco(b: integer): boolean
+    return b == 32 or b == 9 or b == 10 or b == 13
+end
+
+-- Consome espacos e comentarios de linha `-- ate o fim da linha`.
+function pular_trivia(e: Estado): nil
+    while true do
+        if eh_espaco(atual(e)) then
+            avancar(e)
+        elseif atual(e) == 45 and e.pos + 1 <= e.tamanho and texto.byte(e.fonte, e.pos + 1) == 45 then
+            avancar(e)
+            avancar(e)
+            while not fim(e) and atual(e) ~= 10 do
+                avancar(e)
+            end
+        else
+            break
+        end
+    end
+end
+
+function eh_palavra_chave(nome: string): boolean
+    return nome == "function" or nome == "local" or nome == "return" or nome == "end"
+        or nome == "true" or nome == "false" or nome == "nil"
+        or nome == "and" or nome == "or" or nome == "not"
+        or nome == "if" or nome == "then" or nome == "elseif" or nome == "else"
+        or nome == "while" or nome == "do" or nome == "for"
+        or nome == "boolean" or nome == "integer" or nome == "float" or nome == "string" or nome == "value"
+        or nome == "record" or nome == "as" or nome == "import" or nome == "break"
+end
+
+function lex_nome_ou_palavra_chave(e: Estado): Token
+    local linha: integer = e.linha
+    local coluna: integer = e.coluna
+    local inicio: integer = e.pos
+    while not fim(e) and eh_alfanumerico(atual(e)) do
+        avancar(e)
+    end
+    local nome: string = texto.sub(e.fonte, inicio, e.pos - 1)
+    if eh_palavra_chave(nome) then
+        return {kind = TK_KEYWORD(), lexeme = nome, linha = linha, coluna = coluna}
+    end
+    return {kind = TK_NAME(), lexeme = nome, linha = linha, coluna = coluna}
+end
+
+function lex_numero(e: Estado): Token
+    local linha: integer = e.linha
+    local coluna: integer = e.coluna
+    local inicio: integer = e.pos
+    while not fim(e) and eh_digito(atual(e)) do
+        avancar(e)
+    end
+    local lexeme: string = texto.sub(e.fonte, inicio, e.pos - 1)
+    return {kind = TK_INTEGER(), lexeme = lexeme, linha = linha, coluna = coluna}
+end
+
+-- Strings curtas entre aspas duplas, com escapes `\n \" \\`. Subconjunto
+-- deliberado: sem aspa simples, sem long string `[[...]]` (risco 4).
+function lex_string(e: Estado): Token
+    local linha: integer = e.linha
+    local coluna: integer = e.coluna
+    avancar(e) -- consome a aspa de abertura
+    local conteudo: string = ""
+    while not fim(e) and atual(e) ~= 34 do
+        if atual(e) == 92 and e.pos + 1 <= e.tamanho then
+            local prox: integer = texto.byte(e.fonte, e.pos + 1)
+            if prox == 110 then
+                conteudo = conteudo .. "\n"
+            elseif prox == 34 then
+                conteudo = conteudo .. "\""
+            elseif prox == 92 then
+                conteudo = conteudo .. "\\"
+            else
+                conteudo = conteudo .. texto.sub(e.fonte, e.pos + 1, e.pos + 1)
+            end
+            avancar(e)
+            avancar(e)
+        else
+            conteudo = conteudo .. texto.sub(e.fonte, e.pos, e.pos)
+            avancar(e)
+        end
+    end
+    if fim(e) then
+        print("erro lexico: string nao terminada na linha " .. linha)
+    else
+        avancar(e) -- consome a aspa de fechamento
+    end
+    return {kind = TK_STRING(), lexeme = conteudo, linha = linha, coluna = coluna}
+end
+
+-- Simbolos de um ou dois caracteres do subconjunto (Fase 1/2): parenteses,
+-- chaves, colchetes, virgula, dois-pontos, ponto-e-virgula, `.`/`..`, `#`,
+-- aritmeticos, relacionais e `=`. `~` isolado (fora de `~=`) e erro lexico.
+function lex_simbolo(e: Estado): Token
+    local linha: integer = e.linha
+    local coluna: integer = e.coluna
+    local b: integer = atual(e)
+
+    if b == 46 and e.pos + 1 <= e.tamanho and texto.byte(e.fonte, e.pos + 1) == 46 then
+        avancar(e)
+        avancar(e)
+        return {kind = TK_SYMBOL(), lexeme = "..", linha = linha, coluna = coluna}
+    end
+    if b == 61 and e.pos + 1 <= e.tamanho and texto.byte(e.fonte, e.pos + 1) == 61 then
+        avancar(e)
+        avancar(e)
+        return {kind = TK_SYMBOL(), lexeme = "==", linha = linha, coluna = coluna}
+    end
+    if b == 126 and e.pos + 1 <= e.tamanho and texto.byte(e.fonte, e.pos + 1) == 61 then
+        avancar(e)
+        avancar(e)
+        return {kind = TK_SYMBOL(), lexeme = "~=", linha = linha, coluna = coluna}
+    end
+    if b == 60 and e.pos + 1 <= e.tamanho and texto.byte(e.fonte, e.pos + 1) == 61 then
+        avancar(e)
+        avancar(e)
+        return {kind = TK_SYMBOL(), lexeme = "<=", linha = linha, coluna = coluna}
+    end
+    if b == 62 and e.pos + 1 <= e.tamanho and texto.byte(e.fonte, e.pos + 1) == 61 then
+        avancar(e)
+        avancar(e)
+        return {kind = TK_SYMBOL(), lexeme = ">=", linha = linha, coluna = coluna}
+    end
+
+    local lexeme: string = texto.sub(e.fonte, e.pos, e.pos)
+    avancar(e)
+    return {kind = TK_SYMBOL(), lexeme = lexeme, linha = linha, coluna = coluna}
+end
+
+function eh_simbolo_de_um_char(b: integer): boolean
+    return b == 40 or b == 41 or b == 123 or b == 125 or b == 91 or b == 93
+        or b == 44 or b == 58 or b == 59 or b == 46 or b == 35
+        or b == 43 or b == 45 or b == 42 or b == 47 or b == 37 or b == 94
+        or b == 61 or b == 60 or b == 62 or b == 126
+end
+
+function proximo_token(e: Estado): Token
+    pular_trivia(e)
+    if fim(e) then
+        return {kind = TK_EOF(), lexeme = "", linha = e.linha, coluna = e.coluna}
+    end
+    local b: integer = atual(e)
+    if eh_letra_ou_underscore(b) then
+        return lex_nome_ou_palavra_chave(e)
+    end
+    if eh_digito(b) then
+        return lex_numero(e)
+    end
+    if b == 34 then
+        return lex_string(e)
+    end
+    if eh_simbolo_de_um_char(b) then
+        return lex_simbolo(e)
+    end
+    local linha: integer = e.linha
+    local coluna: integer = e.coluna
+    avancar(e)
+    print("erro lexico: caractere inesperado (byte " .. b .. ") na linha " .. linha)
+    return {kind = TK_SYMBOL(), lexeme = "?", linha = linha, coluna = coluna}
+end
+
+function nome_kind(kind: integer): string
+    if kind == TK_EOF() then
+        return "EOF"
+    elseif kind == TK_NAME() then
+        return "NOME"
+    elseif kind == TK_INTEGER() then
+        return "INTEIRO"
+    elseif kind == TK_STRING() then
+        return "STRING"
+    elseif kind == TK_KEYWORD() then
+        return "PALAVRA_CHAVE"
+    end
+    return "SIMBOLO"
+end
+
+function imprimir_token(t: Token): nil
+    print(nome_kind(t.kind) .. " '" .. t.lexeme .. "' " .. t.linha .. ":" .. t.coluna)
+end
+
+function main(args: {string}): integer
+    if #args < 1 then
+        print("uso: lexer <arquivo.titan>")
+        return 1
+    end
+
+    local fonte: string = io.ler_arquivo(args[1])
+    local e: Estado = novo_estado(fonte)
+    local tokens: {Token} = {}
+
+    while true do
+        local t: Token = proximo_token(e)
+        tokens[#tokens + 1] = t
+        if t.kind == TK_EOF() then
+            break
+        end
+    end
+
+    for i: integer = 1, #tokens do
+        imprimir_token(tokens[i])
+    end
+
+    return 0
+end
