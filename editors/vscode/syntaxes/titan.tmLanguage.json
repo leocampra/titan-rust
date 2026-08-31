@@ -1,0 +1,172 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Titan",
+  "scopeName": "source.titan",
+  "fileTypes": ["titan"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#capabilities" },
+    { "include": "#records" },
+    { "include": "#functions" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.titan",
+          "begin": "--\\[(=*)\\[",
+          "beginCaptures": { "1": { "name": "punctuation.definition.comment.titan" } },
+          "end": "\\]\\1\\]"
+        },
+        {
+          "name": "comment.line.double-dash.titan",
+          "match": "--.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.other.multiline.titan",
+          "begin": "\\[(=*)\\[",
+          "beginCaptures": { "1": { "name": "punctuation.definition.string.titan" } },
+          "end": "\\]\\1\\]"
+        },
+        {
+          "name": "string.quoted.double.titan",
+          "begin": "\"",
+          "end": "\"|(?<!\\\\)$",
+          "patterns": [{ "include": "#escapes" }]
+        },
+        {
+          "name": "string.quoted.single.titan",
+          "begin": "'",
+          "end": "'|(?<!\\\\)$",
+          "patterns": [{ "include": "#escapes" }]
+        }
+      ]
+    },
+    "escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.titan",
+          "match": "\\\\[abfnrtv\\\\'\"\\n]"
+        },
+        {
+          "name": "invalid.illegal.escape.titan",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.titan",
+          "match": "\\b[0-9]+\\.[0-9]*([eE][+-]?[0-9]+)?\\b|\\b[0-9]+[eE][+-]?[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.titan",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.titan",
+          "match": "\\b(if|then|elseif|else|while|do|for|return|break)\\b"
+        },
+        {
+          "name": "keyword.other.titan",
+          "match": "\\b(function|local|end|record|as|import)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.titan",
+          "match": "\\b(and|or|not)\\b"
+        },
+        {
+          "name": "constant.language.titan",
+          "match": "\\b(true|false|nil)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.titan",
+          "match": "\\b(boolean|integer|float|string|value)\\b"
+        },
+        {
+          "name": "support.type.titan",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "capabilities": {
+      "patterns": [
+        {
+          "comment": "import <capability> (ex.: import data, import texto, import io)",
+          "match": "\\b(import)\\s+([a-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "keyword.other.titan" },
+            "2": { "name": "entity.name.namespace.titan" }
+          }
+        },
+        {
+          "comment": "membro de capability ou método de opaco: data.read_csv, df.soma",
+          "match": "\\b([a-z_][A-Za-z0-9_]*)(\\.)([a-z_][A-Za-z0-9_]*)\\b(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "entity.name.namespace.titan" },
+            "2": { "name": "punctuation.accessor.titan" },
+            "3": { "name": "entity.name.function.titan" }
+          }
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "comment": "declaração de função: function nome(",
+          "match": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "keyword.other.titan" },
+            "2": { "name": "entity.name.function.titan" }
+          }
+        },
+        {
+          "comment": "chamada de função: nome(",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\b(?=\\s*\\()",
+          "name": "entity.name.function.titan"
+        }
+      ]
+    },
+    "records": {
+      "patterns": [
+        {
+          "match": "\\b(record)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "1": { "name": "keyword.other.titan" },
+            "2": { "name": "entity.name.type.titan" }
+          }
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.titan",
+          "match": "==|~=|<=|>=|<|>|\\.\\.|=|\\+|-|\\*|/|%|\\^|#"
+        },
+        {
+          "name": "punctuation.separator.titan",
+          "match": "[,;:]"
+        }
+      ]
+    }
+  }
+}

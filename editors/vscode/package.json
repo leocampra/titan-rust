@@ -1,0 +1,62 @@
+{
+  "name": "titan-vscode",
+  "displayName": "Titan",
+  "description": "Suporte a Titan no VS Code: realce de sintaxe e language server (titan-lsp).",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:titan"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "titan",
+        "aliases": [
+          "Titan",
+          "titan"
+        ],
+        "extensions": [
+          ".titan"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "titan",
+        "scopeName": "source.titan",
+        "path": "./syntaxes/titan.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Titan",
+      "properties": {
+        "titan.serverPath": {
+          "type": "string",
+          "default": "titan-lsp",
+          "description": "Caminho para o binário titan-lsp. Por padrão, espera-o no PATH (ex.: após `cargo build --release` e adicionar target/release ao PATH, ou `cargo install --path crates/titan-lsp`)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}
