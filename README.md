@@ -6,11 +6,15 @@ como **especificação de referência** de gramática, AST e sistema de tipos �
 como base de código. Veja [`PRD.md`](PRD.md) para o plano de tarefas completo e
 [`docs/arquitetura.md`](docs/arquitetura.md) para o porquê das decisões abaixo.
 
-Estado atual: **Fase 3 ("Capability Runtimes")** — além do
-hello world da Fase 0, do núcleo da linguagem da Fase 1 e dos tipos
-compostos da Fase 2, o compilador já cobre `import`, módulos, tipos opacos e
-a capability `titan-data` (leitura de CSV e agregações sobre Polars), o
-suficiente para levar `examples/dados.titan` até um executável nativo.
+Estado atual: **Fase 4 ("Self-hosting / LSP")** — além do hello world da Fase
+0, do núcleo da linguagem da Fase 1, dos tipos compostos da Fase 2 e das
+capability runtimes da Fase 3 (`import`, módulos, tipos opacos, `titan-data`),
+o compilador agora expõe um language server (`titan-lsp`) que dá diagnóstico,
+hover, go-to-definition e autocomplete num `.titan` aberto no VS Code, e a
+linguagem ganhou `break`, a capability `texto` (acesso a texto por byte) e a
+capability `io` (leitura de arquivo) — o suficiente para
+`examples/lexer.titan`, um lexer do Titan escrito em Titan, tokenizar
+`examples/nucleo.titan`.
 
 ## Como compilar
 
@@ -84,6 +88,24 @@ módulo) e `df.soma("valor")` (método sobre o tipo opaco
 > programa sem `import data` nunca paga esse preço
 > ([ADR 0015](docs/adr/0015-api-data-como-contrato-backend-trocavel.md)).
 
+## Como rodar o exemplo da Fase 4 (self-hosting: lexer em Titan)
+
+```bash
+./target/release/titanc examples/lexer.titan
+./lexer examples/nucleo.titan
+echo $?
+# → 0
+```
+
+`examples/lexer.titan` importa `texto` e `io`, lê o `.titan` passado por
+`args`, tokeniza um subconjunto do idioma (identificadores, palavras-chave,
+inteiros, strings, comentários `--` e os símbolos da Fase 1/2) e imprime a
+lista de tokens — um pedaço do compilador rodando na própria linguagem
+([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)). O estilo é
+deliberadamente deselegante (constantes como função no lugar de tipo soma,
+estado da varredura num `record` passado por parâmetro no lugar de retorno
+múltiplo) — evidência do que falta para a Fase 5, não defeito desta.
+
 O `titanc` lê o `.titan`, gera um projeto Cargo temporário em `build/<nome>/`,
 compila-o com `cargo build --release` e copia o binário resultante para o
 diretório atual como `<nome>`.
@@ -108,6 +130,24 @@ titanc [--emit-rust] [--out DIR] [-v] <arquivo.titan>
 > O `titanc` **não** é instalado no PATH global nesta fase — invoque sempre
 > pelo caminho explícito (`./target/release/titanc` ou
 > `./target/debug/titanc`).
+
+## Como rodar o LSP e a extensão VS Code
+
+```bash
+cargo build --release
+```
+
+produz também `target/release/titan-lsp`, o language server (diagnósticos,
+hover, go-to-definition, autocomplete — T48/T49/T50). Ele conversa por
+stdio e nunca invoka o `cargo` — roda `lex → parse → check` em memória sobre
+o buffer do editor ([ADR 0018](docs/adr/0018-titanc-lib-lsp-reusa-pipeline.md)).
+
+O cliente é a extensão mínima em `editors/vscode/` (não publicada no
+marketplace nesta fase): `cd editors/vscode && npm install && npm run
+compile`, abrir essa pasta no VS Code e pressionar **F5** sobe uma janela
+com a extensão carregada — veja
+[`editors/vscode/README.md`](editors/vscode/README.md) para o passo a passo
+completo e como apontar `titan.serverPath` para o binário compilado.
 
 ## Testes
 
@@ -158,7 +198,17 @@ composto por herança de `is_composite`
 chamado com `.` em vez de `:`
 ([ADR 0014](docs/adr/0014-metodo-com-ponto-nao-dois-pontos.md)) e a API
 `data.*` como contrato estável sobre um backend (Polars) trocável
-([ADR 0015](docs/adr/0015-api-data-como-contrato-backend-trocavel.md)).
+([ADR 0015](docs/adr/0015-api-data-como-contrato-backend-trocavel.md)). A
+Fase 4 soma mais cinco: acesso a texto por capability, não builtins nem
+`s[i]` ([ADR 0016](docs/adr/0016-acesso-a-texto-por-capability.md)), `break`
+sem `continue`
+([ADR 0017](docs/adr/0017-break-sim-continue-nao.md)), `titanc` exposto
+como lib para o LSP reusar o pipeline
+([ADR 0018](docs/adr/0018-titanc-lib-lsp-reusa-pipeline.md)), `tower-lsp`
+com deps isoladas do `Cargo.toml` gerado
+([ADR 0019](docs/adr/0019-lsp-tower-lsp-deps-isoladas.md)) e self-hosting
+entregue por etapas, só o lexer nesta fase
+([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)).
 
 `titan/` e `lua/` (usado para checar comportamento de referência do Lua) são
 **somente leitura** neste repositório — repositórios de terceiros, nunca
@@ -167,34 +217,48 @@ editados.
 ## O que já está implementado
 
 Fase 0 (hello world) + Fase 1 (núcleo da linguagem) + Fase 2 (tipos
-compostos) + Fase 3 (capability runtimes):
+compostos) + Fase 3 (capability runtimes) + Fase 4 (self-hosting / LSP):
 
 - `function`/`local function`, `local x [: T] = exp`, `return`.
 - Operadores aritméticos `+ - * / % ^`, relacionais `== ~= < > <= >=`,
   lógicos `and or not`, unário `-`/`not`; `..` (concatenação, coage
   número→string).
 - Controle de fluxo: `if`/`elseif`/`else`, `while`, `for` numérico
-  (`for x = start, finish[, inc] do ... end`).
+  (`for x = start, finish[, inc] do ... end`), `break`
+  ([ADR 0017](docs/adr/0017-break-sim-continue-nao.md)).
 - Atribuição single-target: `nome = exp` para local já declarada, incluindo
   `v[i] = x` e `p.campo = x`.
 - Tipos compostos: `array` (`{T}`, literal, indexação `v[i]`, `#v`, mutação
   in-place por função via `&mut`), `record` (declaração `record Nome ... end`,
   literal exaustivo, leitura/escrita de campo `p.campo`) e `map`
   (`{K: V}`, `map_get`/`map_set` via indexação).
-- `import data` (declaração de topo, sem alias) e namespaces de módulo
-  (`data.read_csv(...)`, `data.DataFrame`).
+- `import data`/`import texto`/`import io` (declaração de topo, sem alias) e
+  namespaces de módulo (`data.read_csv(...)`, `texto.byte(...)`,
+  `io.ler_arquivo(...)`).
 - Tipos opacos de capability (`data.DataFrame`) e métodos com ponto sobre
   eles (`df.soma("valor")`, açúcar da forma de módulo
   `data.soma(df, "valor")`).
 - Capability runtime `titan-data`: leitura de CSV (`data.read_csv`),
   inspeção (`linhas`, `colunas`, `coluna_integer`/`coluna_float`) e
   agregação (`soma`, `media`, `minimo`, `maximo`) sobre Polars.
+- Capability runtime `titan-texto`: acesso a texto por byte (`byte`, `sub`,
+  `para_inteiro`, `de_inteiro`, `tamanho`)
+  ([ADR 0016](docs/adr/0016-acesso-a-texto-por-capability.md)).
+- Capability runtime `titan-io`: leitura de arquivo (`ler_arquivo`).
+- `titan-lsp`: diagnósticos, hover, go-to-definition e autocomplete sobre o
+  pipeline `lex → parse → check`, sem invocar o `cargo`
+  ([ADR 0018](docs/adr/0018-titanc-lib-lsp-reusa-pipeline.md),
+  [ADR 0019](docs/adr/0019-lsp-tower-lsp-deps-isoladas.md)), com extensão
+  mínima para VS Code (`editors/vscode/`).
+- `examples/lexer.titan`: lexer do Titan escrito em Titan, sobre `texto` e
+  `io` — prova de self-hosting parcial
+  ([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)).
 
 ## O que não está implementado ainda
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
-- `repeat`/`until`, `break`/`continue`, `for`-in.
+- `repeat`/`until`, `continue`, `for`-in.
 - Retornos múltiplos, multi-assign (`a, b = ...`).
 - Bitwise (`& | ~ << >>`), `//`.
 - `foreign import`, `import` com alias (`import data as d`),
@@ -203,7 +267,9 @@ Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 - Chamada de método com dois-pontos (`df:soma()`, forma do original — aqui
   só `.`).
 - `Option`/`?` e cast de tipo (`as`).
-- `titan-crypto`, `titan-ai` (fases 3b/3c) e self-hosting (fase 4).
+- Tipos soma (`enum`/`match`), parser e checker auto-hospedados (self-hosting
+  pleno, fase 5).
+- `titan-crypto`, `titan-ai` (fases 3b/3c).
 
 Qualquer construção fora desse subconjunto é rejeitada pelo `checker` (ou
 pelo `parser`, quando a sintaxe já é o problema) com uma mensagem de erro em
@@ -214,14 +280,20 @@ português, nunca com um panic.
 ```
 titan-rust/
 ├── crates/
-│   ├── titanc/          # o compilador: lexer, parser, checker, codegen, driver, CLI
+│   ├── titanc/          # o compilador como lib + bin: lexer, parser, checker, codegen, driver, CLI
 │   ├── titan-runtime/   # runtime mínimo (print, concat) chamado pelo Rust gerado
-│   └── titan-data/      # capability `data`: leitura de CSV e agregações sobre Polars
+│   ├── titan-data/      # capability `data`: leitura de CSV e agregações sobre Polars
+│   ├── titan-texto/     # capability `texto`: acesso a texto por byte
+│   ├── titan-io/        # capability `io`: leitura de arquivo
+│   └── titan-lsp/       # language server: diagnósticos, hover, go-to-definition, autocomplete
+├── editors/
+│   └── vscode/          # extensão mínima: realce de sintaxe + cliente do titan-lsp
 ├── examples/
 │   ├── hello.titan
 │   ├── nucleo.titan
 │   ├── compostos.titan
 │   ├── dados.titan
+│   ├── lexer.titan
 │   └── vendas.csv
 ├── docs/
 │   ├── arquitetura.md
