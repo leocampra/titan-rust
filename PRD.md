@@ -1859,8 +1859,8 @@ dois-pontos.
 | **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | ✅ **Concluída** |
 | 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
 | 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
-| **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ⬅ **próxima** (T47–T58) |
-| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | Pendente |
+| **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ✅ **Concluída** (T47–T58) |
+| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | ⬅ **próxima** |
 
 ---
 ---
@@ -2301,7 +2301,7 @@ multi-assign, declaração múltipla, `repeat`/`until`, `for`-in, bitwise
 | **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
 | **2. Tipos compostos** | arrays, maps, records, strings dinâmicas | ✅ **Concluída** |
 | **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | ✅ **Concluída** |
-| **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ⬅ **esta fase** (T47–T58) |
+| **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ✅ **Concluída** (T47–T58) |
 | 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
 | 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
-| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | Pendente |
+| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | ⬅ **próxima** |

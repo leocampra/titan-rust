@@ -15,14 +15,39 @@ flowchart LR
 
     rt["titan-runtime\n(print, concat)"] -.link em tempo de build.-> proj
     data["titan-data\n(import data:\nCSV + agregações\nsobre Polars)"] -.link só se houver `import`.-> proj
+    texto["titan-texto\n(import texto:\nbyte/sub/tamanho)"] -.link só se houver `import`.-> proj
+    io["titan-io\n(import io:\nler_arquivo)"] -.link só se houver `import`.-> proj
+
+    checker -.também consumido por.-> lsp["titan-lsp\n(2º consumidor do pipeline)"]
+    lexer -.também consumido por.-> lsp
+    parser -.também consumido por.-> lsp
+    lsp -->|publishDiagnostics/hover/\ncompletion, nunca cargo| editor["VS Code\n(editors/vscode)"]
 ```
 
-Cada seta é uma função pura de um módulo para o próximo — `lex(&str) ->
+Cada seta sólida é uma função pura de um módulo para o próximo — `lex(&str) ->
 Vec<Token>`, `parse(&[Token]) -> Program`, `check(&Program) -> TypedProgram`,
 `generate(&TypedProgram) -> String` — orquestradas por `driver::compile`, que é
 quem lê o arquivo, grava `build/<nome>/`, invoca o `cargo` como subprocesso e
 copia o binário final. `main.rs` só faz parsing de argumentos da CLI e chama
 `driver::compile`.
+
+## O LSP como segundo consumidor do pipeline
+
+Desde a Fase 4, `lex`/`parse`/`check` têm dois consumidores. O binário
+`titanc` (via `driver::compile`) roda o pipeline inteiro até `codegen` e
+`cargo build`. O `titan-lsp` (`crates/titan-lsp`) roda só até `check`, sobre o
+buffer do editor em memória, a cada `didOpen`/`didChange`, e **nunca invoca o
+`cargo`** — é o que torna o diagnóstico instantâneo em vez de levar o tempo de
+uma build completa. Isso só foi possível reusar porque as quatro etapas já
+eram funções puras e porque `titanc` virou biblioteca (`crates/titanc/src/
+lib.rs`, T47) — antes disso, os módulos eram privados a um binário e nada
+fora dele podia chamá-los ([ADR 0018](adr/0018-titanc-lib-lsp-reusa-pipeline.md)).
+
+O LSP soma `tower-lsp` + `tokio` + `serde_json` como dependências do
+**workspace do compilador**, isoladas do `Cargo.toml` gerado por programa —
+`collect_deps` (`driver.rs`) só itera capabilities importadas, e `titan-lsp`
+não é uma capability ([ADR 0019](adr/0019-lsp-tower-lsp-deps-isoladas.md)).
+A extensão VS Code em `editors/vscode/` é o único cliente desta fase.
 
 Todo erro em qualquer etapa (léxico, sintático, de tipo, de I/O, ou falha do
 próprio `cargo build`) vira uma variante de `Result`/enum de erro com posição
@@ -152,6 +177,35 @@ dependências do `Cargo.toml` gerado quando o programa de fato importa
 `data` — o `Cargo.toml` gerado não tem mais uma lista fixa de dependências;
 é montado por módulo importado, e um programa sem `import` nunca paga esse
 custo.
+
+A Fase 4 soma duas capabilities mais leves, no mesmo molde (crate próprio,
+entrada em `capabilities.rs`, sem tocar checker/codegen), sob o mesmo
+`collect_deps`:
+
+- **`texto`** (`import texto`, `crates/titan-texto`): acesso a texto por
+  byte — `byte`, `sub`, `para_inteiro`, `de_inteiro`, `tamanho`. Escolhida em
+  vez de builtins globais ou `s[i]`
+  ([ADR 0016](adr/0016-acesso-a-texto-por-capability.md)). Pura — nenhuma
+  chamada de sistema.
+- **`io`** (`import io`, `crates/titan-io`): `ler_arquivo(caminho): string`,
+  o mínimo para um programa Titan alcançar o próprio fonte. Ao contrário de
+  `texto`, toca o sistema — a separação entre as duas capabilities é
+  deliberada (decisão 3 do PRD.md, Fase 4).
+
+Juntas, `texto` e `io` são o que torna `examples/lexer.titan` (T56) possível
+— um lexer, escrito em Titan, que lê um `.titan` do disco e avança sobre seus
+bytes. Self-hosting é entregue por etapas: só o lexer nesta fase, parser e
+checker auto-hospedados ficam para a Fase 5
+([ADR 0020](adr/0020-self-hosting-por-etapas.md)).
+
+A Fase 4 também acrescenta `break` (T55) — o único item da fase que toca o
+compilador central, não o mecanismo de capability. `StatBreak` é o primeiro
+nó de AST realmente novo do projeto (nas fases anteriores `ast.rs` já vinha
+completa); `continue` fica deliberadamente de fora, porque o `for` numérico é
+desaçucarado para `while` com o incremento no fim do corpo
+([ADR 0004](adr/0004-for-desacucarado-para-while.md)) e um `continue`
+pularia esse incremento, travando o laço
+([ADR 0017](adr/0017-break-sim-continue-nao.md)).
 
 ## Duas armadilhas do Cargo (por que `driver.rs` faz o que faz)
 

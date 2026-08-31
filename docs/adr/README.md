@@ -17,3 +17,8 @@
 | [0013](0013-tipo-opaco-composto-por-heranca.md) | Tipo opaco `Type::Opaque`, composto por herança (exige `Clone`) |
 | [0014](0014-metodo-com-ponto-nao-dois-pontos.md) | Método chamado com `.`, não `:` (diverge do original) |
 | [0015](0015-api-data-como-contrato-backend-trocavel.md) | API `data.*` é o contrato; o backend (Polars) é detalhe interno trocável |
+| [0016](0016-acesso-a-texto-por-capability.md) | Acesso a texto por capability `texto`, não builtins globais nem `s[i]` |
+| [0017](0017-break-sim-continue-nao.md) | `break` sim, `continue` não (o `for` desaçucarado perderia o incremento) |
+| [0018](0018-titanc-lib-lsp-reusa-pipeline.md) | `titanc` exposto como lib: o LSP reusa o pipeline sem invocar o `cargo` |
+| [0019](0019-lsp-tower-lsp-deps-isoladas.md) | LSP sobre `tower-lsp`; deps do servidor nunca entram no `Cargo.toml` gerado |
+| [0020](0020-self-hosting-por-etapas.md) | Self-hosting por etapas: lexer na Fase 4, parser/checker na Fase 5 |
