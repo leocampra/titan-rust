@@ -1,5 +1,6 @@
-//! Language server do Titan (PRD.md, T48/T49): abre um `.titan` e mostra o
-//! erro sublinhado, o tipo sob o cursor e salta para a declaração.
+//! Language server do Titan (PRD.md, T48/T49/T50): abre um `.titan` e mostra
+//! o erro sublinhado, o tipo sob o cursor, salta para a declaração e
+//! completa símbolos, membros de módulo e métodos.
 //!
 //! Roda `lex → parse → check` sobre o buffer **em memória** a cada
 //! `didOpen`/`didChange`; nunca invoca o `cargo` (PRD.md, decisão 6 da Fase
@@ -17,12 +18,16 @@
 //! numa publicação só. `LexError`/`ParseError` param no primeiro erro; é uma
 //! limitação aceita nesta fase (ver PRD.md, T48).
 //!
-//! **Hover e go-to-definition (T49)** precisam do texto do buffer numa
-//! posição arbitrária, não só no momento de `didOpen`/`didChange` — por isso
-//! `Backend` guarda o último texto de cada documento em `documents`. Só
-//! respondem quando o buffer atual tipa sem erro (ver `analysis.rs`).
+//! **Hover, go-to-definition (T49) e autocomplete (T50)** precisam do texto
+//! do buffer numa posição arbitrária, não só no momento de
+//! `didOpen`/`didChange` — por isso `Backend` guarda o último texto de cada
+//! documento em `documents`. Hover/go-to-definition só respondem quando o
+//! buffer atual tipa sem erro (ver `analysis.rs`); autocomplete remenda o
+//! buffer antes de analisar, porque o texto no momento de completar quase
+//! nunca tipa (ver `completion.rs`).
 
 mod analysis;
+mod completion;
 mod diagnostics;
 
 use std::collections::HashMap;
@@ -74,6 +79,10 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string()]),
+                    ..CompletionOptions::default()
+                }),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -141,6 +150,17 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(analysis::definition_at(&checked, uri, position).map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let documents = self.documents.lock().await;
+        let Some(text) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let items = completion::complete(text, position);
+        Ok(Some(CompletionResponse::Array(items)))
     }
 }
 

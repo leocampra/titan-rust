@@ -138,6 +138,21 @@ impl SymTab {
     fn find_symbol(&self, name: &str) -> Option<&Symbol> {
         self.blocks.iter().rev().find_map(|block| block.get(name))
     }
+
+    /// Todos os nomes visíveis agora, do bloco mais externo ao mais interno —
+    /// um bloco interno sobrescreve o nome do externo (shadowing), no mesmo
+    /// espírito de `find_symbol`. Usado para o snapshot de escopo do
+    /// autocomplete (T50): `find_symbol` resolve *um* nome já sabido, isto
+    /// aqui lista *todos* para uma posição do cursor ainda sem nome nenhum.
+    fn visible_symbols(&self) -> HashMap<String, Symbol> {
+        let mut visible = HashMap::new();
+        for block in &self.blocks {
+            for (name, symbol) in block {
+                visible.insert(name.clone(), symbol.clone());
+            }
+        }
+        visible
+    }
 }
 
 // ---- AST tipada ---------------------------------------------------------
@@ -388,13 +403,38 @@ pub struct SymbolUse {
     pub type_name: String,
 }
 
+/// Um símbolo em escopo — o que o autocomplete de posição de expressão
+/// oferece (T50): nome, tipo formatado (para o `detail` do item) e se é
+/// módulo (`import data`, sem membro `.` de valor — completado à parte).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedSymbol {
+    pub name: String,
+    pub type_name: String,
+    pub is_module: bool,
+}
+
+/// Todos os símbolos visíveis num ponto do programa — snapshot tirado ao
+/// fechar cada bloco léxico (T50). Como `ast::Stat` não guarda a `Loc` de
+/// fechamento do bloco, o intervalo é aproximado pela `Loc` de abertura
+/// (`start`) até a última `Loc` vista dentro dele (`end`); blocos aninhados
+/// produzem snapshots aninhados, e o autocomplete escolhe o de intervalo mais
+/// estreito que contém o cursor (o mais interno).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeSnapshot {
+    pub start: Loc,
+    pub end: Loc,
+    pub symbols: Vec<ScopedSymbol>,
+}
+
 /// Saída completa de [`check`]: a AST tipada (o que `codegen` consome) mais
-/// o índice de usos que o LSP consome (T49). Separado de `TypedProgram` para
-/// não obrigar `codegen`, que não precisa do índice, a lidar com ele.
+/// os índices que o LSP consome — usos (T49) e escopos (T50). Separados de
+/// `TypedProgram` para não obrigar `codegen`, que não precisa deles, a lidar
+/// com eles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckedProgram {
     pub program: TypedProgram,
     pub uses: Vec<SymbolUse>,
+    pub scopes: Vec<ScopeSnapshot>,
 }
 
 /// Operador unário já resolvido (T13; `Len` acrescentado estruturalmente na
@@ -432,6 +472,13 @@ struct Checker {
     /// Índice colateral de usos resolvidos, para hover e go-to-definition
     /// (T49) — ver [`SymbolUse`].
     uses: Vec<SymbolUse>,
+    /// Índice colateral de escopos, para autocomplete em posição de
+    /// expressão (T50) — ver [`ScopeSnapshot`].
+    scopes: Vec<ScopeSnapshot>,
+    /// Última `Loc` vista durante a passada 2 — aproxima o fim de um bloco
+    /// (que `ast::Stat` não guarda) para fechar o intervalo de um
+    /// [`ScopeSnapshot`] quando o bloco fecha.
+    last_loc: Loc,
     /// Local de declaração do *nome* de cada record (a chave do `record ...
     /// end`), separado de `records` porque `Type::Record` não carrega `Loc`.
     record_def_locs: HashMap<String, Loc>,
@@ -470,9 +517,39 @@ impl Checker {
             records: HashMap::new(),
             modules: HashMap::new(),
             uses: Vec::new(),
+            scopes: Vec::new(),
+            last_loc: Loc { line: 0, col: 0 },
             record_def_locs: HashMap::new(),
             field_def_locs: HashMap::new(),
         }
+    }
+
+    /// Atualiza a última `Loc` vista (T50) — chamado de todo ponto que já
+    /// tinha uma `Loc` de statement/expressão em mãos, para o fim de um
+    /// [`ScopeSnapshot`] acompanhar o quão longe no arquivo o bloco chegou.
+    fn touch_loc(&mut self, loc: Loc) {
+        if (loc.line, loc.col) > (self.last_loc.line, self.last_loc.col) {
+            self.last_loc = loc;
+        }
+    }
+
+    /// Fecha o bloco atual da symtab e grava o snapshot dos símbolos que
+    /// estavam visíveis dentro dele (T50) — chamado em todo `close_block`
+    /// exceto o do escopo global (sem `open_block` correspondente).
+    fn close_scope(&mut self, start: Loc) {
+        let symbols = self
+            .st
+            .visible_symbols()
+            .into_iter()
+            .map(|(name, symbol)| ScopedSymbol {
+                is_module: matches!(symbol.kind, SymbolKind::Module { .. }),
+                type_name: type_name(&symbol.ty),
+                name,
+            })
+            .collect();
+        let end = self.last_loc;
+        self.st.close_block();
+        self.scopes.push(ScopeSnapshot { start, end, symbols });
     }
 
     /// Registra um uso resolvido (T49) — chamado do único lugar onde um nome
@@ -1002,7 +1079,7 @@ impl Checker {
 
                 let body = self.check_stat(block, &ret_types);
 
-                self.st.close_block();
+                self.close_scope(*loc);
 
                 let mut body = body?;
                 // Fix-up de mutabilidade (decisão 6): agora que todas as
@@ -1044,6 +1121,7 @@ impl Checker {
     }
 
     fn check_stat(&mut self, stat: &Stat, rettypes: &[Type]) -> Option<TypedStat> {
+        self.touch_loc(stat_loc(stat));
         match stat {
             Stat::StatBlock { loc, stats } => {
                 self.st.open_block();
@@ -1055,7 +1133,7 @@ impl Checker {
                         None => ok = false,
                     }
                 }
-                self.st.close_block();
+                self.close_scope(*loc);
                 if ok {
                     Some(TypedStat::Block {
                         loc: *loc,
@@ -1353,7 +1431,7 @@ impl Checker {
         // ...` (T49).
         self.record_use(decl.loc, decl.loc, &decl.name, &var_ty);
         let typed_block = self.check_stat(block, rettypes);
-        self.st.close_block();
+        self.close_scope(decl.loc);
 
         Some(TypedStat::For {
             loc,
@@ -1527,6 +1605,7 @@ impl Checker {
     /// depende dele), mas ele precisa atravessar todo `check_exp` para
     /// chegar até um `{...}` aninhado em qualquer posição.
     fn check_exp(&mut self, exp: &Exp, context: Option<&Type>) -> Option<TypedExp> {
+        self.touch_loc(exp_loc(exp));
         match exp {
             Exp::ExpNil { loc } => Some(TypedExp {
                 loc: *loc,
@@ -2607,6 +2686,42 @@ fn numeric_result(lhs: &Type, rhs: &Type) -> Type {
     }
 }
 
+/// `Loc` de um statement — todo braço de `ast::Stat` tem `loc` como primeiro
+/// campo; usado por `touch_loc` (T50) para aproximar o fim de um bloco.
+fn stat_loc(stat: &Stat) -> Loc {
+    match stat {
+        Stat::StatBlock { loc, .. }
+        | Stat::StatWhile { loc, .. }
+        | Stat::StatRepeat { loc, .. }
+        | Stat::StatIf { loc, .. }
+        | Stat::StatFor { loc, .. }
+        | Stat::StatAssign { loc, .. }
+        | Stat::StatDecl { loc, .. }
+        | Stat::StatCall { loc, .. }
+        | Stat::StatReturn { loc, .. } => *loc,
+    }
+}
+
+/// `Loc` de uma expressão — mesma ideia de [`stat_loc`], para `ast::Exp`.
+fn exp_loc(exp: &Exp) -> Loc {
+    match exp {
+        Exp::ExpNil { loc }
+        | Exp::ExpBool { loc, .. }
+        | Exp::ExpInteger { loc, .. }
+        | Exp::ExpFloat { loc, .. }
+        | Exp::ExpString { loc, .. }
+        | Exp::ExpInitList { loc, .. }
+        | Exp::ExpCall { loc, .. }
+        | Exp::ExpVar { loc, .. }
+        | Exp::ExpUnop { loc, .. }
+        | Exp::ExpConcat { loc, .. }
+        | Exp::ExpBinop { loc, .. }
+        | Exp::ExpCast { loc, .. }
+        | Exp::ExpAdjust { loc, .. }
+        | Exp::ExpExtra { loc, .. } => *loc,
+    }
+}
+
 /// Formata um tipo para mensagem de erro — e, desde a T49, para hover do
 /// LSP, que quer exatamente o mesmo texto que o checker já usa.
 pub fn type_name(ty: &Type) -> String {
@@ -2627,12 +2742,10 @@ pub fn type_name(ty: &Type) -> String {
     }
 }
 
-/// Verifica o programa por completo, produzindo a AST tipada (mais o índice
-/// de usos da T49, em [`CheckedProgram::uses`]) em caso de sucesso.
-///
-/// Nunca panic: qualquer construção fora do subconjunto suportado, ou erro de
-/// tipo, vira uma entrada em `Err`.
-pub fn check(program: &Program) -> Result<CheckedProgram, Vec<CheckError>> {
+/// Roda as duas passadas sobre `program`, devolvendo o `Checker` já
+/// preenchido (erros, `uses`, `scopes` e a AST tipada parcial) — [`check`] e
+/// [`check_partial`] são as duas formas de consumir esse resultado.
+fn run(program: &Program) -> (Checker, TypedProgram) {
     let mut checker = Checker::new();
 
     // Records primeiro (T29): uma função pode receber um record declarado
@@ -2651,13 +2764,60 @@ pub fn check(program: &Program) -> Result<CheckedProgram, Vec<CheckError>> {
         }
     }
 
+    // Snapshot do escopo global (T50) — funções top-level, módulos
+    // importados e `BUILTINS`, sem `close_block` correspondente porque este
+    // bloco nunca fecha de verdade (vive por todo o arquivo).
+    let global_scope = ScopeSnapshot {
+        start: Loc { line: 1, col: 1 },
+        end: checker.last_loc,
+        symbols: checker
+            .st
+            .visible_symbols()
+            .into_iter()
+            .map(|(name, symbol)| ScopedSymbol {
+                is_module: matches!(symbol.kind, SymbolKind::Module { .. }),
+                type_name: type_name(&symbol.ty),
+                name,
+            })
+            .collect(),
+    };
+    checker.scopes.push(global_scope);
+
+    (checker, typed_program)
+}
+
+/// Verifica o programa por completo, produzindo a AST tipada (mais o índice
+/// de usos da T49, em [`CheckedProgram::uses`]) em caso de sucesso.
+///
+/// Nunca panic: qualquer construção fora do subconjunto suportado, ou erro de
+/// tipo, vira uma entrada em `Err`.
+pub fn check(program: &Program) -> Result<CheckedProgram, Vec<CheckError>> {
+    let (checker, typed_program) = run(program);
+
     if checker.errors.is_empty() {
         Ok(CheckedProgram {
             program: typed_program,
             uses: checker.uses,
+            scopes: checker.scopes,
         })
     } else {
         Err(checker.errors)
+    }
+}
+
+/// Mesma análise de [`check`], mas devolve os índices colaterais (`uses`,
+/// `scopes`) **mesmo quando o programa tem erro de tipo** — o autocomplete
+/// de membro (T50) precisa resolver o tipo de um receptor (`df` em `df.`)
+/// justamente quando o buffer remendado ainda não tipa por completo (ex.:
+/// `data.titan_lsp_cursor()` não existe no módulo, um erro esperado). Não
+/// tem uso para `TypedProgram` nem para os erros — quem chama já sabe que o
+/// buffer é sintético e não vai reportá-los.
+pub fn check_partial(program: &Program) -> CheckedProgram {
+    let (checker, typed_program) = run(program);
+    CheckedProgram {
+        program: typed_program,
+        uses: checker.uses,
+        scopes: checker.scopes,
     }
 }
 

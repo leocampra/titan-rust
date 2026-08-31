@@ -350,3 +350,184 @@ fn goto_definition_sobre_chamada_salta_para_a_funcao() {
 
     client.shutdown_and_exit();
 }
+
+/// Extrai a lista de labels de uma resposta `textDocument/completion` — o
+/// resultado pode ser `CompletionItem[]` ou `CompletionList`, mas este
+/// servidor só devolve a forma array (`CompletionResponse::Array`).
+fn completion_labels(response: &Value) -> Vec<String> {
+    response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("esperava array de CompletionItem, obteve: {response:?}"))
+        .iter()
+        .map(|item| item["label"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Critério de aceite da T50: completar `data.` lista `read_csv`, `soma`,
+/// `media`, `minimo`, `maximo`.
+#[test]
+fn completar_data_ponto_lista_funcoes_do_modulo() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    // Linha 2: `    data.` — cursor logo após o `.`, coluna 9 (0-idx).
+    let source = "import data\n\
+                  function main(args: {string}): integer\n\
+                  \x20   data.\n\
+                  \x20   return 0\n\
+                  end";
+    let uri = "file:///teste_completar_modulo.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    client.wait_for_publish_diagnostics();
+
+    let response = client.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": 2, "character": 9},
+        }),
+    );
+
+    let labels = completion_labels(&response);
+    for esperado in ["read_csv", "soma", "media", "minimo", "maximo"] {
+        assert!(
+            labels.contains(&esperado.to_string()),
+            "completar 'data.' deveria listar '{esperado}', obteve: {labels:?}"
+        );
+    }
+    // `linhas`/`colunas`/`coluna_integer`/`coluna_float` só existem como
+    // método (`df.linhas()`), não como função de módulo (`data.linhas()`).
+    assert!(
+        !labels.contains(&"linhas".to_string()),
+        "'linhas' é só método, não deveria aparecer em 'data.': {labels:?}"
+    );
+
+    client.shutdown_and_exit();
+}
+
+/// Segundo contexto da T50: completar `df.` onde `df: data.DataFrame` lista
+/// os métodos do tipo opaco, não as funções de módulo.
+#[test]
+fn completar_variavel_de_tipo_opaco_lista_metodos() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    // Linha 3: `    df.` — cursor logo após o `.`, coluna 7 (0-idx).
+    let source = "import data\n\
+                  function main(args: {string}): integer\n\
+                  \x20   local df: data.DataFrame = data.read_csv(\"v.csv\")\n\
+                  \x20   df.\n\
+                  \x20   return 0\n\
+                  end";
+    let uri = "file:///teste_completar_metodo.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    client.wait_for_publish_diagnostics();
+
+    let response = client.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": 3, "character": 7},
+        }),
+    );
+
+    let labels = completion_labels(&response);
+    for esperado in ["linhas", "colunas", "coluna_integer", "coluna_float", "soma"] {
+        assert!(
+            labels.contains(&esperado.to_string()),
+            "completar 'df.' deveria listar o método '{esperado}', obteve: {labels:?}"
+        );
+    }
+    assert!(
+        !labels.contains(&"read_csv".to_string()),
+        "'read_csv' é função de módulo, não método — não deveria aparecer em 'df.': {labels:?}"
+    );
+
+    client.shutdown_and_exit();
+}
+
+/// Terceiro contexto da T50: em posição de expressão, completar lista
+/// símbolos em escopo (a variável local e o parâmetro da função) mais
+/// `BUILTINS` e palavras-chave.
+#[test]
+fn completar_em_posicao_de_expressao_lista_escopo_builtins_e_keywords() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    // Linha 2: `    local total: integer = ` — cursor no fim da linha,
+    // depois do `= `, coluna 27 (0-idx).
+    let source = "function main(args: {string}): integer\n\
+                  \x20   local x: integer = 1\n\
+                  \x20   local total: integer = \n\
+                  \x20   return 0\n\
+                  end";
+    let uri = "file:///teste_completar_expressao.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    client.wait_for_publish_diagnostics();
+
+    let response = client.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": 2, "character": 27},
+        }),
+    );
+
+    let labels = completion_labels(&response);
+    for esperado in ["x", "args", "print", "if", "while", "function"] {
+        assert!(
+            labels.contains(&esperado.to_string()),
+            "completar em posição de expressão deveria listar '{esperado}', obteve: {labels:?}"
+        );
+    }
+
+    client.shutdown_and_exit();
+}
