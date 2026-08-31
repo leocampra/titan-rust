@@ -1,0 +1,9 @@
+[package]
+name = "titan-io"
+description = "IO Runtime da linguagem Titan: leitura de arquivos, para o compilador alcançar o próprio fonte (T54)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
