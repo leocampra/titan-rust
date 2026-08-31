@@ -1,5 +1,5 @@
-//! Language server do Titan (PRD.md, T48): abre um `.titan` e mostra o erro
-//! sublinhado.
+//! Language server do Titan (PRD.md, T48/T49): abre um `.titan` e mostra o
+//! erro sublinhado, o tipo sob o cursor e salta para a declaração.
 //!
 //! Roda `lex → parse → check` sobre o buffer **em memória** a cada
 //! `didOpen`/`didChange`; nunca invoca o `cargo` (PRD.md, decisão 6 da Fase
@@ -16,9 +16,18 @@
 //! `checker::check` devolve `Vec<CheckError>` — todos os erros de tipo saem
 //! numa publicação só. `LexError`/`ParseError` param no primeiro erro; é uma
 //! limitação aceita nesta fase (ver PRD.md, T48).
+//!
+//! **Hover e go-to-definition (T49)** precisam do texto do buffer numa
+//! posição arbitrária, não só no momento de `didOpen`/`didChange` — por isso
+//! `Backend` guarda o último texto de cada documento em `documents`. Só
+//! respondem quando o buffer atual tipa sem erro (ver `analysis.rs`).
 
+mod analysis;
 mod diagnostics;
 
+use std::collections::HashMap;
+
+use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result as RpcResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -27,11 +36,18 @@ use diagnostics::compute_diagnostics;
 
 struct Backend {
     client: Client,
+    /// Último texto conhecido de cada documento aberto, por URI — hover e
+    /// go-to-definition (T49) reanalisam a partir daqui, já que os pedidos
+    /// do LSP para esses métodos carregam só a posição, não o texto.
+    documents: Mutex<HashMap<Url, String>>,
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
-        Backend { client }
+        Backend {
+            client,
+            documents: Mutex::new(HashMap::new()),
+        }
     }
 
     async fn publish_for(&self, uri: Url, text: &str) {
@@ -39,6 +55,11 @@ impl Backend {
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
+    }
+
+    async fn set_document(&self, uri: Url, text: String) {
+        self.publish_for(uri.clone(), &text).await;
+        self.documents.lock().await.insert(uri, text);
     }
 }
 
@@ -51,6 +72,8 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -71,7 +94,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.publish_for(params.text_document.uri, &params.text_document.text)
+        self.set_document(params.text_document.uri, params.text_document.text)
             .await;
     }
 
@@ -79,15 +102,45 @@ impl LanguageServer for Backend {
         // Sincronização FULL (anunciada em `initialize`): a última mudança
         // sempre carrega o texto completo do documento.
         if let Some(change) = params.content_changes.into_iter().next_back() {
-            self.publish_for(params.text_document.uri, &change.text)
+            self.set_document(params.text_document.uri, change.text)
                 .await;
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.documents.lock().await.remove(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
+    }
+
+    async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let documents = self.documents.lock().await;
+        let Some(text) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(checked) = analysis::analyze(text) else {
+            return Ok(None);
+        };
+        Ok(analysis::hover_at(&checked, position))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> RpcResult<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let documents = self.documents.lock().await;
+        let Some(text) = documents.get(&uri) else {
+            return Ok(None);
+        };
+        let Some(checked) = analysis::analyze(text) else {
+            return Ok(None);
+        };
+        Ok(analysis::definition_at(&checked, uri, position).map(GotoDefinitionResponse::Scalar))
     }
 }
 
