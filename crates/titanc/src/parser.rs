@@ -207,8 +207,8 @@ impl<'a> Parser<'a> {
         Ok(TopLevel::TopLevelRecord { loc, name, fields })
     }
 
-    fn parse_toplevel_func(&mut self, loc: Loc, islocal: bool) -> Result<TopLevel, ParseError> {
-        let (name, _) = self.expect_name("Esperava um nome de função após 'function'.")?;
+    fn parse_toplevel_func(&mut self, _loc: Loc, islocal: bool) -> Result<TopLevel, ParseError> {
+        let (name, loc) = self.expect_name("Esperava um nome de função após 'function'.")?;
 
         self.expect(
             &TokenKind::LParen,

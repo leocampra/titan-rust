@@ -7,12 +7,20 @@
 //! 4) — diferente de `driver::compile`, que gera Rust e builda de verdade.
 //!
 //! **Conversão de posição:** `ast::Loc` é 1-indexado e conta colunas em
-//! bytes; o LSP é 0-indexado e usa UTF-16 por padrão. Em vez de converter
-//! byte→UTF-16 a cada posição, o servidor anuncia `positionEncoding: "utf-8"`
-//! na resposta de `initialize` (permitido pela spec desde a 3.17, negociado
-//! via `general.positionEncodings` do cliente) — daí a conversão é só
-//! `line - 1` / `col - 1`. Sem isso, um `.titan` com acento (o projeto
-//! inteiro escreve em português) exporia posições erradas silenciosamente.
+//! caracteres Unicode (o lexer itera `.chars()`, não bytes); o LSP é
+//! 0-indexado e usa UTF-16 por padrão. A spec permite anunciar
+//! `positionEncoding: "utf-32"` em `initialize` para evitar essa conversão,
+//! mas **o cliente real desta fase não aceita** — `vscode-languageclient`
+//! só oferece `general.positionEncodings: ["utf-16"]` e derruba a conexão
+//! (`throw new Error("Unsupported position encoding...")`,
+//! `client.js:835`) se o servidor responder qualquer coisa diferente de
+//! `"utf-16"` (ou omitir o campo). Por isso o servidor anuncia
+//! `positionEncoding: "utf-16"` de verdade e converte char→UTF-16 em
+//! `loc_to_position`/`position_to_loc` (`analysis.rs`), em vez de
+//! `line - 1` / `col - 1` direto. Acentos do português (`ç`, `ã`, `é`...)
+//! são todos do BMP — 1 char, 1 unidade UTF-16 — então não expõem o erro; um
+//! caractere fora do BMP (ex. emoji, coberto em teste unitário) exigiria 2
+//! unidades UTF-16 e a conversão direta erraria a posição a partir dali.
 //!
 //! `checker::check` devolve `Vec<CheckError>` — todos os erros de tipo saem
 //! numa publicação só. `LexError`/`ParseError` param no primeiro erro; é uma
@@ -29,6 +37,7 @@
 mod analysis;
 mod completion;
 mod diagnostics;
+mod position;
 
 use std::collections::HashMap;
 
@@ -73,7 +82,7 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _params: InitializeParams) -> RpcResult<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                position_encoding: Some(PositionEncodingKind::UTF8),
+                position_encoding: Some(PositionEncodingKind::UTF16),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
@@ -126,14 +135,16 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> RpcResult<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let documents = self.documents.lock().await;
-        let Some(text) = documents.get(&uri) else {
+        // Clona o texto e solta o lock antes de analisar: o mutex só
+        // protege o `HashMap`, não o trabalho de lex/parse/check, que não
+        // precisa serializar requisições de documentos diferentes.
+        let Some(text) = self.documents.lock().await.get(&uri).cloned() else {
             return Ok(None);
         };
-        let Some(checked) = analysis::analyze(text) else {
+        let Some(checked) = analysis::analyze(&text) else {
             return Ok(None);
         };
-        Ok(analysis::hover_at(&checked, position))
+        Ok(analysis::hover_at(&checked, &text, position))
     }
 
     async fn goto_definition(
@@ -142,24 +153,25 @@ impl LanguageServer for Backend {
     ) -> RpcResult<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let documents = self.documents.lock().await;
-        let Some(text) = documents.get(&uri) else {
+        let Some(text) = self.documents.lock().await.get(&uri).cloned() else {
             return Ok(None);
         };
-        let Some(checked) = analysis::analyze(text) else {
+        let Some(checked) = analysis::analyze(&text) else {
             return Ok(None);
         };
-        Ok(analysis::definition_at(&checked, uri, position).map(GotoDefinitionResponse::Scalar))
+        Ok(
+            analysis::definition_at(&checked, &text, uri, position)
+                .map(GotoDefinitionResponse::Scalar),
+        )
     }
 
     async fn completion(&self, params: CompletionParams) -> RpcResult<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let documents = self.documents.lock().await;
-        let Some(text) = documents.get(&uri) else {
+        let Some(text) = self.documents.lock().await.get(&uri).cloned() else {
             return Ok(None);
         };
-        let items = completion::complete(text, position);
+        let items = completion::complete(&text, position);
         Ok(Some(CompletionResponse::Array(items)))
     }
 }

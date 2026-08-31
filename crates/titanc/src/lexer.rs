@@ -115,6 +115,38 @@ pub enum TokenKind {
     Eof,
 }
 
+/// Palavras-chave do léxico e o `TokenKind` que cada uma vira — fonte única
+/// de verdade para `lex_name_or_keyword` e para quem mais precisa da lista
+/// (ex.: autocomplete do LSP, `titan-lsp/src/completion.rs`), evitando uma
+/// segunda tabela desatualizável na mão.
+pub const KEYWORDS: &[(&str, TokenKind)] = &[
+    ("function", TokenKind::Function),
+    ("local", TokenKind::Local),
+    ("return", TokenKind::Return),
+    ("end", TokenKind::End),
+    ("true", TokenKind::True),
+    ("false", TokenKind::False),
+    ("nil", TokenKind::Nil),
+    ("and", TokenKind::And),
+    ("or", TokenKind::Or),
+    ("not", TokenKind::Not),
+    ("if", TokenKind::If),
+    ("then", TokenKind::Then),
+    ("elseif", TokenKind::Elseif),
+    ("else", TokenKind::Else),
+    ("while", TokenKind::While),
+    ("do", TokenKind::Do),
+    ("for", TokenKind::For),
+    ("boolean", TokenKind::KwBoolean),
+    ("integer", TokenKind::KwInteger),
+    ("float", TokenKind::KwFloat),
+    ("string", TokenKind::KwString),
+    ("value", TokenKind::KwValue),
+    ("record", TokenKind::KwRecord),
+    ("as", TokenKind::KwAs),
+    ("import", TokenKind::KwImport),
+];
+
 /// Erro léxico com posição (`lexer.lua` reporta via `lpeglabel`; aqui viramos
 /// um `Result` comum — nunca panic).
 #[derive(Debug, Clone, PartialEq)]
@@ -465,33 +497,9 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        match text.as_str() {
-            "function" => TokenKind::Function,
-            "local" => TokenKind::Local,
-            "return" => TokenKind::Return,
-            "end" => TokenKind::End,
-            "true" => TokenKind::True,
-            "false" => TokenKind::False,
-            "nil" => TokenKind::Nil,
-            "and" => TokenKind::And,
-            "or" => TokenKind::Or,
-            "not" => TokenKind::Not,
-            "if" => TokenKind::If,
-            "then" => TokenKind::Then,
-            "elseif" => TokenKind::Elseif,
-            "else" => TokenKind::Else,
-            "while" => TokenKind::While,
-            "do" => TokenKind::Do,
-            "for" => TokenKind::For,
-            "boolean" => TokenKind::KwBoolean,
-            "integer" => TokenKind::KwInteger,
-            "float" => TokenKind::KwFloat,
-            "string" => TokenKind::KwString,
-            "value" => TokenKind::KwValue,
-            "record" => TokenKind::KwRecord,
-            "as" => TokenKind::KwAs,
-            "import" => TokenKind::KwImport,
-            _ => TokenKind::Name(text),
+        match KEYWORDS.iter().find(|(kw, _)| *kw == text) {
+            Some((_, kind)) => kind.clone(),
+            None => TokenKind::Name(text),
         }
     }
 
