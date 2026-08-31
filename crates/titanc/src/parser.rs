@@ -852,9 +852,10 @@ impl<'a> Parser<'a> {
                     }),
                 };
             } else if self.check(&TokenKind::Dot) {
-                let loc = self.loc();
                 self.advance();
-                let (name, _) = self.expect_name("Esperava um nome de campo após '.'.")?;
+                // `loc` do nome do campo, não do `.` (T49: é o range que
+                // hover/go-to-definition do LSP precisam apontar).
+                let (name, loc) = self.expect_name("Esperava um nome de campo após '.'.")?;
                 exp = Exp::ExpVar {
                     loc,
                     var: Box::new(Var::VarDot {

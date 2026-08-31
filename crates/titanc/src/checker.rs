@@ -91,11 +91,14 @@ enum SymbolKind {
     Module { name: String },
 }
 
-/// Entrada da tabela de símbolos: o tipo e a origem do nome.
+/// Entrada da tabela de símbolos: o tipo, a origem do nome e onde foi
+/// declarado (T49 — go-to-definition precisa do local da declaração, que a
+/// symtab descartava antes de existir um consumidor).
 #[derive(Debug, Clone, PartialEq)]
 struct Symbol {
     ty: Type,
     kind: SymbolKind,
+    def_loc: Loc,
 }
 
 /// Pilha de escopos léxicos. Cada bloco é um `HashMap` de nome → símbolo.
@@ -118,11 +121,18 @@ impl SymTab {
         self.blocks.pop();
     }
 
-    fn add_symbol(&mut self, name: &str, ty: Type, kind: SymbolKind) {
+    fn add_symbol(&mut self, name: &str, ty: Type, kind: SymbolKind, def_loc: Loc) {
         self.blocks
             .last_mut()
             .expect("symtab sempre tem pelo menos um bloco")
-            .insert(name.to_string(), Symbol { ty, kind });
+            .insert(
+                name.to_string(),
+                Symbol {
+                    ty,
+                    kind,
+                    def_loc,
+                },
+            );
     }
 
     fn find_symbol(&self, name: &str) -> Option<&Symbol> {
@@ -360,6 +370,33 @@ impl BinOp {
     }
 }
 
+/// Uma ocorrência de nome resolvida com sucesso pela passada 2 — índice
+/// colateral para hover e go-to-definition (PRD.md, T49). Não influencia a
+/// checagem de tipos: só registra, no momento em que já é conhecido, o que
+/// a symtab (uma pilha de `HashMap` que some ao fechar o bloco) descartaria.
+///
+/// `use_loc`/`name` dão o range clicável no LSP (`use_loc` até
+/// `use_loc + name.chars().count()`); `def_loc` é para onde
+/// go-to-definition salta; `type_name` é o texto pronto para hover, já
+/// formatado por [`type_name`] — a mesma função que o checker usa nas
+/// mensagens de erro.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolUse {
+    pub use_loc: Loc,
+    pub def_loc: Loc,
+    pub name: String,
+    pub type_name: String,
+}
+
+/// Saída completa de [`check`]: a AST tipada (o que `codegen` consome) mais
+/// o índice de usos que o LSP consome (T49). Separado de `TypedProgram` para
+/// não obrigar `codegen`, que não precisa do índice, a lidar com ele.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedProgram {
+    pub program: TypedProgram,
+    pub uses: Vec<SymbolUse>,
+}
+
 /// Operador unário já resolvido (T13; `Len` acrescentado estruturalmente na
 /// T25 — `#v`/`#s`, sem produtor ainda: `check_unop` só mapeia `-`/`not` do
 /// parser).
@@ -392,7 +429,22 @@ struct Checker {
     /// T37), consultada por `resolve_type` (`data.DataFrame`) e por
     /// `check_call`/`check_var` (T39/T40) para membros do módulo.
     modules: HashMap<String, &'static crate::capabilities::Capability>,
+    /// Índice colateral de usos resolvidos, para hover e go-to-definition
+    /// (T49) — ver [`SymbolUse`].
+    uses: Vec<SymbolUse>,
+    /// Local de declaração do *nome* de cada record (a chave do `record ...
+    /// end`), separado de `records` porque `Type::Record` não carrega `Loc`.
+    record_def_locs: HashMap<String, Loc>,
+    /// Local de declaração de cada campo de record — `(nome do record, nome
+    /// do campo) -> Loc`, pela mesma razão de `record_def_locs`.
+    field_def_locs: HashMap<(String, String), Loc>,
 }
+
+/// Loc sentinela para símbolos sem declaração em arquivo Titan (builtins da
+/// stdlib, módulos `import`ados): não há para onde saltar no fonte do
+/// usuário, então go-to-definition sobre eles é ignorado pelo LSP em vez de
+/// apontar para um local sem sentido.
+const NO_DEF_LOC: Loc = Loc { line: 0, col: 0 };
 
 impl Checker {
     fn new() -> Self {
@@ -407,6 +459,7 @@ impl Checker {
                     rettypes: vec![b.rettype.clone()],
                 },
                 SymbolKind::Global,
+                NO_DEF_LOC,
             );
         }
         Checker {
@@ -416,7 +469,25 @@ impl Checker {
             assigned: HashSet::new(),
             records: HashMap::new(),
             modules: HashMap::new(),
+            uses: Vec::new(),
+            record_def_locs: HashMap::new(),
+            field_def_locs: HashMap::new(),
         }
+    }
+
+    /// Registra um uso resolvido (T49) — chamado do único lugar onde um nome
+    /// vira `TypedExpKind::Var`/`Callee`/`Field`, sempre com a `Loc` de
+    /// declaração já em mãos.
+    fn record_use(&mut self, use_loc: Loc, def_loc: Loc, name: &str, ty: &Type) {
+        if def_loc == NO_DEF_LOC {
+            return;
+        }
+        self.uses.push(SymbolUse {
+            use_loc,
+            def_loc,
+            name: name.to_string(),
+            type_name: type_name(ty),
+        });
     }
 
     fn error(&mut self, loc: Loc, message: impl Into<String>) {
@@ -476,6 +547,13 @@ impl Checker {
                 }
             }
             if ok {
+                // Go-to-definition (T49): local do nome do record e de cada
+                // campo, perdido depois que `Type::Record` guarda só nomes.
+                self.record_def_locs.insert(name.clone(), *loc);
+                for field in fields {
+                    self.field_def_locs
+                        .insert((name.clone(), field.name.clone()), field.loc);
+                }
                 raw.insert(name.clone(), fields.clone());
             }
         }
@@ -596,13 +674,26 @@ impl Checker {
                 }
             }
             if ok {
-                self.records.insert(
-                    name.clone(),
-                    Type::Record {
-                        name: name.clone(),
-                        fields: typed_fields,
-                    },
-                );
+                let record_ty = Type::Record {
+                    name: name.clone(),
+                    fields: typed_fields,
+                };
+                // Hover sobre o próprio nome do record e sobre cada campo na
+                // declaração `record ... end` (T49) — só dá para registrar
+                // aqui, depois que os campos têm `Type` resolvido.
+                if let Some(&def_loc) = self.record_def_locs.get(&name) {
+                    self.record_use(def_loc, def_loc, &name, &record_ty);
+                }
+                if let Type::Record { fields, .. } = &record_ty {
+                    for (fname, fty) in fields {
+                        if let Some(&floc) =
+                            self.field_def_locs.get(&(name.clone(), fname.clone()))
+                        {
+                            self.record_use(floc, floc, fname, fty);
+                        }
+                    }
+                }
+                self.records.insert(name.clone(), record_ty);
             } else {
                 // Resolução falhou (erro já reportado por `resolve_type`) —
                 // remove o placeholder para não deixar um record "fantasma"
@@ -661,14 +752,16 @@ impl Checker {
                     Some(types) => types,
                     None => return,
                 };
-                self.st.add_symbol(
-                    name,
-                    Type::Function {
-                        params: param_types,
-                        rettypes: ret_types,
-                    },
-                    SymbolKind::Global,
-                );
+                let fn_ty = Type::Function {
+                    params: param_types,
+                    rettypes: ret_types,
+                };
+                self.st
+                    .add_symbol(name, fn_ty.clone(), SymbolKind::Global, *loc);
+                // A própria declaração conta como "uso" de si mesma (T49):
+                // hover sobre o nome no `function nome(...)` também funciona,
+                // não só sobre as chamadas.
+                self.record_use(*loc, *loc, name, &fn_ty);
             }
             TopLevel::TopLevelVar { loc, .. } => {
                 self.error(
@@ -695,6 +788,7 @@ impl Checker {
                             SymbolKind::Module {
                                 name: modname.clone(),
                             },
+                            NO_DEF_LOC,
                         );
                     }
                     None => {
@@ -798,8 +892,15 @@ impl Checker {
                 self.error(*loc, "tipo opcional (`?`) não é suportado nesta fase.");
                 None
             }
-            ast::Type::TypeName { loc, name } => match self.records.get(name) {
-                Some(ty) => Some(ty.clone()),
+            ast::Type::TypeName { loc, name } => match self.records.get(name).cloned() {
+                Some(ty) => {
+                    // Go-to-definition (T49): anotação `x: Nome` salta para
+                    // o `record Nome ... end`.
+                    if let Some(&def_loc) = self.record_def_locs.get(name) {
+                        self.record_use(*loc, def_loc, name, &ty);
+                    }
+                    Some(ty)
+                }
                 None => {
                     self.error(*loc, format!("tipo '{name}' desconhecido."));
                     None
@@ -889,8 +990,14 @@ impl Checker {
 
                 self.st.open_block();
                 for (param, ty) in params.iter().zip(param_types.iter()) {
-                    self.st
-                        .add_symbol(&param.name, ty.clone(), SymbolKind::Param);
+                    self.st.add_symbol(
+                        &param.name,
+                        ty.clone(),
+                        SymbolKind::Param,
+                        param.loc,
+                    );
+                    // Hover sobre o próprio parâmetro na assinatura (T49).
+                    self.record_use(param.loc, param.loc, &param.name, ty);
                 }
 
                 let body = self.check_stat(block, &ret_types);
@@ -996,8 +1103,14 @@ impl Checker {
 
                 let decl_id = self.next_decl_id;
                 self.next_decl_id += 1;
-                self.st
-                    .add_symbol(&decl.name, ty.clone(), SymbolKind::Local { decl_id });
+                self.st.add_symbol(
+                    &decl.name,
+                    ty.clone(),
+                    SymbolKind::Local { decl_id },
+                    decl.loc,
+                );
+                // Hover sobre o próprio `local nome: tipo = ...` (T49).
+                self.record_use(decl.loc, decl.loc, &decl.name, &ty);
 
                 Some(TypedStat::Decl {
                     loc: *loc,
@@ -1230,8 +1343,15 @@ impl Checker {
         // A variável de controle vive num bloco próprio que não vaza para
         // fora do laço (o corpo `StatBlock` abre o seu por cima).
         self.st.open_block();
-        self.st
-            .add_symbol(&decl.name, var_ty.clone(), SymbolKind::ForVar);
+        self.st.add_symbol(
+            &decl.name,
+            var_ty.clone(),
+            SymbolKind::ForVar,
+            decl.loc,
+        );
+        // Hover sobre a própria variável de controle no `for nome: tipo =
+        // ...` (T49).
+        self.record_use(decl.loc, decl.loc, &decl.name, &var_ty);
         let typed_block = self.check_stat(block, rettypes);
         self.st.close_block();
 
@@ -1738,6 +1858,11 @@ impl Checker {
                 ok = false;
                 continue;
             }
+            // Go-to-definition (T49): `nome = valor` num construtor de
+            // record também é um uso do campo, não só `p.campo`.
+            if let Some(&def_loc) = self.field_def_locs.get(&(rname.to_string(), fname.clone())) {
+                self.record_use(field.loc, def_loc, fname, expected_ty);
+            }
             match self.check_exp(&field.exp, Some(expected_ty)) {
                 Some(typed) => {
                     if !expected_ty.compatible(&typed.ty) {
@@ -2016,11 +2141,14 @@ impl Checker {
                     self.error(*loc, format!("'{name}' é um módulo, não um valor."));
                     None
                 }
-                Some(symbol) => Some(TypedExp {
-                    loc: *loc,
-                    ty: symbol.ty,
-                    kind: TypedExpKind::Var(name.clone()),
-                }),
+                Some(symbol) => {
+                    self.record_use(*loc, symbol.def_loc, name, &symbol.ty);
+                    Some(TypedExp {
+                        loc: *loc,
+                        ty: symbol.ty,
+                        kind: TypedExpKind::Var(name.clone()),
+                    })
+                }
                 None => {
                     self.error(*loc, format!("'{name}' não foi declarado."));
                     None
@@ -2100,6 +2228,14 @@ impl Checker {
                     return None;
                 };
                 let field_ty = field_ty.clone();
+                // Go-to-definition (T49): salta para a declaração do campo
+                // dentro do `record ... end`, não para o record inteiro.
+                if let Some(&def_loc) = self
+                    .field_def_locs
+                    .get(&(rname.clone(), name.clone()))
+                {
+                    self.record_use(*loc, def_loc, name, &field_ty);
+                }
                 Some(TypedExp {
                     loc: *loc,
                     ty: field_ty,
@@ -2130,15 +2266,28 @@ impl Checker {
             return None;
         };
         match var.as_ref() {
-            Var::VarName { name, .. } => {
+            Var::VarName { loc: name_loc, name } => {
                 let Some(symbol) = self.st.find_symbol(name).cloned() else {
                     self.error(*loc, format!("função '{name}' não foi declarada."));
                     return None;
                 };
+                let def_loc = symbol.def_loc;
                 let Type::Function { params, rettypes } = symbol.ty else {
                     self.error(*loc, format!("'{name}' não é uma função."));
                     return None;
                 };
+                // `*name_loc` (posição do nome), não `*loc` (posição de toda
+                // a expressão de chamada, `f(...)` — T49 precisa do range do
+                // identificador, não do parêntese em diante).
+                self.record_use(
+                    *name_loc,
+                    def_loc,
+                    name,
+                    &Type::Function {
+                        params: params.clone(),
+                        rettypes: rettypes.clone(),
+                    },
+                );
                 Some((Callee::Direct(name.clone()), name.clone(), params, rettypes))
             }
             // `data.read_csv(...)` (T39): base é o símbolo de um módulo
@@ -2458,7 +2607,9 @@ fn numeric_result(lhs: &Type, rhs: &Type) -> Type {
     }
 }
 
-fn type_name(ty: &Type) -> String {
+/// Formata um tipo para mensagem de erro — e, desde a T49, para hover do
+/// LSP, que quer exatamente o mesmo texto que o checker já usa.
+pub fn type_name(ty: &Type) -> String {
     match ty {
         Type::Invalid => "<inválido>".to_string(),
         Type::Nil => "nil".to_string(),
@@ -2476,12 +2627,12 @@ fn type_name(ty: &Type) -> String {
     }
 }
 
-/// Verifica o programa por completo, produzindo a AST tipada em caso de
-/// sucesso.
+/// Verifica o programa por completo, produzindo a AST tipada (mais o índice
+/// de usos da T49, em [`CheckedProgram::uses`]) em caso de sucesso.
 ///
 /// Nunca panic: qualquer construção fora do subconjunto suportado, ou erro de
 /// tipo, vira uma entrada em `Err`.
-pub fn check(program: &Program) -> Result<TypedProgram, Vec<CheckError>> {
+pub fn check(program: &Program) -> Result<CheckedProgram, Vec<CheckError>> {
     let mut checker = Checker::new();
 
     // Records primeiro (T29): uma função pode receber um record declarado
@@ -2501,7 +2652,10 @@ pub fn check(program: &Program) -> Result<TypedProgram, Vec<CheckError>> {
     }
 
     if checker.errors.is_empty() {
-        Ok(typed_program)
+        Ok(CheckedProgram {
+            program: typed_program,
+            uses: checker.uses,
+        })
     } else {
         Err(checker.errors)
     }
@@ -2541,7 +2695,7 @@ mod tests {
             lex(source).unwrap_or_else(|e| panic!("fonte não deveria ter erro léxico: {e}"));
         let program =
             parse(&tokens).unwrap_or_else(|e| panic!("fonte não deveria ter erro sintático: {e}"));
-        check(&program)
+        check(&program).map(|checked| checked.program)
     }
 
     #[test]
@@ -3596,6 +3750,7 @@ end"#;
         });
         assert!(
             typed
+                .program
                 .iter()
                 .any(|t| matches!(t, TypedTopLevel::Record { name, .. } if name == "Ponto"))
         );
@@ -4142,3 +4297,6 @@ end"#;
         );
     }
 }
+
+
+

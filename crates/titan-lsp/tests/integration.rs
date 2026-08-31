@@ -1,4 +1,4 @@
-//! Teste de integração ponta a ponta do `titan-lsp` (PRD.md, T48): fala
+//! Teste de integração ponta a ponta do `titan-lsp` (PRD.md, T48/T49): fala
 //! JSON-RPC de verdade com o binário via stdin/stdout, no mesmo espírito do
 //! teste de `titanc/tests/integration.rs` — aciona o processo real, não as
 //! funções internas.
@@ -9,6 +9,10 @@
 //! `initialize` — este teste manda um `.titan` com acento (o projeto inteiro
 //! escreve em português) para expor um eventual erro de posicionamento que
 //! só apareceria em fonte não-ASCII.
+//!
+//! `hover_sobre_local_array_mostra_o_tipo` e
+//! `goto_definition_sobre_chamada_salta_para_a_funcao` cobrem os dois
+//! critérios de aceite da T49.
 
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -230,6 +234,118 @@ fn did_open_sem_erro_publica_lista_vazia_de_diagnosticos() {
     assert!(
         diagnostics.is_empty(),
         "programa válido não deveria gerar diagnósticos: {diagnostics:?}"
+    );
+
+    client.shutdown_and_exit();
+}
+
+/// Critério de aceite da T49: hover sobre uma variável local `{integer}`
+/// mostra o tipo formatado por `checker::type_name`.
+#[test]
+fn hover_sobre_local_array_mostra_o_tipo() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    // Linha 1: `    local qs: {integer} = {5, 3, 1, 4, 2}` — `qs` começa na
+    // coluna 11 (1-indexada, contagem em bytes: 4 espaços + "local " = 10).
+    let source = "function main(args: {string}): integer\n    local qs: {integer} = {5, 3, 1, 4, 2}\n    return 0\nend";
+    let uri = "file:///teste_hover.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    client.wait_for_publish_diagnostics();
+
+    let response = client.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": {"uri": uri},
+            // 0-indexado: linha 1 é `    local qs: ...`; coluna 11 (0-idx)
+            // cai em cima do `q` de `qs`.
+            "position": {"line": 1, "character": 11},
+        }),
+    );
+
+    let contents = &response["result"]["contents"];
+    let text = contents["value"]
+        .as_str()
+        .or_else(|| contents.as_str())
+        .expect("hover deveria ter contents de texto");
+    assert!(
+        text.contains("{integer}"),
+        "hover não mostrou o tipo esperado: {text}"
+    );
+
+    client.shutdown_and_exit();
+}
+
+/// Critério de aceite da T49: go-to-definition sobre a chamada de uma
+/// função salta para a declaração `function`.
+#[test]
+fn goto_definition_sobre_chamada_salta_para_a_funcao() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    // Linha 0: `function ajuda(): nil` — `ajuda` começa na coluna 9 (0-idx).
+    // Linha 4: `    ajuda()` — chamada a `ajuda` na coluna 4 (0-idx).
+    let source = "function ajuda(): nil\n\
+                  end\n\
+                  \n\
+                  function main(args: {string}): integer\n\
+                  \x20   ajuda()\n\
+                  \x20   return 0\n\
+                  end";
+    let uri = "file:///teste_definicao.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    client.wait_for_publish_diagnostics();
+
+    let response = client.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": 4, "character": 4},
+        }),
+    );
+
+    let result = &response["result"];
+    let range = if result.is_array() {
+        &result[0]["range"]
+    } else {
+        &result["range"]
+    };
+    assert_eq!(
+        range["start"]["line"].as_u64(),
+        Some(0),
+        "go-to-definition deveria saltar para a linha da `function ajuda`, resultado: {response:?}"
     );
 
     client.shutdown_and_exit();

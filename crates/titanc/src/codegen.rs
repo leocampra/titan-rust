@@ -1185,7 +1185,8 @@ mod tests {
                     .join("; ")
             )
         });
-        generate(&typed).unwrap_or_else(|e| panic!("erro de geração de código inesperado: {e}"))
+        generate(&typed.program)
+            .unwrap_or_else(|e| panic!("erro de geração de código inesperado: {e}"))
     }
 
     #[test]

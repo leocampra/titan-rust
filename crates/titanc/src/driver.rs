@@ -178,8 +178,8 @@ pub fn compile(opts: &Options) -> Result<PathBuf, CompileError> {
 
     let tokens = lexer::lex(&source)?;
     let program = parser::parse(&tokens)?;
-    let typed = checker::check(&program).map_err(CompileError::Check)?;
-    let rust_code = codegen::generate(&typed)?;
+    let checked = checker::check(&program).map_err(CompileError::Check)?;
+    let rust_code = codegen::generate(&checked.program)?;
 
     if opts.emit_rust {
         println!("{rust_code}");
