@@ -39,6 +39,12 @@
 //! - a prova ponta a ponta da Fase 3 (PRD.md, T45): compila e executa
 //!   `examples/dados.titan` — único caminho feliz desta suíte que paga o
 //!   build do Polars de propósito — conferindo stdout completo e exit code.
+//! - curadoria da Fase 4 (PRD.md, T57): `CASOS_FORA_DE_ESCOPO_FASE_4` fecha
+//!   com tipos soma (`enum`/`match`, sem sintaxe própria até a Fase 5),
+//!   `.titan` importando `.titan` (mesma rejeição de `import` com string da
+//!   T35) e `s[i]` (indexação de string, branch própria no checker); e o
+//!   risco 5 (Cargo.toml gerado nunca depender do LSP) é conferido dentro do
+//!   build de `hello.titan` já pago pelo caminho feliz, sem custo extra.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -110,6 +116,21 @@ fn compila_e_executa_hello_titan_conferindo_stdout_e_exit_code() {
     let run_output = Command::new(&binary).output().expect("executa ./hello");
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), "Olá, mundo!\n");
     assert_eq!(run_output.status.code(), Some(0));
+
+    // Risco 5 da Fase 4 (PRD.md, T57): `hello.titan` não tem `import`, então
+    // `collect_deps` (driver.rs) só deveria listar `titan-runtime`. Reusa o
+    // build já pago acima em vez de compilar de novo só para checar isso.
+    let cargo_toml =
+        std::fs::read_to_string(out_dir.join("build").join("hello").join("Cargo.toml"))
+            .expect("lê o Cargo.toml gerado");
+    assert!(
+        cargo_toml.contains("titan-runtime"),
+        "Cargo.toml gerado deveria depender de titan-runtime:\n{cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains("titan-lsp"),
+        "Cargo.toml gerado não deveria depender do LSP:\n{cargo_toml}"
+    );
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }
@@ -955,12 +976,18 @@ fn construcoes_fora_de_escopo_da_fase_3_produzem_erro_claro_sem_panic() {
     }
 }
 
-/// Negativos da Fase 4 (PRD.md, T55): `break` é keyword e é aceito dentro de
-/// `while`/`for`, mas continua rejeitado fora de laço — agora por erro de
-/// tipos (`checker.rs`), não mais de sintaxe, já que o parser aceita `break`
-/// em qualquer posição de comando. `continue` nunca foi keyword (decisão
-/// técnica 7 do PRD.md) e é rejeitado explicando o motivo (o `for`
-/// desaçucarado para `while` teria seu incremento pulado).
+/// Negativos da Fase 4 (PRD.md, T55 e T57): `break` é keyword e é aceito
+/// dentro de `while`/`for`, mas continua rejeitado fora de laço — agora por
+/// erro de tipos (`checker.rs`), não mais de sintaxe, já que o parser aceita
+/// `break` em qualquer posição de comando. `continue` nunca foi keyword
+/// (decisão técnica 7 do PRD.md) e é rejeitado explicando o motivo (o `for`
+/// desaçucarado para `while` teria seu incremento pulado). Os últimos três
+/// casos são a curadoria da T57 (risco 5 à parte, coberto em
+/// `compila_e_executa_hello_titan_conferindo_stdout_e_exit_code`): tipos soma
+/// e `match` seguem sem sintaxe própria (Fase 5, pendente — PRD.md linha
+/// 1889), `.titan` importando `.titan` cai na mesma rejeição de `import` com
+/// string (T35) e `s[i]` é indexação de string, fora de escopo por decisão
+/// explícita do checker.
 const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "break_fora_de_laco",
@@ -996,6 +1023,36 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         // léxica/sintática, independente de haver ou não um laço em volta.
         fonte: "function main(args: {string}): integer\n    continue\n    return 0\nend",
         trecho_esperado: "`continue` não é suportado",
+    },
+    CasoNegativo {
+        // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria —
+        // Fase 5, pendente. `enum` não é declaração de topo reconhecida.
+        nome: "tipo_soma_enum",
+        fonte: "enum Cor\n    Vermelho\n    Verde\n    Azul\nend\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "Esperava uma declaração de topo",
+    },
+    CasoNegativo {
+        nome: "tipo_soma_match",
+        // `match` não é keyword: dentro de um corpo de função, o parser
+        // simplesmente não reconhece o início de comando.
+        fonte: "function main(args: {string}): integer\n    local x: integer = 1\n    match x\n        1 -> print(\"um\")\n    end\n    return 0\nend",
+        trecho_esperado: "Esperava um comando",
+    },
+    CasoNegativo {
+        // `.titan` importando `.titan` cairia exatamente na forma `import`
+        // com string (T35): não há mecanismo de módulo de usuário na Fase 4,
+        // só as capabilities embutidas (`data`, `texto`, `io`).
+        nome: "titan_importando_titan",
+        fonte: "import \"outro.titan\"\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "nome de string não é suportado",
+    },
+    CasoNegativo {
+        nome: "indexacao_de_string",
+        // `s[i]` é rejeitado por decisão explícita do checker (branch própria
+        // para `Type::String` em `VarBracket`), distinta da rejeição
+        // genérica de indexar um tipo não indexável.
+        fonte: "function main(args: {string}): integer\n    local s: string = \"abc\"\n    local c: string = s[1]\n    return 0\nend",
+        trecho_esperado: "não é possível indexar uma string",
     },
 ];
 
