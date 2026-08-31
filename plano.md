@@ -886,3 +886,121 @@ de biblioteca, não de compilador.
 **Redox segue fora de escopo** — o alvo é Linux nativo via cargo.
 
 A lista de tarefas executável da Fase 3 (T34–T46) está no `PRD.md`.
+
+---
+
+# Fase 4 — Self-hosting / LSP
+
+As Fases 0–3 entregaram um compilador que leva um `.titan` até executável
+nativo e um mecanismo de capabilities provado por um runtime real. O roadmap
+sempre listou a Fase 4 como *"compilador escrito na própria linguagem —
+complexidade muito alta"*, mas nunca a detalhou. A investigação que abre a
+fase explica por quê: **self-hosting completo não cabe numa fase.**
+
+## A medição que recortou a fase
+
+Para escrever o `titanc` em Titan, faltam — em ordem de gravidade:
+
+| Lacuna | Onde é rejeitada | Consequência |
+|---|---|---|
+| Tipos soma (`enum`/`match`) | não existem em `types.rs` | um `Exp` de 13 variantes não tem representação |
+| Módulos de usuário | `driver.rs` lê **um** arquivo | o compilador teria de caber num único `.titan` |
+| Ler arquivo | não há capability de I/O | o compilador não alcança o próprio fonte |
+| Acesso a caractere | `checker.rs:2035` | um lexer não avança sobre o fonte |
+| `string` ↔ número | sem `tonumber`/`tostring` | literal numérico não vira valor |
+| `break`/`continue` | nem são keywords | laço de scan vira flag booleana |
+| Retornos múltiplos | `checker.rs:1483` | `(token, pos)` vira record ou `&mut` |
+
+O `checker.rs` sozinho tem 4144 linhas; sem módulos de usuário e sem tipos
+soma, reescrevê-lo em Titan produziria um arquivo único, com uma AST de
+records "gordos" e tags inteiras — um estilo que o próprio `titanc` não usa,
+o que anularia boa parte do valor do exercício.
+
+Do lado do LSP o quadro se inverte. Há um bloqueador estrutural, mas barato:
+o `titanc` é **só um binário** — `main.rs` declara os módulos como `mod`
+privados, sem `lib.rs`, então nada pode reusar o pipeline como biblioteca.
+Fora isso o terreno é bom, e por acidente feliz: `lex`/`parse`/`check`/
+`generate` são funções puras, todo erro já carrega `Loc { line, col }`, e
+`checker::check` já devolve `Vec<CheckError>` — vários diagnósticos de uma
+vez, que é exatamente o que um language server publica.
+
+Daí o recorte: **a fase entrega duas provas — o LSP em Rust, completo e
+demonstrável num editor, e a fundação de self-hosting, provada pelo lexer do
+Titan escrito em Titan.** Tipos soma, módulos de usuário e o parser/checker
+auto-hospedados ficam para a Fase 5.
+
+## As decisões desta fase
+
+**1. Acesso a texto por capability, não por builtin nem por `s[i]`.**
+`import texto` traz `texto.byte`, `texto.sub`, `texto.para_inteiro` e
+`texto.de_inteiro`. É a tese do plano aplicada a si mesma — capacidade, não
+biblioteca — e sai quase de graça: a ABI de argumentos já emite corretamente
+uma assinatura `(string, integer) -> integer`, então a capability é uma tabela
+mais um crate, sem tocar em checker nem codegen. As alternativas custariam
+mais: builtins globais exigiriam namespace numa tabela que hoje é plana, e
+`s[i]` seria assimétrico (leitura sim, escrita não) e ainda deixaria
+`sub`/`para_inteiro` sem casa.
+
+**2. `break` sim, `continue` não.** `break` mapeia direto para o `break` do
+Rust. `continue` não: o `for` numérico é desaçucarado para `while` com o
+incremento **no fim do corpo** (ADR 0004), então um `continue` pularia o
+incremento e produziria laço infinito — um bug silencioso, sem erro de
+compilação, no idioma mais comum de um lexer. Fica rejeitado com mensagem
+clara até a Fase 5 tratar o caso.
+
+**3. O `break` é o primeiro nó de AST realmente novo do projeto.** Nas fases
+anteriores a `ast.rs` já vinha completa e a tarefa era ensinar parser, checker
+e codegen a usá-la. Aqui não: o Titan original também não tem `break`
+(`ast.lua:33-42`), então o nó não existe em lugar nenhum. É trabalho pequeno,
+mas em cinco arquivos.
+
+**4. O LSP não invoca o `cargo`.** Ele roda `lex → parse → check` sobre o
+buffer em memória e para aí — nunca gera projeto, nunca compila. É o que torna
+o diagnóstico instantâneo, e é possível porque o pipeline já é feito de
+funções puras.
+
+**5. Protocolo por biblioteca (`tower-lsp`), semântica por conta própria.**
+Reimplementar o framing `Content-Length` e ~100 structs do LSP não é o
+trabalho interessante da fase. As dependências entram no workspace do
+compilador e **nunca** no `Cargo.toml` gerado por programa, que continua
+montado só a partir das capabilities de fato importadas.
+
+## O que a fase cobre
+
+```text
+LSP          titanc como lib  ·  diagnósticos  ·  hover  ·  go-to-definition
+             autocomplete  ·  extensão VS Code mínima
+Linguagem    break  ·  capability `texto` (byte, sub, para_inteiro, de_inteiro)
+             capability `io` (ler_arquivo)
+Prova        examples/lexer.titan — o lexer do Titan escrito em Titan
+```
+
+## O que continua fora
+
+Tipos soma e `match`, `continue`, módulos de usuário (um `.titan` importando
+outro), parser e checker auto-hospedados, `Option`/`?`, cast `as`, retornos
+múltiplos, multi-assign, `repeat`/`until`, `for`-in, bitwise, `//`,
+`foreign import`, `import` com alias e `df:metodo()`. Tudo segue rejeitado
+com mensagem clara em português, nunca com panic.
+
+Uma consequência assumida: **o `examples/lexer.titan` vai ficar deselegante.**
+Sem variáveis de topo, as constantes de `TokenKind` viram funções sem
+argumento (`function TK_IF(): integer return 1 end`); sem retornos múltiplos,
+a posição corrente anda num record de estado passado por `&mut`; sem tipos
+soma, o token carrega uma tag inteira. Isso é dado, não defeito — é a
+evidência empírica que justifica a Fase 5, e fica registrada no ADR 0020 em
+vez de disfarçada.
+
+## Divergências deliberadas, registradas em ADR
+
+| ADR | Decisão |
+|---|---|
+| 0016 | Acesso a texto por capability `texto`, não builtins globais nem `s[i]` |
+| 0017 | `break` sim, `continue` não (o `for` desaçucarado perderia o incremento) |
+| 0018 | `titanc` exposto como lib: o LSP reusa o pipeline sem invocar o `cargo` |
+| 0019 | LSP sobre `tower-lsp`; deps do servidor nunca entram no `Cargo.toml` gerado |
+| 0020 | Self-hosting por etapas: lexer na Fase 4, parser/checker na Fase 5 |
+
+**Redox segue fora de escopo** — o alvo é Linux nativo via cargo.
+
+A lista de tarefas executável da Fase 4 (T47–T58) está no `PRD.md`.
