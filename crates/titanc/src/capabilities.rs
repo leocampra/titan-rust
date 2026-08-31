@@ -196,14 +196,68 @@ fn data_functions() -> Vec<CapabilityFn> {
     functions
 }
 
+/// Toda a superfície do `titan-texto` (T53): cinco funções de módulo, sem
+/// receptor e sem tipo opaco — o mínimo que um lexer precisa para andar
+/// sobre o fonte. Nenhuma mudança em checker ou codegen: o caminho de função
+/// de módulo (`Capability::find_function`) já existe desde `data.read_csv`
+/// (T38/T41).
+fn texto_functions() -> Vec<CapabilityFn> {
+    vec![
+        CapabilityFn {
+            titan_name: "byte",
+            receiver: None,
+            rust_path: "titan_texto::byte",
+            params: Box::leak(Box::new([Type::String, Type::Integer])),
+            rettype: Type::Integer,
+        },
+        CapabilityFn {
+            titan_name: "sub",
+            receiver: None,
+            rust_path: "titan_texto::sub",
+            params: Box::leak(Box::new([Type::String, Type::Integer, Type::Integer])),
+            rettype: Type::String,
+        },
+        CapabilityFn {
+            titan_name: "para_inteiro",
+            receiver: None,
+            rust_path: "titan_texto::para_inteiro",
+            params: Box::leak(Box::new([Type::String])),
+            rettype: Type::Integer,
+        },
+        CapabilityFn {
+            titan_name: "de_inteiro",
+            receiver: None,
+            rust_path: "titan_texto::de_inteiro",
+            params: Box::leak(Box::new([Type::Integer])),
+            rettype: Type::String,
+        },
+        CapabilityFn {
+            titan_name: "tamanho",
+            receiver: None,
+            rust_path: "titan_texto::tamanho",
+            params: Box::leak(Box::new([Type::String])),
+            rettype: Type::Integer,
+        },
+    ]
+}
+
 pub static CAPABILITIES: LazyLock<Vec<Capability>> = LazyLock::new(|| {
-    vec![Capability {
-        titan_name: "data",
-        crate_name: "titan-data",
-        crate_path: "crates/titan-data",
-        opaque_types: DATA_OPAQUE_TYPES,
-        functions: Box::leak(data_functions().into_boxed_slice()),
-    }]
+    vec![
+        Capability {
+            titan_name: "data",
+            crate_name: "titan-data",
+            crate_path: "crates/titan-data",
+            opaque_types: DATA_OPAQUE_TYPES,
+            functions: Box::leak(data_functions().into_boxed_slice()),
+        },
+        Capability {
+            titan_name: "texto",
+            crate_name: "titan-texto",
+            crate_path: "crates/titan-texto",
+            opaque_types: &[],
+            functions: Box::leak(texto_functions().into_boxed_slice()),
+        },
+    ]
 });
 
 /// Busca um módulo de capability pelo nome usado em `import`.
@@ -300,7 +354,19 @@ mod tests {
     fn capability_inexistente_reporta_lista_de_disponiveis() {
         // Mesma função de listagem que o checker (T38) usa para montar a
         // mensagem de erro "capability 'foo' não existe; disponíveis: ...".
-        assert_eq!(available_module_names(), vec!["data"]);
+        assert_eq!(available_module_names(), vec!["data", "texto"]);
+    }
+
+    #[test]
+    fn lookup_module_texto_por_nome_titan() {
+        // Módulo real da T53: só funções, sem tipo opaco.
+        let texto = lookup_module("texto").expect("módulo texto deveria existir");
+        assert!(texto.opaque_types.is_empty());
+        assert!(texto.find_function("byte").is_some());
+        assert!(texto.find_function("sub").is_some());
+        assert!(texto.find_function("para_inteiro").is_some());
+        assert!(texto.find_function("de_inteiro").is_some());
+        assert!(texto.find_function("tamanho").is_some());
     }
 
     #[test]
