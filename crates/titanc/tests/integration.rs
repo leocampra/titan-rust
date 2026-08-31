@@ -337,6 +337,61 @@ fn emit_rust_de_import_data_compila_sem_erro() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+/// Mesmo precedente de `emit_rust_de_import_data_compila_sem_erro`, para o
+/// módulo `texto` (T53): usa `--emit-rust` para não pagar o build do crate
+/// real e confirma que `import texto` mais uma chamada de cada função de
+/// módulo resolve e gera Rust sem erro.
+#[test]
+fn emit_rust_de_import_texto_compila_sem_erro() {
+    let out_dir = temp_dir("emit-rust-import-texto");
+
+    let source = concat!(
+        "import texto\n\n",
+        "function main(args: {string}): integer\n",
+        "    local b: integer = texto.byte(\"abc\", 1)\n",
+        "    local s: string = texto.sub(\"abc\", 1, 2)\n",
+        "    local n: integer = texto.para_inteiro(\"42\")\n",
+        "    local t: string = texto.de_inteiro(n)\n",
+        "    local tam: integer = texto.tamanho(s)\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "caso.titan", source);
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&output);
+    assert!(
+        output.status.success(),
+        "titanc --emit-rust falhou para `import texto`: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("titan_texto::byte("), "stdout: {stdout}");
+    assert!(stdout.contains("titan_texto::sub("), "stdout: {stdout}");
+    assert!(
+        stdout.contains("titan_texto::para_inteiro("),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("titan_texto::de_inteiro("),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("titan_texto::tamanho("), "stdout: {stdout}");
+    assert!(
+        !out_dir.join("build").exists(),
+        "--emit-rust não deveria gerar build/"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 /// Um caso negativo: fonte, trecho esperado na mensagem de erro em stderr.
 struct CasoNegativo {
     nome: &'static str,

@@ -1,0 +1,9 @@
+[package]
+name = "titan-texto"
+description = "Texto Runtime da linguagem Titan: operações sobre strings em bytes, para o lexer escrito em Titan (T53)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

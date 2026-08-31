@@ -2753,6 +2753,10 @@ name = "titan-runtime"
 version = "0.1.0"
 
 [[package]]
+name = "titan-texto"
+version = "0.1.0"
+
+[[package]]
 name = "titanc"
 version = "0.1.0"
 dependencies = [
