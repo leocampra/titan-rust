@@ -34,9 +34,15 @@
 //! (`TypedProgram` e companhia) em vez de mutar a árvore original — é o que
 //! `codegen.rs` (T6) vai consumir.
 //!
+//! - **Retornos múltiplos** (T65): a assinatura aceita lista de tipos
+//!   (`: integer, integer`) e o `return` lista de valores, conferidos por
+//!   aridade e por posição. Uma chamada com N>1 retornos usada em posição de
+//!   expressão ajusta para o primeiro valor (`TypedExpKind::Adjust`); o
+//!   enésimo valor é `TypedExpKind::Extra`.
+//!
 //! Tudo fora do subconjunto (records, maps, arrays manipuláveis, `import`,
-//! `foreign import`, métodos, retornos múltiplos, `Option`/`?`) produz um
-//! erro semântico claro — nunca panic.
+//! `foreign import`, métodos, `Option`/`?`) produz um erro semântico claro —
+//! nunca panic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -371,6 +377,17 @@ pub enum TypedExpKind {
     },
     /// `{["a"] = 1}` desambiguado como map (T25 — estrutural; T33 constrói).
     MapLit(Vec<(TypedExp, TypedExp)>),
+    /// Ajuste de uma chamada com N>1 retornos usada em posição escalar
+    /// (T65 — o `ExpAdjust` de `ast.rs`): a chamada produz uma tupla e só o
+    /// primeiro valor interessa. O `ty` do `TypedExp` que envolve este nó já
+    /// é o do primeiro retorno; `exp` é sempre um `Call`.
+    Adjust(Box<TypedExp>),
+    /// `index`-ésimo (base 0) valor de retorno de uma chamada com N>1
+    /// retornos (T65 — o `ExpExtra` de `ast.rs`). `exp` é sempre um `Call`.
+    Extra {
+        exp: Box<TypedExp>,
+        index: usize,
+    },
 }
 
 /// Operador binário já resolvido (T13). Enum, não `String`, para o `match`
@@ -1265,7 +1282,13 @@ impl Checker {
                 })
             }
             Stat::StatCall { loc, callexp } => {
-                let call = self.check_exp(callexp, None)?;
+                // Chamada como statement descarta todos os retornos — não
+                // passa por `adjust_to_one` (T65), que é para posição de
+                // expressão.
+                let call = match callexp {
+                    Exp::ExpCall { loc, exp, args } => self.check_call(loc, exp, args)?.0,
+                    other => self.check_exp(other, None)?,
+                };
                 Some(TypedStat::Call { loc: *loc, call })
             }
             Stat::StatReturn { loc, exps } => {
@@ -1816,7 +1839,12 @@ impl Checker {
                     kind: TypedExpKind::Concat(typed_exps),
                 })
             }
-            Exp::ExpCall { loc, exp, args } => self.check_call(loc, exp, args),
+            // Chamada em posição de expressão: com N>1 retornos, ajusta
+            // para o primeiro valor (T65).
+            Exp::ExpCall { loc, exp, args } => {
+                let (call, rettypes) = self.check_call(loc, exp, args)?;
+                Some(self.adjust_to_one(call, &rettypes))
+            }
             Exp::ExpInitList { loc, fields } => self.check_init_list(*loc, fields, context),
             Exp::ExpUnop { loc, op, exp } => self.check_unop(*loc, op, exp),
             Exp::ExpBinop { loc, lhs, op, rhs } => self.check_binop(*loc, op, lhs, rhs),
@@ -1824,13 +1852,26 @@ impl Checker {
                 self.error(*loc, "cast de tipo (`as`) não é suportado nesta fase.");
                 None
             }
-            Exp::ExpAdjust { loc, .. } | Exp::ExpExtra { loc, .. } => {
-                self.error(
-                    *loc,
-                    "múltiplos valores de retorno não são suportados nesta fase.",
-                );
-                None
-            }
+            // `ExpAdjust`/`ExpExtra` (T65): nós de ajuste de retorno
+            // múltiplo. O parser não os produz a partir do fonte — quem
+            // monta o `Adjust` é o próprio `check_exp` no braço de
+            // `ExpCall` —, mas a AST os expõe e o checker os tipa de
+            // verdade em vez de rejeitá-los.
+            Exp::ExpAdjust { exp, .. } => match exp.as_ref() {
+                Exp::ExpCall {
+                    loc: call_loc,
+                    exp,
+                    args,
+                } => {
+                    let (call, rettypes) = self.check_call(call_loc, exp, args)?;
+                    Some(self.adjust_to_one(call, &rettypes))
+                }
+                // Ajustar o que já é escalar não muda nada.
+                other => self.check_exp(other, context),
+            },
+            Exp::ExpExtra {
+                loc, exp, index, ..
+            } => self.check_extra(*loc, exp, *index),
         }
     }
 
@@ -2681,7 +2722,17 @@ impl Checker {
         }
     }
 
-    fn check_call(&mut self, loc: &Loc, callee: &Exp, args: &Args) -> Option<TypedExp> {
+    /// Tipa uma chamada **crua**: devolve o `TypedExp` da chamada (cujo `ty`
+    /// é o do primeiro retorno) junto da lista completa de tipos de retorno
+    /// da assinatura. Quem chama decide o que fazer com os valores além do
+    /// primeiro — [`Self::adjust_to_one`] em posição de expressão, descarte
+    /// em posição de comando (T65).
+    fn check_call(
+        &mut self,
+        loc: &Loc,
+        callee: &Exp,
+        args: &Args,
+    ) -> Option<(TypedExp, Vec<Type>)> {
         let Args::ArgsFunc { args: arg_exps, .. } = args else {
             self.error(*loc, "chamada de método não é suportada nesta fase.");
             return None;
@@ -2765,19 +2816,76 @@ impl Checker {
             }
         }
 
-        // A Fase 0 só produz uma função de retorno único; `rettypes[0]`
-        // sempre existe porque toda assinatura coletada tem ao menos um tipo
-        // de retorno (`TypeNil` quando omitido).
+        // `rettypes[0]` sempre existe porque toda assinatura coletada tem ao
+        // menos um tipo de retorno (`TypeNil` quando omitido). Com N>1
+        // retornos (T65) o tipo da chamada crua é o do primeiro valor.
         let ty = rettypes.first().cloned().unwrap_or(Type::Nil);
 
+        Some((
+            TypedExp {
+                loc: *loc,
+                ty,
+                kind: TypedExpKind::Call {
+                    callee,
+                    args: typed_args,
+                },
+            },
+            rettypes,
+        ))
+    }
+
+    /// `ExpExtra` (T65): o `index`-ésimo (base 0) valor de retorno de uma
+    /// chamada. Só faz sentido sobre uma chamada, e o índice precisa existir
+    /// na assinatura.
+    fn check_extra(&mut self, loc: Loc, exp: &Exp, index: usize) -> Option<TypedExp> {
+        let Exp::ExpCall {
+            loc: call_loc,
+            exp,
+            args,
+        } = exp
+        else {
+            self.error(
+                loc,
+                "só uma chamada de função produz valores de retorno extras.",
+            );
+            return None;
+        };
+        // Chamada crua, sem passar por `adjust_to_one` — é justamente a
+        // aridade completa que interessa aqui.
+        let (inner, rettypes) = self.check_call(call_loc, exp, args)?;
+        let Some(ty) = rettypes.get(index).cloned() else {
+            self.error(
+                loc,
+                format!(
+                    "a chamada produz {} valor(es) de retorno, mas foi pedido o {}º.",
+                    rettypes.len(),
+                    index + 1
+                ),
+            );
+            return None;
+        };
         Some(TypedExp {
-            loc: *loc,
+            loc,
             ty,
-            kind: TypedExpKind::Call {
-                callee,
-                args: typed_args,
+            kind: TypedExpKind::Extra {
+                exp: Box::new(inner),
+                index,
             },
         })
+    }
+
+    /// Envolve uma chamada com N>1 retornos num `Adjust` — posição escalar
+    /// fica com o primeiro valor (T65). Uma chamada de retorno único passa
+    /// intacta, e o caso comum do programa continua exatamente como era.
+    fn adjust_to_one(&self, call: TypedExp, rettypes: &[Type]) -> TypedExp {
+        if rettypes.len() <= 1 {
+            return call;
+        }
+        TypedExp {
+            loc: call.loc,
+            ty: call.ty.clone(),
+            kind: TypedExpKind::Adjust(Box::new(call)),
+        }
     }
 }
 
@@ -4964,6 +5072,337 @@ end"#;
                 .iter()
                 .any(|e| e.to_string().contains("`continue` fora de um laço")),
             "{erros:?}"
+        );
+    }
+
+    // ---- T65: retornos múltiplos ----------------------------------------
+
+    /// Os comandos do corpo da função de nome `name` — `typed_body_stats`
+    /// assume a primeira função do programa, e os testes de retorno múltiplo
+    /// precisam olhar a `main` de um programa que declara `divmod` antes.
+    fn typed_stats_da_funcao(source: &str, name: &str) -> Vec<TypedStat> {
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let body = typed
+            .iter()
+            .find_map(|top| match top {
+                TypedTopLevel::Func { name: n, body, .. } if n == name => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("esperava a função '{name}' no programa tipado"));
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava TypedStat::Block como corpo");
+        };
+        stats.clone()
+    }
+
+    const DIVMOD: &str = "function divmod(a: integer, b: integer): integer, integer\n\
+                          \x20   return a // b, a % b\n\
+                          end\n";
+
+    /// O caso central da T65: uma assinatura com dois retornos tipa, e os
+    /// dois tipos chegam ao programa tipado.
+    #[test]
+    fn funcao_com_dois_retornos_tipa() {
+        let source = format!(
+            "{DIVMOD}\
+             function main(args: {{string}}): integer\n\
+             \x20   return 0\n\
+             end"
+        );
+        let typed = check_source(&source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let TypedTopLevel::Func { name, rettypes, .. } = &typed[0] else {
+            panic!("esperava TypedTopLevel::Func");
+        };
+        assert_eq!(name, "divmod");
+        assert_eq!(rettypes, &vec![Type::Integer, Type::Integer]);
+    }
+
+    /// `return` com menos valores que a assinatura reusa, sem mudança, a
+    /// checagem de aridade que já existia.
+    #[test]
+    fn return_com_aridade_menor_produz_erro_claro() {
+        let source = "function divmod(a: integer, b: integer): integer, integer\n\
+                      \x20   return a // b\n\
+                      end\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let erros = check_source(source).expect_err("esperava erro");
+        assert!(
+            erros.iter().any(|e| e
+                .to_string()
+                .contains("retornou 1 valor(es), mas a função espera 2")),
+            "{erros:?}"
+        );
+    }
+
+    /// E com valores demais, idem.
+    #[test]
+    fn return_com_aridade_maior_produz_erro_claro() {
+        let source = "function f(): integer\n\
+                      \x20   return 1, 2\n\
+                      end\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let erros = check_source(source).expect_err("esperava erro");
+        assert!(
+            erros.iter().any(|e| e
+                .to_string()
+                .contains("retornou 2 valor(es), mas a função espera 1")),
+            "{erros:?}"
+        );
+    }
+
+    /// Cada valor é conferido contra o tipo na sua posição, não só o
+    /// primeiro.
+    #[test]
+    fn tipo_incompativel_no_segundo_retorno_produz_erro_claro() {
+        let source = "function f(): integer, string\n\
+                      \x20   return 1, 2\n\
+                      end\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let erros = check_source(source).expect_err("esperava erro");
+        assert!(
+            erros.iter().any(|e| e
+                .to_string()
+                .contains("retorno incompatível: esperado string, encontrado integer")),
+            "{erros:?}"
+        );
+    }
+
+    /// Chamada de dois retornos em posição escalar ajusta para o primeiro
+    /// valor: o tipo é o do primeiro retorno e o nó vira um `Adjust`.
+    #[test]
+    fn chamada_de_dois_retornos_em_posicao_escalar_ajusta_para_o_primeiro() {
+        let source = format!(
+            "{DIVMOD}\
+             function main(args: {{string}}): integer\n\
+             \x20   local q: integer = divmod(7, 2)\n\
+             \x20   return q\n\
+             end"
+        );
+        let stats = typed_stats_da_funcao(&source, "main");
+        let TypedStat::Decl { ty, value, .. } = &stats[0] else {
+            panic!("esperava Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(ty, &Type::Integer);
+        assert_eq!(value.ty, Type::Integer);
+        let TypedExpKind::Adjust(inner) = &value.kind else {
+            panic!("esperava Adjust, obteve {:?}", value.kind);
+        };
+        assert!(
+            matches!(&inner.kind, TypedExpKind::Call { .. }),
+            "{:?}",
+            inner.kind
+        );
+    }
+
+    /// Chamada de retorno único não ganha envelope nenhum — o caso comum
+    /// continua exatamente como era.
+    #[test]
+    fn chamada_de_retorno_unico_nao_ganha_ajuste() {
+        let source = "function f(): integer\n\
+                      \x20   return 1\n\
+                      end\n\
+                      function main(args: {string}): integer\n\
+                      \x20   local x: integer = f()\n\
+                      \x20   return x\n\
+                      end";
+        let stats = typed_stats_da_funcao(source, "main");
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava Decl");
+        };
+        assert!(
+            matches!(&value.kind, TypedExpKind::Call { .. }),
+            "{:?}",
+            value.kind
+        );
+    }
+
+    /// Chamada como comando descarta os dois retornos e não passa pelo
+    /// ajuste — quem ajusta é a posição de expressão.
+    #[test]
+    fn chamada_de_dois_retornos_como_comando_nao_ganha_ajuste() {
+        let source = format!(
+            "{DIVMOD}\
+             function main(args: {{string}}): integer\n\
+             \x20   divmod(7, 2)\n\
+             \x20   return 0\n\
+             end"
+        );
+        let stats = typed_stats_da_funcao(&source, "main");
+        let TypedStat::Call { call, .. } = &stats[0] else {
+            panic!("esperava Call, obteve {:?}", stats[0]);
+        };
+        assert!(
+            matches!(&call.kind, TypedExpKind::Call { .. }),
+            "{:?}",
+            call.kind
+        );
+    }
+
+    /// O ajuste vale em qualquer posição de expressão, não só no `local`:
+    /// dentro de um operador o valor usado é o primeiro retorno.
+    #[test]
+    fn ajuste_vale_dentro_de_expressao() {
+        let source = format!(
+            "{DIVMOD}\
+             function main(args: {{string}}): integer\n\
+             \x20   return divmod(7, 2) + 1\n\
+             end"
+        );
+        let stats = typed_stats_da_funcao(&source, "main");
+        let TypedStat::Return { exps, .. } = &stats[0] else {
+            panic!("esperava Return");
+        };
+        let TypedExpKind::Binop { lhs, .. } = &exps[0].kind else {
+            panic!("esperava Binop");
+        };
+        assert!(
+            matches!(&lhs.kind, TypedExpKind::Adjust(_)),
+            "{:?}",
+            lhs.kind
+        );
+    }
+
+    /// `ExpExtra` — o nó que a AST expõe desde a Fase 0 — deixa de ser
+    /// rejeitado e passa a ser tipado pelo tipo do enésimo retorno.
+    #[test]
+    fn exp_extra_tipa_pelo_enesimo_retorno() {
+        let source = "function f(): integer, string\n\
+                      \x20   return 1, \"a\"\n\
+                      end\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let typed = check_source(source).expect("esperava sucesso");
+        assert_eq!(typed.len(), 2);
+
+        // O parser não produz `ExpExtra` a partir do fonte; o nó é montado
+        // aqui para exercitar o braço do checker.
+        let loc = Loc { line: 1, col: 1 };
+        let chamada = ast::Exp::ExpCall {
+            loc,
+            exp: Box::new(ast::Exp::ExpVar {
+                loc,
+                var: Box::new(ast::Var::VarName {
+                    loc,
+                    name: "f".to_string(),
+                }),
+            }),
+            args: ast::Args::ArgsFunc { loc, args: vec![] },
+        };
+        let fonte = ast::Exp::ExpExtra {
+            loc,
+            exp: Box::new(chamada),
+            index: 1,
+            r#type: None,
+        };
+
+        let mut checker = Checker::new();
+        checker.st.add_symbol(
+            "f",
+            Type::Function {
+                params: vec![],
+                rettypes: vec![Type::Integer, Type::String],
+            },
+            SymbolKind::Global,
+            loc,
+        );
+        let typed_exp = checker.check_exp(&fonte, None).expect("esperava sucesso");
+        assert_eq!(typed_exp.ty, Type::String);
+        assert!(
+            matches!(&typed_exp.kind, TypedExpKind::Extra { index: 1, .. }),
+            "{:?}",
+            typed_exp.kind
+        );
+    }
+
+    /// Repassar uma chamada de dois retornos num `return` de dois retornos
+    /// **não** expande a lista: a chamada em posição de expressão ajusta
+    /// para o primeiro valor (a regra desta tarefa), e a aridade acusa a
+    /// diferença com erro claro. A expansão do Lua fica fora do escopo da
+    /// T65 — o que importa aqui é que o caso não passa em silêncio nem
+    /// panica.
+    #[test]
+    fn repassar_chamada_de_dois_retornos_no_return_produz_erro_claro() {
+        let source = format!(
+            "{DIVMOD}\
+             function repassa(a: integer, b: integer): integer, integer\n\
+             \x20   return divmod(a, b)\n\
+             end\n\
+             function main(args: {{string}}): integer\n\
+             \x20   return 0\n\
+             end"
+        );
+        let erros = check_source(&source).expect_err("esperava erro");
+        assert!(
+            erros.iter().any(|e| e
+                .to_string()
+                .contains("retornou 1 valor(es), mas a função espera 2")),
+            "{erros:?}"
+        );
+    }
+
+    /// Índice além da assinatura é erro claro, não `panic` nem silêncio.
+    #[test]
+    fn exp_extra_com_indice_alem_da_assinatura_produz_erro_claro() {
+        let loc = Loc { line: 1, col: 1 };
+        let chamada = ast::Exp::ExpCall {
+            loc,
+            exp: Box::new(ast::Exp::ExpVar {
+                loc,
+                var: Box::new(ast::Var::VarName {
+                    loc,
+                    name: "f".to_string(),
+                }),
+            }),
+            args: ast::Args::ArgsFunc { loc, args: vec![] },
+        };
+        let fonte = ast::Exp::ExpExtra {
+            loc,
+            exp: Box::new(chamada),
+            index: 5,
+            r#type: None,
+        };
+
+        let mut checker = Checker::new();
+        checker.st.add_symbol(
+            "f",
+            Type::Function {
+                params: vec![],
+                rettypes: vec![Type::Integer, Type::String],
+            },
+            SymbolKind::Global,
+            loc,
+        );
+        assert!(checker.check_exp(&fonte, None).is_none());
+        assert!(
+            checker
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("valor(es) de retorno")),
+            "{:?}",
+            checker.errors
         );
     }
 }

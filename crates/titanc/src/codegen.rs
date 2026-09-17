@@ -338,6 +338,11 @@ fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::Ha
                 collect_referenced_names_exp(v, names);
             }
         }
+        // Ajuste de retorno múltiplo (T65): os nomes lidos são os da
+        // chamada envolvida.
+        TypedExpKind::Adjust(inner) | TypedExpKind::Extra { exp: inner, .. } => {
+            collect_referenced_names_exp(inner, names)
+        }
         TypedExpKind::Nil
         | TypedExpKind::Bool(_)
         | TypedExpKind::Integer(_)
@@ -683,6 +688,15 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::ArrayLit(elems) => emit_array_lit(elems, ctx),
         TypedExpKind::RecordLit { type_name, fields } => emit_record_lit(type_name, fields, ctx),
         TypedExpKind::MapLit(entries) => emit_map_lit(entries, ctx),
+        // Retorno múltiplo (T65): a chamada devolve uma tupla Rust e o
+        // ajuste é um acesso posicional. A **assinatura** e o `return` que
+        // produzem essa tupla são trabalho da T66 — até lá, um programa que
+        // use retorno múltiplo passa pelo checker e sai em `--emit-rust`,
+        // mas o Rust emitido só compila quando a T66 fechar o par.
+        TypedExpKind::Adjust(inner) => format!("{}.0", emit_exp(inner, ctx)),
+        TypedExpKind::Extra { exp: inner, index } => {
+            format!("{}.{index}", emit_exp(inner, ctx))
+        }
     }
 }
 

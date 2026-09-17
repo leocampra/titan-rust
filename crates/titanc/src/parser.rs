@@ -9,17 +9,18 @@
 //! local x [: T] = exp
 //! ```
 //!
-//! Statements: `StatCall`, `StatReturn`, `StatDecl`, `StatIf`, `StatWhile`,
-//! `StatRepeat` (T64), `StatFor` (numérico), `StatAssign` (single-target).
+//! Statements: `StatCall`, `StatReturn` (lista de valores desde a T65),
+//! `StatDecl`, `StatIf`, `StatWhile`, `StatRepeat` (T64), `StatFor`
+//! (numérico), `StatAssign` (single-target).
 //! Expressões: literais, `ExpVar`, `ExpCall`, `ExpConcat` (`..`) e
 //! `ExpBinop`/`ExpUnop` numa cascata de precedência que espelha
 //! `parser.lua:369-395` **por completo**, incluindo os níveis bitwise
 //! (`|`, `~`, `&`, `<<`, `>>`) e a divisão inteira `//` (T60).
-//! Tipos: `integer`, `float`, `boolean`, `string`, `nil`, `{T}`.
+//! Tipos: `integer`, `float`, `boolean`, `string`, `nil`, `{T}`, e a lista
+//! de tipos de retorno da assinatura (`: integer, integer`, T65).
 //!
 //! Tudo fora desse subconjunto (records, maps, arrays manipuláveis,
-//! `import`, retornos múltiplos, ...) produz um erro sintático claro — nunca
-//! panic.
+//! `import`, ...) produz um erro sintático claro — nunca panic.
 
 use crate::ast::{
     Args, Decl, Exp, Field, FieldName, Loc, Program, Stat, Then, TopLevel, Type, Var,
@@ -297,14 +298,19 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `[: Tipo]` — omitido vira `TypeNil` (`parser.lua:44-47`).
+    /// `[: Tipo {, Tipo}]` — omitido vira `TypeNil` (`parser.lua:44-47`).
+    /// A lista separada por vírgula é o lado da assinatura dos retornos
+    /// múltiplos (T65); um retorno só continua sendo o caso comum.
     fn parse_rettypes_opt(&mut self) -> Result<Vec<Type>, ParseError> {
         let loc = self.loc();
-        if self.eat(&TokenKind::Colon) {
-            Ok(vec![self.parse_type()?])
-        } else {
-            Ok(vec![Type::TypeNil { loc }])
+        if !self.eat(&TokenKind::Colon) {
+            return Ok(vec![Type::TypeNil { loc }]);
         }
+        let mut types = vec![self.parse_type()?];
+        while self.eat(&TokenKind::Comma) {
+            types.push(self.parse_type()?);
+        }
+        Ok(types)
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -601,6 +607,10 @@ impl<'a> Parser<'a> {
             && !self.check(&TokenKind::Eof)
         {
             exps.push(self.parse_exp()?);
+            // `return a, b` — a lista de valores dos retornos múltiplos (T65).
+            while self.eat(&TokenKind::Comma) {
+                exps.push(self.parse_exp()?);
+            }
         }
         self.eat(&TokenKind::Semicolon);
         Ok(Stat::StatReturn { loc, exps })
@@ -2302,5 +2312,99 @@ end"#;
     return 0
 end"#;
         assert!(parse_source(source).is_ok());
+    }
+
+    // ---- T65: retornos múltiplos na sintaxe ----------------------------
+
+    /// `: integer, integer` na assinatura vira uma lista de dois tipos.
+    #[test]
+    fn assinatura_aceita_lista_de_tipos_de_retorno() {
+        let program = parse_source(
+            "function divmod(a: integer, b: integer): integer, integer\n\
+             \x20   return a, b\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+
+        let TopLevel::TopLevelFunc { rettypes, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        assert_eq!(rettypes.len(), 2);
+        assert!(matches!(rettypes[0], Type::TypeInteger { .. }));
+        assert!(matches!(rettypes[1], Type::TypeInteger { .. }));
+    }
+
+    /// Um retorno só continua produzindo lista de um — nada de tupla de 1.
+    #[test]
+    fn assinatura_de_retorno_unico_continua_com_um_tipo() {
+        let program = parse_source(
+            "function f(): integer\n\
+             \x20   return 1\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { rettypes, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        assert_eq!(rettypes.len(), 1);
+        assert!(matches!(rettypes[0], Type::TypeInteger { .. }));
+    }
+
+    /// `return a, b` produz um `StatReturn` com duas expressões.
+    #[test]
+    fn return_aceita_lista_de_expressoes() {
+        let program = parse_source(
+            "function divmod(a: integer, b: integer): integer, integer\n\
+             \x20   return a // b, a % b\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatReturn { exps, .. } = &stats[0] else {
+            panic!("esperava StatReturn");
+        };
+        assert_eq!(exps.len(), 2);
+        assert!(matches!(&exps[0], Exp::ExpBinop { op, .. } if op == "//"));
+        assert!(matches!(&exps[1], Exp::ExpBinop { op, .. } if op == "%"));
+    }
+
+    /// `return` sem valor continua sendo lista vazia — a vírgula é opcional,
+    /// não obrigatória.
+    #[test]
+    fn return_sem_valor_continua_sem_expressoes() {
+        let program = parse_source(
+            "function f()\n\
+             \x20   return\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatReturn { exps, .. } = &stats[0] else {
+            panic!("esperava StatReturn");
+        };
+        assert!(exps.is_empty());
+    }
+
+    /// Vírgula pendurada na assinatura é erro de sintaxe, não silêncio.
+    #[test]
+    fn lista_de_tipos_de_retorno_com_virgula_pendurada_produz_erro() {
+        let err = parse_source(
+            "function f(): integer,\n\
+             \x20   return 1\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("tipo"), "{}", err.message);
     }
 }
