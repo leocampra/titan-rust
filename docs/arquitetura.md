@@ -207,6 +207,21 @@ desaçucarado para `while` com o incremento no fim do corpo
 pularia esse incremento, travando o laço
 ([ADR 0017](adr/0017-break-sim-continue-nao.md)).
 
+> A Fase 5 volta atrás nesse ponto: a T62 troca o template do `for` por um
+> `loop` com o incremento no **topo**
+> ([ADR 0022](adr/0022-for-como-loop-com-incremento-no-topo.md), que supera o
+> 0004), removendo o impeditivo que mantinha o `continue` fora da linguagem;
+> a T63 então o acrescenta, com `StatContinue` e o mesmo desenho de `break`
+> em cada camada — parser, checker (a mesma checagem de profundidade de laço)
+> e um `continue;` sem label no codegen
+> ([ADR 0023](adr/0023-continue-entra-com-o-incremento-no-topo.md), que supera
+> o "não" do 0017). A T64 fecha a família dos laços com `repeat`/`until`, o
+> nó que `ast.rs` carregava desde a Fase 0 sem nunca ter sido construído:
+> `loop { corpo; if cond { break; } }` no Rust gerado, e o `until` enxergando
+> os `local` do corpo como em Lua — o que obriga o checker a fechar o escopo
+> do bloco **depois** de tipar a condição, invertendo a ordem natural de
+> `open_block`/`close_block`.
+
 ## Duas armadilhas do Cargo (por que `driver.rs` faz o que faz)
 
 1. O `Cargo.toml` gerado em `build/<nome>/` leva um `[workspace]` **vazio**.

@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Statements: `StatCall`, `StatReturn`, `StatDecl`, `StatIf`, `StatWhile`,
-//! `StatFor` (numérico), `StatAssign` (single-target).
+//! `StatRepeat` (T64), `StatFor` (numérico), `StatAssign` (single-target).
 //! Expressões: literais, `ExpVar`, `ExpCall`, `ExpConcat` (`..`) e
 //! `ExpBinop`/`ExpUnop` numa cascata de precedência que espelha
 //! `parser.lua:369-395` **por completo**, incluindo os níveis bitwise
@@ -18,8 +18,8 @@
 //! Tipos: `integer`, `float`, `boolean`, `string`, `nil`, `{T}`.
 //!
 //! Tudo fora desse subconjunto (records, maps, arrays manipuláveis,
-//! `import`, retornos múltiplos, `repeat`/`until`, ...) produz um erro
-//! sintático claro — nunca panic.
+//! `import`, retornos múltiplos, ...) produz um erro sintático claro — nunca
+//! panic.
 
 use crate::ast::{
     Args, Decl, Exp, Field, FieldName, Loc, Program, Stat, Then, TopLevel, Type, Var,
@@ -379,10 +379,13 @@ impl<'a> Parser<'a> {
         let loc = self.loc();
         let mut stats = Vec::new();
         // `elseif`/`else` também terminam um bloco — quem os consome (ou
-        // rejeita, no caso de um bloco de função) é o chamador.
+        // rejeita, no caso de um bloco de função) é o chamador. `until`
+        // (T64) entra na mesma lista: é ele, e não `end`, que fecha o corpo
+        // de um `repeat`.
         while !self.check(&TokenKind::End)
             && !self.check(&TokenKind::Elseif)
             && !self.check(&TokenKind::Else)
+            && !self.check(&TokenKind::KwUntil)
             && !self.check(&TokenKind::Eof)
         {
             stats.push(self.parse_stat()?);
@@ -409,6 +412,10 @@ impl<'a> Parser<'a> {
             return self.parse_stat_while(loc);
         }
 
+        if self.eat(&TokenKind::KwRepeat) {
+            return self.parse_stat_repeat(loc);
+        }
+
         if self.eat(&TokenKind::For) {
             return self.parse_stat_for(loc);
         }
@@ -418,20 +425,15 @@ impl<'a> Parser<'a> {
             return Ok(Stat::StatBreak { loc });
         }
 
-        // `continue` virou keyword na T59, mas ainda não tem semântica: o
-        // `for` continua desaçucarado para `while` com o incremento no fim do
-        // corpo (T15, ADR 0004), então um `continue` pularia o incremento e
-        // daria laço infinito silencioso. A rejeição sai daqui quando a T65
-        // reabrir o ADR 0004 e o `for` deixar de ser desaçucarado.
-        if self.check(&TokenKind::KwContinue) {
-            return Err(ParseError {
-                message: "`continue` não é suportado: o `for` é desaçucarado para `while` \
-                          com o incremento no fim do corpo, e um `continue` pularia esse \
-                          incremento, causando um laço infinito silencioso. Reestruture o \
-                          laço com `if`/`break`."
-                    .to_string(),
-                loc,
-            });
+        // `continue` (T63): até a T62 esta posição carregava uma rejeição
+        // explícita, porque o `for` desaçucarado punha o incremento no fim do
+        // corpo e um `continue` pularia por cima dele (ADR 0017). Com o
+        // incremento no topo do `loop` (ADR 0022), a mensagem deixou de ser
+        // verdade e o comando entra como qualquer outro — a checagem de estar
+        // dentro de laço fica no checker, igual a `break`.
+        if self.eat(&TokenKind::KwContinue) {
+            self.eat(&TokenKind::Semicolon);
+            return Ok(Stat::StatContinue { loc });
         }
 
         // Chamada ou atribuição — desambiguadas sem backtracking, como no
@@ -443,8 +445,9 @@ impl<'a> Parser<'a> {
         }
         if !matches!(exp, Exp::ExpCall { .. }) {
             return Err(ParseError {
-                message: "Esperava um comando (`local`, `return`, `if`, `while`, `for`, \
-                          `break`, uma atribuição ou uma chamada de função)."
+                message: "Esperava um comando (`local`, `return`, `if`, `while`, `repeat`, \
+                          `for`, `break`, `continue`, uma atribuição ou uma chamada de \
+                          função)."
                     .to_string(),
                 loc,
             });
@@ -495,6 +498,31 @@ impl<'a> Parser<'a> {
             loc,
             condition,
             block: Box::new(block),
+        })
+    }
+
+    /// `repeat block until exp` (T64) — o único laço da linguagem que testa
+    /// a condição **no fim**, e por isso roda o corpo ao menos uma vez.
+    ///
+    /// Diferente de `while`/`for`, não há `do` nem `end`: quem abre é o
+    /// próprio `repeat` e quem fecha é o `until`, motivo pelo qual
+    /// [`Self::parse_block`] o reconhece como terminador de bloco. A
+    /// condição fica **fora** do `StatBlock` na AST, mas em Lua — e no Titan
+    /// — ela enxerga os `local` declarados no corpo; garantir isso é
+    /// trabalho do checker, que só fecha o escopo do corpo depois de tipar
+    /// o `until`.
+    fn parse_stat_repeat(&mut self, loc: Loc) -> Result<Stat, ParseError> {
+        let block = self.parse_block()?;
+        self.expect(
+            &TokenKind::KwUntil,
+            "Esperava 'until' para fechar o 'repeat'.",
+        )?;
+        let condition = self.parse_exp()?;
+        self.eat(&TokenKind::Semicolon);
+        Ok(Stat::StatRepeat {
+            loc,
+            block: Box::new(block),
+            condition,
         })
     }
 
@@ -2142,5 +2170,137 @@ end"#,
     fn operador_bitwise_sem_operando_direito_produz_erro_claro() {
         let err = parse_exp_source("1 |").unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    /// T63: `continue` deixou de ser rejeitado no parser (a mensagem do
+    /// ADR 0017 explicava que ele pularia o incremento do `for`, o que a T62
+    /// tornou falso) e passou a produzir `StatContinue`, exatamente como
+    /// `break` produz `StatBreak`.
+    #[test]
+    fn continue_produz_stat_continue() {
+        let source = r#"function main(args: {string}): integer
+    for i = 1, 5 do
+        continue
+    end
+    return 0
+end"#;
+        let program = parse_source(source).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava função");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava bloco");
+        };
+        let Stat::StatFor { block, .. } = &stats[0] else {
+            panic!("esperava for");
+        };
+        let Stat::StatBlock { stats, .. } = block.as_ref() else {
+            panic!("esperava bloco do for");
+        };
+        assert!(matches!(stats[0], Stat::StatContinue { .. }), "{stats:?}");
+    }
+
+    /// T64: `repeat` deixou de morrer em `parse_primary_exp` (onde caía
+    /// desde que a T59 o tornou keyword) e passou a produzir o
+    /// `StatRepeat` que a AST carrega desde a Fase 0 sem nunca ter sido
+    /// construído.
+    #[test]
+    fn repeat_produz_stat_repeat() {
+        let source = r#"function main(args: {string}): integer
+    repeat
+        print("x")
+    until true
+    return 0
+end"#;
+        let program = parse_source(source).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava função");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava bloco");
+        };
+        let Stat::StatRepeat {
+            block, condition, ..
+        } = &stats[0]
+        else {
+            panic!("esperava StatRepeat, obteve {:?}", stats[0]);
+        };
+        let Stat::StatBlock { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava bloco do repeat");
+        };
+        assert_eq!(corpo.len(), 1);
+        assert!(matches!(corpo[0], Stat::StatCall { .. }), "{corpo:?}");
+        assert!(matches!(condition, Exp::ExpBool { value: true, .. }));
+    }
+
+    /// `until` fecha o bloco no lugar do `end`: um `repeat` de uma linha só,
+    /// como o do caso negativo que a T64 aposentou, precisa parsear igual.
+    #[test]
+    fn repeat_de_uma_linha_parseia() {
+        let stats = stats_da_primeira_funcao(
+            "function f(): integer\n    repeat print(\"x\") until true\n    return 0\nend",
+        );
+        assert!(matches!(stats[0], Stat::StatRepeat { .. }), "{stats:?}");
+    }
+
+    /// O corpo do `repeat` é um bloco como qualquer outro: `break`,
+    /// `continue` e laços aninhados entram sem sintaxe própria.
+    #[test]
+    fn repeat_aninhado_e_com_break_continue() {
+        let stats = stats_da_primeira_funcao(
+            "function f(): integer\n\
+             \x20   repeat\n\
+             \x20       repeat\n\
+             \x20           continue\n\
+             \x20       until true\n\
+             \x20       break\n\
+             \x20   until false\n\
+             \x20   return 0\n\
+             end",
+        );
+        let Stat::StatRepeat { block, .. } = &stats[0] else {
+            panic!("esperava StatRepeat externo, obteve {:?}", stats[0]);
+        };
+        let Stat::StatBlock { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava bloco");
+        };
+        assert!(matches!(corpo[0], Stat::StatRepeat { .. }), "{corpo:?}");
+        assert!(matches!(corpo[1], Stat::StatBreak { .. }), "{corpo:?}");
+    }
+
+    /// `repeat` sem `until` não pode consumir o resto da função em silêncio:
+    /// o bloco para no `end` e o `expect` acusa o `until` que falta.
+    #[test]
+    fn repeat_sem_until_produz_erro_claro() {
+        let err = parse_source(
+            "function f(): integer\n    repeat\n        print(\"x\")\n    end\n    return 0\nend",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("until"), "{}", err.message);
+    }
+
+    /// A contrapartida de `until` terminar bloco (T64): fora de um `repeat`
+    /// ele para o bloco cedo, e quem estava esperando `end` — o corpo da
+    /// função, o `if`, o `while` — acusa a falta do `end` na posição do
+    /// `until`. O erro é claro e aponta a linha certa, que é o que importa;
+    /// o `until` órfão não passa em silêncio.
+    #[test]
+    fn until_fora_de_repeat_produz_erro_claro() {
+        let err =
+            parse_source("function f(): integer\n    until true\n    return 0\nend").unwrap_err();
+        assert!(err.message.contains("end"), "{}", err.message);
+        assert_eq!(err.loc.line, 2);
+    }
+
+    /// Fora de laço o parser **aceita** `continue` — quem rejeita é o
+    /// checker, pela profundidade de laço. Mesma divisão de camadas que
+    /// `break` tem desde a T55.
+    #[test]
+    fn continue_fora_de_laco_passa_pelo_parser() {
+        let source = r#"function main(args: {string}): integer
+    continue
+    return 0
+end"#;
+        assert!(parse_source(source).is_ok());
     }
 }

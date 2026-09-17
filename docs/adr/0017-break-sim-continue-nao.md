@@ -2,7 +2,12 @@
 
 ## Status
 
-Aceito.
+**Superado** pelo [ADR 0023](0023-continue-entra-com-o-incremento-no-topo.md)
+(PRD T63) na metade que dizia "`continue` não": o
+[ADR 0022](0022-for-como-loop-com-incremento-no-topo.md) moveu o incremento do
+`for` para o topo do laço, e a premissa abaixo — de que um `continue` pularia
+o incremento — deixou de ser verdade. A metade que dizia "`break` sim"
+permanece exatamente como está: `break` entrou na T55 e não mudou.
 
 ## Contexto
 
@@ -48,8 +53,13 @@ incremento do `for` desaçucarado — em vez de cair no erro genérico de
 > (`TokenKind::KwContinue`) junto com as outras seis que a fase precisa. Isso
 > não muda a decisão — a rejeição continua no parser, só que agora testando o
 > token em vez de comparar um `Name` com a string `"continue"`. A decisão em
-> si só cai quando a T65 reabrir o [ADR 0004](0004-for-desacucarado-para-while.md)
-> e o `for` deixar de ser desaçucarado, como previsto abaixo.
+> si só cai quando o `for` deixar de ser desaçucarado, como previsto abaixo —
+> o que aconteceu na T62 ([ADR 0022](0022-for-como-loop-com-incremento-no-topo.md)).
+
+> **Nota (Fase 5, T63):** a decisão caiu. O ADR 0022 pôs o incremento no topo
+> do `loop`, a rejeição saiu do parser e `continue` entrou na linguagem pelo
+> [ADR 0023](0023-continue-entra-com-o-incremento-no-topo.md) — pela porta que
+> a última consequência listada abaixo deixou aberta.
 
 ## Consequências
 

@@ -5,6 +5,9 @@
 //! não possui — aqui ela vem da stdlib, não é palavra-chave) e `concat`, que dá
 //! suporte ao operador `..`. A Fase 2 acrescenta a superfície de arrays,
 //! records e maps: indexação checada, sem nunca expor o `panic!` cru do Rust.
+//! A Fase 5 acrescenta [`idiv`], a divisão com piso do operador `//`, e
+//! [`shl`]/[`shr`], os deslocamentos com a semântica do Lua (quantidade de
+//! deslocamento arbitrária, inclusive negativa).
 //!
 //! Arrays em Titan são **1-based** (`coder.lua:1994`); a conversão para o
 //! 0-based do `Vec` acontece só aqui dentro, num lugar só.
@@ -40,6 +43,102 @@ pub fn concat(a: &str, b: &str) -> String {
 fn abortar(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(1);
+}
+
+/// Divisão inteira com piso — o `//` do Titan (PRD.md, T61).
+///
+/// **Não** é o `/` do Rust: o Rust trunca em direção a zero e o Titan/Lua
+/// arredonda para menos infinito, então `-7 // 2` é `-4`, não `-3`
+/// (`coder.lua:1716-1746`, que inlineia o `luaV_div` do Lua).
+///
+/// Três detalhes, todos vindos do original:
+///
+/// - **Divisão por zero aborta** com mensagem em português (o original lança
+///   "divide by zero"), em vez de deixar o `panic!` do Rust escapar.
+/// - **`b == -1` sai por negação com wrap**, porque `i64::MIN / -1`
+///   transborda.
+/// - **`div_euclid` não serve**: para divisor negativo ele mantém o resto
+///   não-negativo em vez de arredondar para baixo — `(-7).div_euclid(-2)` é
+///   `4`, e `-7 // -2` no Titan é `3`. Daí a correção explícita abaixo.
+///
+/// ```
+/// assert_eq!(titan_runtime::idiv(7, 2), 3);
+/// assert_eq!(titan_runtime::idiv(-7, 2), -4);
+/// ```
+pub fn idiv(a: i64, b: i64) -> i64 {
+    match idiv_checked(a, b) {
+        Ok(q) => q,
+        Err(msg) => abortar(&msg),
+    }
+}
+
+/// `a // b` devolvendo o erro em português em vez de abortar — base
+/// testável de [`idiv`], mesmo par `*_checked`/aborta de
+/// [`array_get_checked`]/[`array_get`].
+pub fn idiv_checked(a: i64, b: i64) -> Result<i64, String> {
+    if b == 0 {
+        return Err("divisão inteira por zero".to_string());
+    }
+    if b == -1 {
+        // `i64::MIN / -1` transborda; `wrapping_neg` reproduz o
+        // `intop(-, 0, m)` do original, que é aritmética com wrap-around.
+        return Ok(a.wrapping_neg());
+    }
+    let q = a / b;
+    // Sinais opostos e divisão não exata: o truncamento do Rust ficou uma
+    // unidade acima do piso.
+    if (a % b != 0) && ((a < 0) != (b < 0)) {
+        Ok(q - 1)
+    } else {
+        Ok(q)
+    }
+}
+
+/// `a << b` com a semântica do Titan (PRD.md, T61).
+///
+/// **Não** é o `<<` do Rust, que exige `0 <= b < 64` e transborda fora
+/// disso — `1 << 64` sequer compila em Rust, e o erro chegaria em inglês
+/// sobre código que o usuário não escreveu. No Titan/Lua a quantidade de
+/// deslocamento é um inteiro qualquer (`coder.lua:1670-1710`, que reordena o
+/// `luaV_shiftl`): deslocamento **negativo inverte a direção** e
+/// deslocamento de 64 ou mais zera o resultado.
+///
+/// O deslocamento é sempre **lógico**, não aritmético: o bit de sinal não se
+/// propaga, daí a conta passar por `u64` (`>>` sobre `i64` no Rust
+/// propagaria o sinal, divergindo do Lua).
+///
+/// ```
+/// assert_eq!(titan_runtime::shl(1, 10), 1024);
+/// assert_eq!(titan_runtime::shl(1, 64), 0);
+/// assert_eq!(titan_runtime::shl(1024, -10), 1);
+/// ```
+pub fn shl(a: i64, b: i64) -> i64 {
+    if b <= -64 || b >= 64 {
+        return 0;
+    }
+    if b >= 0 {
+        ((a as u64) << b) as i64
+    } else {
+        ((a as u64) >> -b) as i64
+    }
+}
+
+/// `a >> b` com a semântica do Titan — [`shl`] com a direção invertida
+/// (`coder.lua:1916`), incluindo o deslocamento lógico e o zero fora da
+/// faixa.
+///
+/// ```
+/// assert_eq!(titan_runtime::shr(1024, 10), 1);
+/// assert_eq!(titan_runtime::shr(1, 64), 0);
+/// assert_eq!(titan_runtime::shr(-1, 63), 1);
+/// ```
+pub fn shr(a: i64, b: i64) -> i64 {
+    // `-b` transbordaria só para `i64::MIN`, que já saiu como 0 acima por
+    // estar fora da faixa — mas o `wrapping_neg` deixa isso explícito.
+    if b <= -64 || b >= 64 {
+        return 0;
+    }
+    shl(a, b.wrapping_neg())
 }
 
 /// Lê `v[indice]` (1-based) checando a faixa; devolve o erro em português em
@@ -432,6 +531,97 @@ mod tests {
         assert_eq!(
             map_get_mut_checked(&mut m, &"faltando".to_string()),
             Err("chave não encontrada no map".to_string())
+        );
+    }
+
+    // --- idiv ---------------------------------------------------------------
+
+    #[test]
+    fn idiv_com_operandos_positivos_e_a_divisao_usual() {
+        assert_eq!(idiv(7, 2), 3);
+        assert_eq!(idiv(6, 3), 2);
+        assert_eq!(idiv(0, 5), 0);
+    }
+
+    /// A propriedade que separa `//` do `/` do Rust: sinais opostos
+    /// arredondam **para baixo**, não em direção a zero.
+    #[test]
+    fn idiv_com_sinais_opostos_arredonda_para_baixo() {
+        assert_eq!(idiv(-7, 2), -4);
+        assert_eq!(idiv(7, -2), -4);
+        // Divisão exata não tem o que arredondar, mesmo com sinais opostos.
+        assert_eq!(idiv(-6, 2), -3);
+        assert_eq!(idiv(6, -2), -3);
+    }
+
+    #[test]
+    fn idiv_com_dois_negativos_da_quociente_positivo() {
+        assert_eq!(idiv(-7, -2), 3);
+        assert_eq!(idiv(-6, -3), 2);
+    }
+
+    /// `div_euclid` seria a escolha óbvia e está errada para divisor
+    /// negativo — este teste fixa a divergência.
+    #[test]
+    fn idiv_diverge_de_div_euclid_quando_o_divisor_e_negativo() {
+        assert_eq!(idiv(-7, -2), 3);
+        assert_eq!((-7i64).div_euclid(-2), 4);
+    }
+
+    #[test]
+    fn idiv_por_menos_um_nao_transborda() {
+        assert_eq!(idiv(10, -1), -10);
+        assert_eq!(idiv(i64::MIN, -1), i64::MIN);
+    }
+
+    // --- shl / shr ---------------------------------------------------------
+
+    #[test]
+    fn shift_com_deslocamento_usual() {
+        assert_eq!(shl(1, 10), 1024);
+        assert_eq!(shr(1024, 10), 1);
+        assert_eq!(shl(5, 0), 5);
+        assert_eq!(shr(5, 0), 5);
+    }
+
+    /// No Titan/Lua um deslocamento negativo inverte a direção — no Rust
+    /// nem sequer é representável.
+    #[test]
+    fn shift_com_deslocamento_negativo_inverte_a_direcao() {
+        assert_eq!(shl(1024, -10), 1);
+        assert_eq!(shr(1, -10), 1024);
+    }
+
+    /// Deslocar 64 ou mais zera; no Rust isso seria overflow — e o rustc
+    /// recusa a compilação quando consegue provar, com mensagem em inglês.
+    #[test]
+    fn shift_fora_da_faixa_zera_em_vez_de_transbordar() {
+        assert_eq!(shl(1, 64), 0);
+        assert_eq!(shl(1, 1000), 0);
+        assert_eq!(shr(1, 64), 0);
+        assert_eq!(shl(1, -64), 0);
+        assert_eq!(shr(-1, -1000), 0);
+        assert_eq!(shl(1, i64::MIN), 0);
+        assert_eq!(shr(1, i64::MIN), 0);
+    }
+
+    /// O deslocamento do Lua é lógico: o bit de sinal não se propaga, ao
+    /// contrário do `>>` do Rust sobre `i64`.
+    #[test]
+    fn shift_a_direita_e_logico_nao_aritmetico() {
+        assert_eq!(shr(-1, 63), 1);
+        // O `>>` do Rust sobre i64 propagaria o sinal e daria -1.
+        assert_eq!(-1i64 >> 63, -1);
+    }
+
+    /// O original lança "divide by zero" em vez de deixar a UB acontecer;
+    /// aqui a mensagem chega em português, e [`idiv`] a transforma em
+    /// aborto sem `panic!` cru.
+    #[test]
+    fn idiv_por_zero_devolve_erro_em_portugues() {
+        assert_eq!(
+            idiv_checked(1, 0),
+            Err("divisão inteira por zero".to_string())
         );
     }
 }

@@ -19,11 +19,12 @@
 //!   'main' panicked");
 //! - suíte consolidada da Fase 2 (PRD.md, T31): tudo que **segue** fora de
 //!   escopo após arrays/records/maps serem aceitos — retornos múltiplos,
-//!   métodos, `import`, `repeat`, `break`, bitwise, `//`, `Option`, `as`,
+//!   métodos, `import`, `break`, bitwise, `//`, `Option`, `as`,
 //!   multi-assign e as regras de tipos de record/map — continua rejeitado
-//!   com erro claro (bitwise e `//` agora pelo checker, não mais pelo
-//!   parser: T60). `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
-//!   real no codegen desde a T30;
+//!   com erro claro. `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
+//!   real no codegen desde a T30; bitwise e `//` saíram na T61 e
+//!   `repeat`/`until` na T64, e o que resta deles é o negativo de tipo
+//!   (`1.5 & 2`, condição do `until` não-boolean);
 //! - arquivos `.titan` reais do Titan original nunca panicam ao serem
 //!   processados (compilam ou falham com erro claro), e os que usam somente
 //!   o idioma de arrays já suportado (`sieve.titan`, `selection_sort.titan`)
@@ -47,9 +48,14 @@
 //!   risco 5 (Cargo.toml gerado nunca depender do LSP) é conferido dentro do
 //!   build de `hello.titan` já pago pelo caminho feliz, sem custo extra.
 //! - abertura da Fase 5 (PRD.md, T59): as tabelas de fora-de-escopo mudam de
-//!   camada onde o léxico abriu (`& | ~ << >> // ?` agora são tokens, então
-//!   a rejeição virou sintática) e `KEYWORDS_NOVAS_DA_T59` registra a quebra
-//!   compatível das sete palavras-chave novas.
+//!   camada onde o léxico abriu (`?` agora é token, então a rejeição de
+//!   `tipo_option` virou sintática) e `KEYWORDS_NOVAS_DA_T59` registra a quebra compatível das
+//!   sete palavras-chave novas;
+//! - bitwise e `//` completos (PRD.md, T61): `& | ~ << >> //` percorreram
+//!   lexer (T59), parser (T60) e agora checker/codegen — o caminho feliz é
+//!   provado por execução real em
+//!   `compila_e_executa_bitwise_e_divisao_inteira`, com `-7 // 2` dando -4
+//!   (piso, não truncagem).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -793,9 +799,10 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// rejeitada em alguma etapa (léxica, sintática ou de tipos) com erro claro,
 /// nunca panic.
 ///
-/// `indexacao_de_array`, `construtor_de_array` e `operador_length` saíram
-/// desta tabela na T30/T31: viraram casos positivos (arrays têm suporte real
-/// no codegen). `chamada_de_metodo` e `tipo_option` continuam rejeitados,
+/// `indexacao_de_array`, `construtor_de_array`, `operador_length` (T30/T31)
+/// e os seis de bitwise/`//` (T61) saíram desta tabela por terem virado
+/// caminho feliz — arrays e operadores têm suporte real no codegen.
+/// `chamada_de_metodo` e `tipo_option` continuam rejeitados,
 /// mas por outra camada: com `.` e `[` lexados e o parser sabendo indexação,
 /// a rejeição de `chamada_de_metodo` já não vem do lexer, e sim do parser não
 /// reconhecer `:` como início de chamada de método. `break_fora_de_escopo`
@@ -816,48 +823,21 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    local p = ponto:dist()\n    return 0\nend",
         trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
+    // `repeat_until` saiu desta tabela na T64: virou caso **positivo**, com
+    // execução real em `compila_e_executa_repeat_until` — o mesmo movimento
+    // que `break` fez na T55, bitwise na T61 e `continue` na T63. O que
+    // sobrou da família é o negativo de sintaxe (`repeat` sem `until`) e o
+    // de tipo (condição não-boolean), ambos na tabela da Fase 4.
+    // Os seis casos de bitwise e `//` que ficavam aqui saíram da tabela na
+    // T61: viraram casos **positivos**, com execução real em
+    // `compila_e_executa_bitwise_e_divisao_inteira` — mesmo movimento que
+    // `indexacao_de_array` fez na T30 e `break` na T55. O que sobrou da
+    // família é o negativo de tipo, `bitwise_com_float`, logo abaixo: o
+    // operador existe, o que não existe é coerção float→integer.
     CasoNegativo {
-        nome: "repeat_until",
-        // `repeat`/`until` viraram keywords na T59: deixaram de ser lidas
-        // como identificador, então o comando morre em `parse_primary_exp`.
-        fonte: "function main(args: {string}): integer\n    repeat print(\"x\") until true\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
-    },
-    // Os seis casos abaixo mudaram de camada duas vezes na Fase 5. Na T59
-    // `& | ~ << >> // ?` viraram tokens e a rejeição saiu do lexer para o
-    // parser; na T60 o parser ganhou os níveis de precedência e ela desceu
-    // outra vez, agora para o checker — mesmo trajeto do `break` na T55.
-    // Continuam rejeitados: quem fecha o buraco é a T61, que troca estes
-    // braços genéricos de `check_binop`/`check_unop` pelos braços reais.
-    CasoNegativo {
-        nome: "bitwise_and",
-        fonte: "function main(args: {string}): integer\n    local a = 1 & 2\n    return 0\nend",
-        trecho_esperado: "operador `&` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "bitwise_or",
-        fonte: "function main(args: {string}): integer\n    local a = 1 | 2\n    return 0\nend",
-        trecho_esperado: "operador `|` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "bitwise_not_isolado",
-        fonte: "function main(args: {string}): integer\n    local a = ~2\n    return 0\nend",
-        trecho_esperado: "operador unário `~` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "shift_esquerda",
-        fonte: "function main(args: {string}): integer\n    local a = 1 << 2\n    return 0\nend",
-        trecho_esperado: "operador `<<` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "shift_direita",
-        fonte: "function main(args: {string}): integer\n    local a = 1 >> 2\n    return 0\nend",
-        trecho_esperado: "operador `>>` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "divisao_inteira",
-        fonte: "function main(args: {string}): integer\n    local a = 1 // 2\n    return 0\nend",
-        trecho_esperado: "operador `//` não é suportado nesta fase",
+        nome: "bitwise_com_float",
+        fonte: "function main(args: {string}): integer\n    local a = 1.5 & 2\n    return 0\nend",
+        trecho_esperado: "operando de `&` precisa ser integer",
     },
     CasoNegativo {
         nome: "tipo_option",
@@ -994,9 +974,9 @@ fn construcoes_fora_de_escopo_da_fase_3_produzem_erro_claro_sem_panic() {
 /// Negativos da Fase 4 (PRD.md, T55 e T57): `break` é keyword e é aceito
 /// dentro de `while`/`for`, mas continua rejeitado fora de laço — agora por
 /// erro de tipos (`checker.rs`), não mais de sintaxe, já que o parser aceita
-/// `break` em qualquer posição de comando. `continue` nunca foi keyword
-/// (decisão técnica 7 do PRD.md) e é rejeitado explicando o motivo (o `for`
-/// desaçucarado para `while` teria seu incremento pulado). Os últimos três
+/// `break` em qualquer posição de comando. Desde a T63 (Fase 5) `continue`
+/// segue exatamente o mesmo desenho: aceito dentro de laço, rejeitado fora
+/// dele pelo checker, com a mesma mensagem em português. Os últimos três
 /// casos são a curadoria da T57 (risco 5 à parte, coberto em
 /// `compila_e_executa_hello_titan_conferindo_stdout_e_exit_code`): tipos soma
 /// e `match` seguem sem sintaxe própria (Fase 5, pendente — PRD.md linha
@@ -1022,22 +1002,44 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    local break = 1\n    return 0\nend",
         trecho_esperado: "Esperava um nome de variável",
     },
-    CasoNegativo {
-        nome: "continue_em_while",
-        fonte: "function main(args: {string}): integer\n    while true do\n        continue\n    end\n    return 0\nend",
-        trecho_esperado: "`continue` não é suportado",
-    },
-    CasoNegativo {
-        nome: "continue_em_for",
-        fonte: "function main(args: {string}): integer\n    for i = 1, 10 do\n        continue\n    end\n    return 0\nend",
-        trecho_esperado: "`continue` não é suportado",
-    },
+    // `continue_em_while` e `continue_em_for` saíram desta tabela na T63:
+    // viraram casos **positivos**, com execução real em
+    // `compila_e_executa_continue_em_for_e_em_while` — o mesmo movimento que
+    // `break` fez na T55. O que sobrou da família é o negativo de escopo,
+    // logo abaixo, e ele mudou de camada: era erro de sintaxe (o parser
+    // rejeitava `continue` em qualquer posição) e agora é erro de tipos, do
+    // checker, exatamente como `break_fora_de_laco`.
     CasoNegativo {
         nome: "continue_fora_de_laco",
-        // Fora de laço `continue` também é rejeitado — é a mesma checagem
-        // léxica/sintática, independente de haver ou não um laço em volta.
         fonte: "function main(args: {string}): integer\n    continue\n    return 0\nend",
-        trecho_esperado: "`continue` não é suportado",
+        trecho_esperado: "`continue` fora de um laço",
+    },
+    CasoNegativo {
+        nome: "continue_depois_do_laco",
+        fonte: "function main(args: {string}): integer\n    while false do\n    end\n    continue\n    return 0\nend",
+        trecho_esperado: "`continue` fora de um laço",
+    },
+    // `repeat`/`until` (T64) são positivos desde a fase — o que resta de
+    // negativo é o `until` que falta (sintaxe) e a condição não-boolean
+    // (tipos, ADR 0005: sem truthy/falsy), na mesma divisão de camadas de
+    // `break` e `continue`.
+    CasoNegativo {
+        nome: "repeat_sem_until",
+        fonte: "function main(args: {string}): integer\n    repeat\n        print(\"x\")\n    end\n    return 0\nend",
+        trecho_esperado: "Esperava 'until' para fechar o 'repeat'",
+    },
+    CasoNegativo {
+        nome: "until_com_condicao_nao_boolean",
+        fonte: "function main(args: {string}): integer\n    repeat\n    until 1\n    return 0\nend",
+        trecho_esperado: "condição do `until` precisa ser boolean",
+    },
+    CasoNegativo {
+        nome: "local_do_repeat_nao_vaza",
+        // O outro lado da armadilha de escopo da T64: o `until` enxerga os
+        // `local` do corpo, mas depois do laço eles saem de escopo como em
+        // qualquer bloco.
+        fonte: "function main(args: {string}): integer\n    repeat\n        local x: integer = 1\n    until true\n    return x\nend",
+        trecho_esperado: "'x' não foi declarado",
     },
     CasoNegativo {
         // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria: a
@@ -1191,6 +1193,281 @@ fn compila_e_executa_break_saindo_de_while_e_de_for() {
     let esperado = "while-1\nwhile-2\nwhile-3\nfor-1\nfor-2\n";
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T63 — o ponto central da tarefa, e a prova de que o
+/// bug que o ADR 0017 temia deixou de existir: `continue` dentro de um `for`
+/// **avança o laço**. Com o template antigo (incremento no fim do corpo,
+/// ADR 0004) este programa entraria em laço infinito na primeira iteração
+/// par; com o incremento no topo do `loop` (ADR 0022, T62) ele imprime os
+/// ímpares e **termina**. O `while` cobre o outro laço da linguagem: lá o
+/// incremento é escrito pelo usuário, então o `continue` precisa vir depois
+/// dele — é a mesma semântica do Lua, e do Rust.
+#[test]
+fn compila_e_executa_continue_em_for_e_em_while() {
+    let out_dir = temp_dir("continue-execucao-real");
+
+    let source = concat!(
+        "function main(args: {string}): integer\n",
+        // `for i = 1, 5` pulando os pares: imprime 1, 3, 5 e termina. Se o
+        // `continue` pulasse o incremento, o programa travaria em i = 2.
+        "    for i = 1, 5 do\n",
+        "        if i % 2 == 0 then\n",
+        "            continue\n",
+        "        end\n",
+        "        print(\"for-\" .. i)\n",
+        "    end\n",
+        // Decrescente com passo negativo: o `continue` também precisa passar
+        // pelo `i += titan_for_inc` com `titan_for_asc` falso.
+        "    for j = 5, 1, -2 do\n",
+        "        if j == 3 then\n",
+        "            continue\n",
+        "        end\n",
+        "        print(\"dec-\" .. j)\n",
+        "    end\n",
+        // `while`: o incremento é do usuário e vem antes do `continue`.
+        "    local k: integer = 0\n",
+        "    while k < 5 do\n",
+        "        k = k + 1\n",
+        "        if k % 2 == 1 then\n",
+        "            continue\n",
+        "        end\n",
+        "        print(\"while-\" .. k)\n",
+        "    end\n",
+        // `continue` em laço aninhado afeta só o laço mais interno.
+        "    for a = 1, 2 do\n",
+        "        for b = 1, 3 do\n",
+        "            if b == 2 then\n",
+        "                continue\n",
+        "            end\n",
+        "            print(\"ani-\" .. a .. \"-\" .. b)\n",
+        "        end\n",
+        "    end\n",
+        // `continue` convivendo com `break` no mesmo laço.
+        "    for c = 1, 10 do\n",
+        "        if c == 2 then\n",
+        "            continue\n",
+        "        end\n",
+        "        if c == 4 then\n",
+        "            break\n",
+        "        end\n",
+        "        print(\"mix-\" .. c)\n",
+        "    end\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "continue_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de continue: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("continue_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./continue_exec");
+    let esperado = concat!(
+        "for-1\nfor-3\nfor-5\n",
+        "dec-5\ndec-1\n",
+        "while-2\nwhile-4\n",
+        "ani-1-1\nani-1-3\nani-2-1\nani-2-3\n",
+        "mix-1\nmix-3\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T64 (execução real, os três pontos da tarefa): o
+/// `repeat` roda ao menos uma vez **mesmo** com a condição de saída já
+/// verdadeira; o `until` referencia um `local` declarado no corpo — a
+/// armadilha de escopo herdada do Lua, que obriga o checker a fechar o bloco
+/// só depois de tipar a condição; e `break`/`continue` (T63) funcionam lá
+/// dentro sem caso especial, porque `repeat` também é emitido como um `loop`
+/// do Rust (ADR 0023).
+#[test]
+fn compila_e_executa_repeat_until() {
+    let out_dir = temp_dir("repeat-execucao-real");
+
+    let source = concat!(
+        "function main(args: {string}): integer\n",
+        // 1. Condição de saída já verdadeira na entrada: o corpo roda uma
+        //    vez. Com um `while` no lugar, não imprimiria nada.
+        "    local n: integer = 0\n",
+        "    repeat\n",
+        "        n = n + 1\n",
+        "        print(\"uma-vez-\" .. n)\n",
+        "    until true\n",
+        // 2. O `until` lê `dobro`, um `local` do corpo.
+        "    local m: integer = 0\n",
+        "    repeat\n",
+        "        local dobro: integer = m * 2\n",
+        "        m = m + 1\n",
+        "        print(\"dobro-\" .. dobro)\n",
+        "    until dobro >= 6\n",
+        // 3. `break` e `continue` no mesmo `repeat`. A condição do `until`
+        //    nunca fica verdadeira: quem termina o laço é o `break`.
+        "    local k: integer = 0\n",
+        "    repeat\n",
+        "        k = k + 1\n",
+        "        if k == 2 then\n",
+        "            continue\n",
+        "        end\n",
+        "        if k == 5 then\n",
+        "            break\n",
+        "        end\n",
+        "        print(\"mix-\" .. k)\n",
+        "    until k > 100\n",
+        // 4. Aninhado: o `break` interno fecha só o laço de dentro.
+        "    local a: integer = 0\n",
+        "    repeat\n",
+        "        a = a + 1\n",
+        "        local b: integer = 0\n",
+        "        repeat\n",
+        "            b = b + 1\n",
+        "            print(\"ani-\" .. a .. \"-\" .. b)\n",
+        "        until b >= 2\n",
+        "    until a >= 2\n",
+        // 5. `repeat` dentro de `for` e `for` dentro de `repeat`: os dois
+        //    laços convivem sem o template de um atrapalhar o do outro.
+        "    for i = 1, 2 do\n",
+        "        local c: integer = 0\n",
+        "        repeat\n",
+        "            c = c + 1\n",
+        "        until c >= i\n",
+        "        print(\"for-rep-\" .. i .. \"-\" .. c)\n",
+        "    end\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "repeat_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de repeat: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("repeat_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./repeat_exec");
+    let esperado = concat!(
+        "uma-vez-1\n",
+        "dobro-0\ndobro-2\ndobro-4\ndobro-6\n",
+        "mix-1\nmix-3\nmix-4\n",
+        "ani-1-1\nani-1-2\nani-2-1\nani-2-2\n",
+        "for-rep-1-1\nfor-rep-2-2\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T61 pelo pipeline completo (`titanc` → Rust →
+/// `cargo build` → executável): bitwise e `//` percorrem lexer, parser,
+/// checker e codegen e produzem os valores certos em execução real. O caso
+/// que dá nome à tarefa é `-7 // 2`: o `/` do Rust truncaria para -3, e o
+/// `//` do Titan/Lua arredonda para baixo, dando -4.
+#[test]
+fn compila_e_executa_bitwise_e_divisao_inteira() {
+    let out_dir = temp_dir("bitwise-execucao-real");
+
+    // Os parênteses em volta dos bitwise são necessários: na cascata de
+    // precedência do Titan (T60) `..` liga mais forte que `&`/`|`/`~`, então
+    // sem eles a string entraria como operando do operador bitwise.
+    let source = concat!(
+        "function main(args: {string}): integer\n",
+        "    print(\"7//2=\" .. 7 // 2)\n",
+        "    print(\"-7//2=\" .. -7 // 2)\n",
+        "    print(\"and=\" .. (5 & 3))\n",
+        "    print(\"or=\" .. (5 | 3))\n",
+        "    print(\"xor=\" .. (5 ~ 3))\n",
+        "    print(\"shl=\" .. (1 << 10))\n",
+        // Deslocamento fora de `0..64` é legal no Titan (zera) e overflow no
+        // Rust — com constantes, o rustc recusaria a compilação em inglês.
+        "    print(\"shl64=\" .. (1 << 64))\n",
+        "    print(\"shlneg=\" .. (1024 << -10))\n",
+        "    print(\"not=\" .. ~0)\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "bitwise_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de bitwise: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("bitwise_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./bitwise_exec");
+    let esperado = "7//2=3\n-7//2=-4\nand=1\nor=7\nxor=6\nshl=1024\nshl64=0\nshlneg=1\nnot=-1\n";
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// `1.5 & 2` é o caso que o PRD (T61) destaca: o rustc recusaria em inglês,
+/// sobre código que o usuário não escreveu — aqui o erro chega em português,
+/// do checker, antes de qualquer `cargo build`.
+#[test]
+fn bitwise_com_float_produz_erro_em_portugues_sem_panic() {
+    let out_dir = temp_dir("bitwise-float");
+    let source_path = write_source(
+        &out_dir,
+        "bitwise_float.titan",
+        "function main(args: {string}): integer\n    local a = 1.5 & 2\n    return 0\nend",
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&output);
+    assert!(!output.status.success(), "esperava falha de checagem");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("operando de `&` precisa ser integer"),
+        "stderr inesperado: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }

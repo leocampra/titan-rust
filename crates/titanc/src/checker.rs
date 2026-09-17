@@ -16,11 +16,13 @@
 //!   (`checker.lua:365-368` e `447-457`), `for` numérico espelhando
 //!   `checkfor` (`checker.lua:239-288`) e atribuição single-target
 //!   (`checker.lua:378-410`).
-//! - Operadores da Fase 1 (T13): regras de tipo espelhando
-//!   `checker.lua:910-1122` (sem bitwise/gradual typing), com a coerção
-//!   int→float centralizada em `numeric_result`. O checker **não** emite nó
-//!   de cast: o codegen decide o `as f64` comparando o tipo do operando com
-//!   o tipo do resultado.
+//! - Operadores (T13, completados na T61): regras de tipo espelhando
+//!   `checker.lua:910-1122` (sem gradual typing), com a coerção int→float
+//!   centralizada em `numeric_result`. O checker **não** emite nó de cast:
+//!   o codegen decide o `as f64` comparando o tipo do operando com o tipo
+//!   do resultado. Bitwise (`& | ~ << >>`) exige `integer` estrito, sem
+//!   coerção de float — divergência deliberada do original, ADR 0021; `//`
+//!   segue a regra aritmética de `+ - * %`.
 //! - **Rastreio de mutabilidade** (decisão 6 da Fase 1): cada `local` recebe
 //!   um id; atribuições registram o id do símbolo resolvido (mesmo espírito
 //!   do `var._decl._assigned = true` do original) e um fix-up ao final do
@@ -33,8 +35,8 @@
 //! `codegen.rs` (T6) vai consumir.
 //!
 //! Tudo fora do subconjunto (records, maps, arrays manipuláveis, `import`,
-//! `foreign import`, métodos, retornos múltiplos, `repeat`, `Option`/`?`)
-//! produz um erro semântico claro — nunca panic.
+//! `foreign import`, métodos, retornos múltiplos, `Option`/`?`) produz um
+//! erro semântico claro — nunca panic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -231,6 +233,17 @@ pub enum TypedStat {
         condition: TypedExp,
         block: Box<TypedStat>,
     },
+    /// `repeat` (Fase 5, T64) — o laço que testa no fim. `block` é sempre um
+    /// [`TypedStat::Block`], mas o escopo que ele representa engloba também
+    /// `condition`: o `until` enxerga os `local` do corpo (semântica do Lua),
+    /// e é por isso que `check_repeat` só fecha o escopo depois de tipar a
+    /// condição. O codegen (`loop { corpo; if cond { break; } }`) emite os
+    /// dois dentro das mesmas chaves, preservando a visibilidade.
+    Repeat {
+        loc: Loc,
+        block: Box<TypedStat>,
+        condition: TypedExp,
+    },
     For {
         loc: Loc,
         name: String,
@@ -252,6 +265,11 @@ pub enum TypedStat {
     /// `break` (Fase 4, T55) — só produzido dentro de `while`/`for`;
     /// `check_stat` rejeita fora de laço antes de chegar aqui.
     Break {
+        loc: Loc,
+    },
+    /// `continue` (Fase 5, T63) — mesma disciplina de `Break`: só produzido
+    /// dentro de laço, com a **mesma** checagem de `loop_depth`.
+    Continue {
         loc: Loc,
     },
 }
@@ -366,6 +384,9 @@ pub enum BinOp {
     Div,
     Mod,
     Pow,
+    /// `//` — divisão com piso (T61). Não é o `/` do Rust: para inteiros o
+    /// Rust trunca em direção a zero e o Titan/Lua arredonda para baixo.
+    IDiv,
     Eq,
     Ne,
     Lt,
@@ -374,12 +395,24 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// `&` — bitwise AND (T61).
+    BAnd,
+    /// `|` — bitwise OR (T61).
+    BOr,
+    /// `~` **binário** — XOR no Titan (o `~` unário é NOT, e o `^` do Titan
+    /// é potência, não XOR). Vira `^` na emissão (T61).
+    BXor,
+    /// `<<` — deslocamento à esquerda (T61).
+    Shl,
+    /// `>>` — deslocamento à direita (T61).
+    Shr,
 }
 
 impl BinOp {
     /// Grafia do operador no fonte Titan — as mesmas strings que o parser
-    /// coloca em `ExpBinop.op`. `None` para operadores fora do subconjunto
-    /// (bitwise, `//`), que viram erro claro no chamador.
+    /// coloca em `ExpBinop.op`. Desde a T61 cobre todos os operadores
+    /// binários que o parser produz (bitwise e `//` inclusive); `None`
+    /// sobra só para AST montada à mão, que vira erro claro no chamador.
     fn from_source(op: &str) -> Option<BinOp> {
         Some(match op {
             "+" => BinOp::Add,
@@ -396,6 +429,13 @@ impl BinOp {
             ">=" => BinOp::Ge,
             "and" => BinOp::And,
             "or" => BinOp::Or,
+            "//" => BinOp::IDiv,
+            "&" => BinOp::BAnd,
+            "|" => BinOp::BOr,
+            // Titan `~` binário é XOR (o `^` é potência) — ver `BinOp::BXor`.
+            "~" => BinOp::BXor,
+            "<<" => BinOp::Shl,
+            ">>" => BinOp::Shr,
             _ => return None,
         })
     }
@@ -461,6 +501,9 @@ pub enum UnOp {
     Neg,
     Not,
     Len,
+    /// `~` **unário** — bitwise NOT sobre inteiro (T61). Vira `!` no Rust,
+    /// o mesmo operador de `Not`, mas sobre `i64` em vez de `bool`.
+    BNot,
 }
 
 // ---- Checker -------------------------------------------------------------
@@ -502,8 +545,9 @@ struct Checker {
     /// do campo) -> Loc`, pela mesma razão de `record_def_locs`.
     field_def_locs: HashMap<(String, String), Loc>,
     /// Profundidade de `while`/`for` aninhados (Fase 4, T55) — `break` só é
-    /// válido quando `> 0`. Incrementada/decrementada em `check_stat` ao
-    /// entrar/sair do bloco do laço.
+    /// válido quando `> 0`, e `continue` (T63) usa exatamente a mesma
+    /// checagem. Incrementada/decrementada em `check_stat` ao entrar/sair do
+    /// bloco do laço.
     loop_depth: usize,
 }
 
@@ -1326,10 +1370,11 @@ impl Checker {
                     block: Box::new(block?),
                 })
             }
-            Stat::StatRepeat { loc, .. } => {
-                self.error(*loc, "`repeat` não é suportado nesta fase.");
-                None
-            }
+            Stat::StatRepeat {
+                loc,
+                block,
+                condition,
+            } => self.check_repeat(*loc, block, condition, rettypes),
             Stat::StatFor {
                 loc,
                 decl,
@@ -1356,6 +1401,16 @@ impl Checker {
                 }
                 Some(TypedStat::Break { loc: *loc })
             }
+            // `continue` (T63): a **mesma** checagem de `break`, palavra por
+            // palavra — `loop_depth` já é incrementado por `while` e por
+            // `check_for`, então não há nada a acrescentar ao rastreamento.
+            Stat::StatContinue { loc } => {
+                if self.loop_depth == 0 {
+                    self.error(*loc, "`continue` fora de um laço (`while`/`for`).");
+                    return None;
+                }
+                Some(TypedStat::Continue { loc: *loc })
+            }
         }
     }
 
@@ -1375,6 +1430,65 @@ impl Checker {
             return None;
         }
         Some(typed)
+    }
+
+    /// `repeat block until cond` (T64).
+    ///
+    /// A armadilha da tarefa é de **escopo**, não de tipos: em Lua a
+    /// condição do `until` enxerga os `local` declarados no corpo
+    /// (`repeat local x = f() until x > 10` é válido), o que inverte a ordem
+    /// natural de abrir/fechar bloco. Por isso este método **não** delega o
+    /// corpo a `check_stat` — que abriria e fecharia o escopo antes de a
+    /// condição ser vista — e sim repete aqui o que o braço `StatBlock` faz,
+    /// intercalando a condição entre o último statement e o `close_scope`.
+    ///
+    /// Fora isso é um laço como os outros: `loop_depth` sobe pelo corpo, e
+    /// `break`/`continue` (T63) entram sem caso especial (ADR 0023).
+    fn check_repeat(
+        &mut self,
+        loc: Loc,
+        block: &Stat,
+        condition: &Exp,
+        rettypes: &[Type],
+    ) -> Option<TypedStat> {
+        let Stat::StatBlock {
+            loc: block_loc,
+            stats,
+        } = block
+        else {
+            // Defensivo: `parse_stat_repeat` só produz `StatBlock` como corpo.
+            self.error(loc, "corpo de `repeat` precisa ser um bloco.");
+            return None;
+        };
+
+        self.touch_loc(*block_loc);
+        self.st.open_block();
+        let mut typed_stats = Vec::with_capacity(stats.len());
+        let mut ok = true;
+        self.loop_depth += 1;
+        for stat in stats {
+            match self.check_stat(stat, rettypes) {
+                Some(typed) => typed_stats.push(typed),
+                None => ok = false,
+            }
+        }
+        self.loop_depth -= 1;
+        // Aqui está o ponto da tarefa: a condição é tipada com o escopo do
+        // corpo ainda aberto.
+        let typed_condition = self.check_condition(condition, "until");
+        self.close_scope(*block_loc);
+
+        if !ok {
+            return None;
+        }
+        Some(TypedStat::Repeat {
+            loc,
+            block: Box::new(TypedStat::Block {
+                loc: *block_loc,
+                stats: typed_stats,
+            }),
+            condition: typed_condition?,
+        })
     }
 
     /// `for` numérico, espelhando `checkfor` (`checker.lua:239-288`):
@@ -2036,8 +2150,8 @@ impl Checker {
         })
     }
 
-    /// Regras de tipo dos operadores binários (T13), espelhando
-    /// `checker.lua:910-1122` sem bitwise nem gradual typing.
+    /// Regras de tipo dos operadores binários (T13/T61), espelhando
+    /// `checker.lua:910-1122` sem gradual typing.
     fn check_binop(&mut self, loc: Loc, op_str: &str, lhs: &Exp, rhs: &Exp) -> Option<TypedExp> {
         let Some(op) = BinOp::from_source(op_str) else {
             self.error(
@@ -2052,7 +2166,9 @@ impl Checker {
 
         let ty = match op {
             // Ambos numéricos; int/int → int, qualquer float promove a float.
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
+            // `//` entra aqui: no original é o mesmo braço de `+ - * %`
+            // (`checker.lua:988`) — int/int → int, qualquer float promove.
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::IDiv => {
                 if !self.check_numeric_operands(op_str, &lhs, &rhs) {
                     return None;
                 }
@@ -2127,6 +2243,18 @@ impl Checker {
                 }
                 Type::Boolean
             }
+            // Bitwise exige `Integer` dos dois lados, resultado `Integer`.
+            // Divergência deliberada de `checker.lua:1097-1109`, que coage
+            // float para integer (ADR 0021): aqui `1.5 & 2` é erro claro em
+            // português, e não uma truncagem silenciosa — quem quiser
+            // truncar escreve o cast (T71). Nenhuma promoção int→float
+            // acontece, então o resultado é sempre `Integer`.
+            BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
+                if !self.check_integer_operands(op_str, &lhs, &rhs) {
+                    return None;
+                }
+                Type::Integer
+            }
         };
 
         Some(TypedExp {
@@ -2159,19 +2287,43 @@ impl Checker {
         ok
     }
 
+    /// Reporta um erro por lado não-inteiro de um operador bitwise,
+    /// apontando o `loc` do operando culpado. Separado de
+    /// [`Checker::check_numeric_operands`] porque bitwise **não** aceita
+    /// float: a mensagem precisa dizer `integer`, não "numérico".
+    fn check_integer_operands(&mut self, op_str: &str, lhs: &TypedExp, rhs: &TypedExp) -> bool {
+        let mut ok = true;
+        for side in [lhs, rhs] {
+            if !side.ty.equals(&Type::Integer) {
+                self.error(
+                    side.loc,
+                    format!(
+                        "operando de `{op_str}` precisa ser integer, encontrado {}.",
+                        type_name(&side.ty)
+                    ),
+                );
+                ok = false;
+            }
+        }
+        ok
+    }
+
     /// Regras de tipo dos operadores unários (T13/T29): `-` numérico preserva
     /// o tipo do operando; `not` é boolean → boolean (`checker.lua:1100-1122`);
     /// `#` (`checker.lua:852-859`) sobre `Array`/`String` resulta `Integer` —
     /// `parser::parse_unary_exp` produz `#` como prefixo de expressão desde a
     /// T30 (lacuna do parser fechada ali; `check_unop` já sabia mapear `"#"`
-    /// desde a T29).
+    /// desde a T29). `~` (bitwise NOT) entrou na T61: `Integer` → `Integer`,
+    /// sem coerção de float.
     fn check_unop(&mut self, loc: Loc, op_str: &str, exp: &Exp) -> Option<TypedExp> {
         let op = match op_str {
             "-" => UnOp::Neg,
             "not" => UnOp::Not,
             "#" => UnOp::Len,
-            // O parser (T11) só produz `-` e `not`; defensivo para AST
-            // montada à mão (`~`).
+            // `~` unário é bitwise NOT (T61) — o XOR é o `~` binário.
+            "~" => UnOp::BNot,
+            // Defensivo para AST montada à mão: o parser (T60) só produz
+            // `-`, `not`, `#` e `~` como prefixo.
             _ => {
                 self.error(
                     loc,
@@ -2208,6 +2360,22 @@ impl Checker {
                     return None;
                 }
                 Type::Boolean
+            }
+            // Mesma exigência do bitwise binário: `Integer` estrito, sem
+            // coerção de float (ADR 0021 — divergência deliberada de
+            // `checker.lua:870-881`).
+            UnOp::BNot => {
+                if !exp.ty.equals(&Type::Integer) {
+                    self.error(
+                        exp.loc,
+                        format!(
+                            "operando de `~` precisa ser integer, encontrado {}.",
+                            type_name(&exp.ty)
+                        ),
+                    );
+                    return None;
+                }
+                Type::Integer
             }
             UnOp::Len => {
                 if !matches!(exp.ty, Type::Array { .. } | Type::String) {
@@ -2639,13 +2807,16 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
                 fixup_mutability(stat, assigned);
             }
         }
-        TypedStat::While { block, .. } | TypedStat::For { block, .. } => {
+        TypedStat::While { block, .. }
+        | TypedStat::Repeat { block, .. }
+        | TypedStat::For { block, .. } => {
             fixup_mutability(block, assigned);
         }
         TypedStat::Call { .. }
         | TypedStat::Return { .. }
         | TypedStat::Assign { .. }
-        | TypedStat::Break { .. } => {}
+        | TypedStat::Break { .. }
+        | TypedStat::Continue { .. } => {}
     }
 }
 
@@ -2734,7 +2905,8 @@ fn stat_loc(stat: &Stat) -> Loc {
         | Stat::StatDecl { loc, .. }
         | Stat::StatCall { loc, .. }
         | Stat::StatReturn { loc, .. }
-        | Stat::StatBreak { loc, .. } => *loc,
+        | Stat::StatBreak { loc, .. }
+        | Stat::StatContinue { loc, .. } => *loc,
     }
 }
 
@@ -3849,10 +4021,11 @@ end"#;
 
     #[test]
     fn operadores_fora_do_subconjunto_montados_a_mao_produzem_erro() {
-        // O parser (T11) nunca produz `//` nem `~` — AST montada à mão para
-        // exercitar o braço defensivo `_` da conversão String → BinOp/UnOp.
-        // `#` deixou de ser exemplo aqui na T29 (passou a ser suportado);
-        // ver a seção de testes da T29 mais abaixo.
+        // AST montada à mão para exercitar o braço defensivo `_` da
+        // conversão String → BinOp/UnOp, que só é alcançável assim: o
+        // parser nunca produz estas grafias. `#` deixou de ser exemplo aqui
+        // na T29 e `//`/`~` na T61 — os três passaram a ser suportados —,
+        // então o que resta são grafias inventadas.
         let loc = Loc { line: 1, col: 1 };
         let program: Program = vec![TopLevel::TopLevelFunc {
             loc,
@@ -3876,12 +4049,12 @@ end"#;
                         Exp::ExpBinop {
                             loc,
                             lhs: Box::new(Exp::ExpInteger { loc, value: 1 }),
-                            op: "//".to_string(),
+                            op: "<=>".to_string(),
                             rhs: Box::new(Exp::ExpInteger { loc, value: 2 }),
                         },
                         Exp::ExpUnop {
                             loc,
-                            op: "~".to_string(),
+                            op: "++".to_string(),
                             exp: Box::new(Exp::ExpInteger { loc, value: 1 }),
                         },
                     ],
@@ -3892,11 +4065,11 @@ end"#;
         let errs = check(&program).unwrap_err();
         assert!(
             errs.iter()
-                .any(|e| e.message.contains("operador `//` não é suportado"))
+                .any(|e| e.message.contains("operador `<=>` não é suportado"))
         );
         assert!(
             errs.iter()
-                .any(|e| e.message.contains("operador unário `~` não é suportado"))
+                .any(|e| e.message.contains("operador unário `++` não é suportado"))
         );
     }
 
@@ -4492,7 +4665,305 @@ end"#;
             "xs é passada por valor composto a `usa` → marcada mutável (uso sob &mut)"
         );
     }
+
+    // ---- T61: tipos de bitwise e `//` -----------------------------------
+
+    /// Tipo da expressão do primeiro `local` do corpo de `main` — atalho
+    /// para afirmar sobre o resultado de um operador sem desmontar a AST
+    /// tipada inteira.
+    fn tipo_do_primeiro_local(source: &str) -> Type {
+        let stats = typed_body_stats(source);
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl, obteve {:?}", stats[0]);
+        };
+        value.ty.clone()
+    }
+
+    fn fonte_com_local(exp: &str) -> String {
+        format!("function main(args: {{string}}): integer\n    local a = {exp}\n    return 0\nend")
+    }
+
+    #[test]
+    fn bitwise_entre_inteiros_resulta_integer() {
+        for exp in ["1 & 2", "1 | 2", "1 ~ 2", "1 << 2", "1 >> 2", "~1"] {
+            assert_eq!(
+                tipo_do_primeiro_local(&fonte_com_local(exp)),
+                Type::Integer,
+                "`{exp}` deveria resultar integer"
+            );
+        }
+    }
+
+    /// Divergência deliberada de `checker.lua:1097-1109`, que coage float
+    /// para integer: aqui o erro chega em português, em vez de truncar em
+    /// silêncio (PRD.md, T61).
+    #[test]
+    fn bitwise_com_float_produz_erro_em_portugues() {
+        for exp in ["1.5 & 2", "2 | 1.5", "1.5 ~ 2", "1.5 << 2", "1 >> 1.5"] {
+            let errs = check_source(&fonte_com_local(exp)).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("precisa ser integer")),
+                "`{exp}` deveria acusar operando não-integer, obteve {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bitwise_not_unario_com_float_produz_erro() {
+        let errs = check_source(&fonte_com_local("~1.5")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("`~` precisa ser integer"))
+        );
+    }
+
+    #[test]
+    fn bitwise_com_string_produz_erro() {
+        let errs = check_source(&fonte_com_local("\"a\" & 1")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("precisa ser integer"))
+        );
+    }
+
+    #[test]
+    fn divisao_inteira_segue_a_regra_aritmetica_dos_demais() {
+        assert_eq!(
+            tipo_do_primeiro_local(&fonte_com_local("7 // 2")),
+            Type::Integer
+        );
+        for exp in ["7.0 // 2", "7 // 2.0", "7.0 // 2.0"] {
+            assert_eq!(
+                tipo_do_primeiro_local(&fonte_com_local(exp)),
+                Type::Float,
+                "`{exp}` deveria promover a float"
+            );
+        }
+    }
+
+    #[test]
+    fn divisao_inteira_com_string_produz_erro_de_operando_numerico() {
+        let errs = check_source(&fonte_com_local("\"a\" // 2")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("precisa ser numérico"))
+        );
+    }
+
+    /// `~` desambigua pelo número de operandos: binário é XOR, prefixo é NOT
+    /// — os dois no mesmo programa, para provar que o checker não confunde.
+    #[test]
+    fn til_binario_e_unario_convivem_no_mesmo_programa() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local x = 5 ~ 3\n\
+             \x20   local y = ~0\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::Decl { value: x, .. } = &stats[0] else {
+            panic!("esperava Decl");
+        };
+        assert!(matches!(
+            x.kind,
+            TypedExpKind::Binop {
+                op: BinOp::BXor,
+                ..
+            }
+        ));
+        let TypedStat::Decl { value: y, .. } = &stats[1] else {
+            panic!("esperava Decl");
+        };
+        assert!(matches!(
+            y.kind,
+            TypedExpKind::Unop { op: UnOp::BNot, .. }
+        ));
+    }
+
+    /// T63: dentro de laço, `continue` vira `TypedStat::Continue` — em
+    /// `while` e em `for`, que é onde `loop_depth` é incrementado.
+    #[test]
+    fn continue_dentro_de_laco_e_aceito() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   while true do\n\
+             \x20       continue\n\
+             \x20   end\n\
+             \x20   for i = 1, 3 do\n\
+             \x20       continue\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::While { block, .. } = &stats[0] else {
+            panic!("esperava While");
+        };
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert!(matches!(corpo[0], TypedStat::Continue { .. }));
+        let TypedStat::For { block, .. } = &stats[1] else {
+            panic!("esperava For");
+        };
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert!(matches!(corpo[0], TypedStat::Continue { .. }));
+    }
+
+    /// Fora de laço é erro claro em português, com a mesma forma da mensagem
+    /// de `break` — a checagem é literalmente a mesma.
+    #[test]
+    fn continue_fora_de_laco_e_erro_claro() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   continue\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("`continue` fora de um laço")),
+            "{erros:?}"
+        );
+    }
+
+    /// T64: `repeat` deixou de ser rejeitado ("não é suportado nesta fase")
+    /// e passou a produzir `TypedStat::Repeat`, com a condição tipada como
+    /// `Boolean` — a mesma exigência do `while` (ADR 0005: sem truthy).
+    #[test]
+    fn repeat_produz_typed_repeat_com_condicao_boolean() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local n: integer = 0\n\
+             \x20   repeat\n\
+             \x20       n = n + 1\n\
+             \x20   until n > 3\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::Repeat {
+            block, condition, ..
+        } = &stats[1]
+        else {
+            panic!("esperava TypedStat::Repeat, obteve {:?}", stats[1]);
+        };
+        assert_eq!(condition.ty, Type::Boolean);
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert_eq!(corpo.len(), 1);
+    }
+
+    /// A armadilha da T64: em Lua a condição do `until` enxerga os `local`
+    /// declarados no corpo, o que obriga o escopo do bloco a fechar
+    /// **depois** de a condição ser tipada. Se `check_repeat` delegasse o
+    /// corpo a `check_stat` (que fecha o escopo ao sair do `StatBlock`),
+    /// este caso falharia com "nome não declarado".
+    #[test]
+    fn until_enxerga_local_declarado_no_corpo() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local n: integer = 0\n\
+             \x20   repeat\n\
+             \x20       local x: integer = n * 2\n\
+             \x20       n = n + 1\n\
+             \x20   until x > 10\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(matches!(stats[1], TypedStat::Repeat { .. }), "{stats:?}");
+    }
+
+    /// O outro lado da mesma moeda: o escopo **fecha**. O `local` do corpo
+    /// não vaza para depois do laço, senão o `repeat` estaria declarando no
+    /// escopo de fora.
+    #[test]
+    fn local_do_corpo_nao_vaza_para_depois_do_repeat() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   repeat\n\
+             \x20       local x: integer = 1\n\
+             \x20   until true\n\
+             \x20   return x\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("'x' não foi declarado")),
+            "{erros:?}"
+        );
+    }
+
+    /// Condição não-boolean é erro claro em português, nomeando `until` —
+    /// não `repeat` — porque é a palavra que o usuário escreveu antes dela.
+    #[test]
+    fn until_com_condicao_nao_boolean_e_erro_claro() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   repeat\n\
+             \x20   until 1\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("condição do `until`")),
+            "{erros:?}"
+        );
+    }
+
+    /// O corpo do `repeat` é laço para efeito de `loop_depth`: `break` e
+    /// `continue` dentro dele são aceitos sem caso especial (ADR 0023).
+    #[test]
+    fn break_e_continue_dentro_de_repeat_sao_aceitos() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local n: integer = 0\n\
+             \x20   repeat\n\
+             \x20       n = n + 1\n\
+             \x20       if n == 1 then\n\
+             \x20           continue\n\
+             \x20       end\n\
+             \x20       break\n\
+             \x20   until true\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::Repeat { block, .. } = &stats[1] else {
+            panic!("esperava Repeat");
+        };
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert!(matches!(corpo[2], TypedStat::Break { .. }), "{corpo:?}");
+    }
+
+    /// Depois do laço fechado `loop_depth` voltou a zero: um `continue` ali
+    /// é erro, mesmo havendo um laço antes no mesmo corpo.
+    #[test]
+    fn continue_depois_do_laco_e_erro_claro() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   while false do\n\
+             \x20   end\n\
+             \x20   continue\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("`continue` fora de um laço")),
+            "{erros:?}"
+        );
+    }
 }
-
-
-

@@ -202,7 +202,10 @@ chamado com `.` em vez de `:`
 Fase 4 soma mais cinco: acesso a texto por capability, não builtins nem
 `s[i]` ([ADR 0016](docs/adr/0016-acesso-a-texto-por-capability.md)), `break`
 sem `continue`
-([ADR 0017](docs/adr/0017-break-sim-continue-nao.md)), `titanc` exposto
+([ADR 0017](docs/adr/0017-break-sim-continue-nao.md) — a metade que recusava
+`continue` foi superada na Fase 5 pelo
+[ADR 0023](docs/adr/0023-continue-entra-com-o-incremento-no-topo.md)),
+`titanc` exposto
 como lib para o LSP reusar o pipeline
 ([ADR 0018](docs/adr/0018-titanc-lib-lsp-reusa-pipeline.md)), `tower-lsp`
 com deps isoladas do `Cargo.toml` gerado
@@ -225,7 +228,10 @@ compostos) + Fase 3 (capability runtimes) + Fase 4 (self-hosting / LSP):
   número→string).
 - Controle de fluxo: `if`/`elseif`/`else`, `while`, `for` numérico
   (`for x = start, finish[, inc] do ... end`), `break`
-  ([ADR 0017](docs/adr/0017-break-sim-continue-nao.md)).
+  ([ADR 0017](docs/adr/0017-break-sim-continue-nao.md)) e `continue`
+  (Fase 5, T63 — o `for` passou a ser emitido como `loop` com o incremento no
+  topo, [ADR 0022](docs/adr/0022-for-como-loop-com-incremento-no-topo.md) e
+  [ADR 0023](docs/adr/0023-continue-entra-com-o-incremento-no-topo.md)).
 - Atribuição single-target: `nome = exp` para local já declarada, incluindo
   `v[i] = x` e `p.campo = x`.
 - Tipos compostos: `array` (`{T}`, literal, indexação `v[i]`, `#v`, mutação
@@ -258,7 +264,7 @@ compostos) + Fase 3 (capability runtimes) + Fase 4 (self-hosting / LSP):
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
-- `repeat`/`until`, `continue`, `for`-in.
+- `repeat`/`until`, `for`-in.
 - Retornos múltiplos, multi-assign (`a, b = ...`).
 - Bitwise (`& | ~ << >>`), `//`.
 - `foreign import`, `import` com alias (`import data as d`),

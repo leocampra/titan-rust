@@ -182,6 +182,14 @@ pub enum Stat {
     StatBreak {
         loc: Loc,
     },
+    /// `continue` (Fase 5, T63) — o segundo nó realmente novo do projeto,
+    /// depois de `StatBreak`. O Titan original também não o tem; ele só foi
+    /// possível depois que a T62 tirou o `for` do desaçucaramento com o
+    /// incremento no fim do corpo (ADR 0022 supera o ADR 0004), o que
+    /// derrubou o fundamento técnico do ADR 0017.
+    StatContinue {
+        loc: Loc,
+    },
 }
 
 /// Ramo `then` de um `if` (`ast.lua`: `Then.Then`).

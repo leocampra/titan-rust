@@ -20,6 +20,25 @@
 //! | `{K: V}` | `HashMap<K, V>` (`&mut HashMap<K, V>` em posição de parâmetro) |
 //! | `record Nome` | `struct Nome` (`&mut Nome` em posição de parâmetro) |
 //!
+//! Seis operadores **não** mapeiam para o símbolo de grafia igual no Rust
+//! (PRD.md, T61) — o cruzamento entre `~` e `^` é a armadilha principal:
+//!
+//! | Titan | Significado | Rust |
+//! |---|---|---|
+//! | `^` | potência | `.powf` ([`emit_pow`]) |
+//! | `~` binário | XOR | `^` |
+//! | `~` unário | bitwise NOT | `!` (o mesmo de `not`, sobre `i64`) |
+//! | `//` | divisão com piso | `titan_runtime::idiv` ([`emit_idiv`]) |
+//! | `<<` `>>` | deslocamento de qualquer tamanho | `titan_runtime::shl`/`shr` ([`emit_shift`]) |
+//!
+//! `//` e os deslocamentos merecem destaque, e pelo mesmo motivo: existe um
+//! operador Rust de grafia igual, mas com semântica diferente — usar o
+//! símbolo direto compilaria e daria a resposta errada. O `/` trunca em direção a zero
+//! onde o Titan/Lua arredonda para baixo (`-7 // 2` é `-4`, não `-3`); o
+//! `<<` exige deslocamento em `0..64` e transborda fora disso, onde o
+//! Titan/Lua aceita qualquer inteiro (negativo inverte a direção, 64 ou mais
+//! zera).
+//!
 //! Nada aqui assume que valores são `Copy` (decisão 1 da Fase 2, PRD.md): a
 //! semântica de valor de arrays/maps/records vem de clonar explicitamente na
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
@@ -223,6 +242,15 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             collect_referenced_names_exp(condition, names);
             collect_referenced_names_stat(block, names);
         }
+        // `repeat` (T64): mesma leitura do `while`, invertida só na ordem em
+        // que corpo e condição aparecem no fonte — para efeito de "que nomes
+        // este statement lê", a ordem não importa.
+        TypedStat::Repeat {
+            block, condition, ..
+        } => {
+            collect_referenced_names_stat(block, names);
+            collect_referenced_names_exp(condition, names);
+        }
         TypedStat::For {
             start,
             finish,
@@ -239,7 +267,7 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             collect_referenced_names_lvalue(target, names);
             collect_referenced_names_exp(value, names);
         }
-        TypedStat::Break { .. } => {}
+        TypedStat::Break { .. } | TypedStat::Continue { .. } => {}
     }
 }
 
@@ -409,6 +437,34 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             indent(out, depth);
             out.push_str("}\n");
         }
+        // `repeat corpo until cond` (T64) → `loop { corpo; if cond {
+        // break; } }`. O `loop` do Rust é o único laço que não testa nada no
+        // topo, que é exatamente a semântica do `repeat`: o corpo roda ao
+        // menos uma vez. Corpo e condição saem dentro das **mesmas** chaves,
+        // e não em blocos separados, porque em Titan — como em Lua — o
+        // `until` enxerga os `local` do corpo (o checker já tipou os dois no
+        // mesmo escopo). `break` e `continue` do usuário caem no `loop` sem
+        // caso especial (ADR 0023): `break` sai, e `continue` volta ao topo
+        // — o que, aqui, **pula o teste do `until`** daquela iteração, uma
+        // divergência deliberada do C e do idioma `goto continue` do Lua,
+        // registrada no ADR.
+        TypedStat::Repeat {
+            block, condition, ..
+        } => {
+            indent(out, depth);
+            out.push_str("loop {\n");
+            emit_block_stats(out, block, depth + 1, ctx);
+            indent(out, depth + 1);
+            out.push_str("if ");
+            out.push_str(&emit_delimited_exp(condition, ctx));
+            out.push_str(" {\n");
+            indent(out, depth + 2);
+            out.push_str("break;\n");
+            indent(out, depth + 1);
+            out.push_str("}\n");
+            indent(out, depth);
+            out.push_str("}\n");
+        }
         TypedStat::Assign { target, value, .. } => {
             indent(out, depth);
             match target {
@@ -492,12 +548,20 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                 }
             }
         }
-        // `for` numérico sempre desaçucarado para `while`, nunca `Range` do
-        // Rust: `.step_by` não aceita passo negativo nem float, e `Range<f64>`
-        // não implementa `Iterator`. Um único template cobre integer/float,
-        // `inc` omitido (o checker já materializou `1`/`1.0`), `inc` negativo
-        // e `inc` só conhecido em runtime (PRD T15; ADR na T18). Sem caminho
-        // otimizado para `inc = 1` literal nesta fase — otimização futura.
+        // `for` numérico emitido como `loop` do Rust, nunca `Range`:
+        // `.step_by` não aceita passo negativo nem float, e `Range<f64>` não
+        // implementa `Iterator`. Um único template cobre integer/float, `inc`
+        // omitido (o checker já materializou `1`/`1.0`), `inc` negativo e
+        // `inc` só conhecido em runtime (PRD T15; ADR 0004 na T18).
+        //
+        // T62 revisa o ADR 0004: o desaçucaramento para `while` punha o
+        // incremento no **fim** do corpo, e um `continue` do usuário pularia
+        // por cima dele — laço infinito (o impeditivo que o ADR 0017
+        // registrou). Aqui o incremento vai para o **topo** do `loop`,
+        // guardado por um flag de primeira iteração, e o teste de parada vem
+        // logo depois. Assim todo caminho que volta ao topo — queda natural
+        // do fim do corpo ou `continue` explícito — passa pelo incremento.
+        // Sem caminho otimizado para `inc = 1` literal nesta fase.
         TypedStat::For {
             name,
             ty,
@@ -535,17 +599,38 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str(&format!(
                 "let titan_for_asc: bool = titan_for_inc > 0 as {t};\n"
             ));
+            // Incremento no topo, pulado só na primeira volta. O flag é a
+            // única forma de manter o incremento antes do corpo sem alterar o
+            // valor visto na primeira iteração.
             indent(out, inner);
-            out.push_str(&format!(
-                "while (titan_for_asc && {name} <= titan_for_finish)\n"
-            ));
+            out.push_str("let mut titan_for_primeira: bool = true;\n");
+            indent(out, inner);
+            out.push_str("loop {\n");
             indent(out, inner + 1);
-            out.push_str(&format!(
-                "|| (!titan_for_asc && {name} >= titan_for_finish) {{\n"
-            ));
-            emit_block_stats(out, block, inner + 1, ctx);
+            out.push_str("if titan_for_primeira {\n");
+            indent(out, inner + 2);
+            out.push_str("titan_for_primeira = false;\n");
             indent(out, inner + 1);
+            out.push_str("} else {\n");
+            indent(out, inner + 2);
             out.push_str(&format!("{name} += titan_for_inc;\n"));
+            indent(out, inner + 1);
+            out.push_str("}\n");
+            // Teste de parada depois do incremento: mesma condição de
+            // continuação de antes, negada.
+            indent(out, inner + 1);
+            out.push_str(&format!(
+                "if !((titan_for_asc && {name} <= titan_for_finish)\n"
+            ));
+            indent(out, inner + 2);
+            out.push_str(&format!(
+                "|| (!titan_for_asc && {name} >= titan_for_finish)) {{\n"
+            ));
+            indent(out, inner + 2);
+            out.push_str("break;\n");
+            indent(out, inner + 1);
+            out.push_str("}\n");
+            emit_block_stats(out, block, inner + 1, ctx);
             indent(out, inner);
             out.push_str("}\n");
             indent(out, depth);
@@ -554,6 +639,14 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
         TypedStat::Break { .. } => {
             indent(out, depth);
             out.push_str("break;\n");
+        }
+        // `continue` (T63) emite literalmente `continue;`, sem label: o
+        // template do `for` (ADR 0022) põe o incremento no topo do `loop`, de
+        // modo que voltar ao topo já avança a variável de controle, e o
+        // `while` do Rust reavalia a condição — nenhum laço auxiliar.
+        TypedStat::Continue { .. } => {
+            indent(out, depth);
+            out.push_str("continue;\n");
         }
     }
 }
@@ -772,8 +865,11 @@ fn emit_place_expr(exp: &TypedExp, ctx: Ctx) -> String {
     }
 }
 
-/// Operador Rust equivalente a um [`BinOp`] do Titan. `Pow` não tem operador
-/// (o `^` do Rust é XOR) e é emitido como chamada em [`emit_pow`].
+/// Operador Rust equivalente a um [`BinOp`] do Titan. Quatro variantes não
+/// têm símbolo direto e viram chamada: `Pow` ([`emit_pow`] — o `^` do Rust é XOR, não
+/// potência), `IDiv` ([`emit_idiv`] — o `/` do Rust trunca, o `//` do Titan
+/// arredonda para baixo) e `Shl`/`Shr` ([`emit_shift`] — o Rust transborda
+/// fora de `0..64`, o Titan aceita qualquer deslocamento).
 fn binop_symbol(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
@@ -790,7 +886,15 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::Ge => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
+        BinOp::BAnd => "&",
+        BinOp::BOr => "|",
+        // Atenção ao cruzamento: `~` binário no Titan é XOR, que no Rust é
+        // `^` — e o `^` do Titan é potência, que vira `.powf` em `emit_pow`.
+        BinOp::BXor => "^",
+        BinOp::Shl => unreachable!("`<<` é emitido como chamada em emit_shift"),
+        BinOp::Shr => unreachable!("`>>` é emitido como chamada em emit_shift"),
         BinOp::Pow => unreachable!("`^` é emitido como chamada a powf em emit_pow"),
+        BinOp::IDiv => unreachable!("`//` é emitido como chamada em emit_idiv"),
     }
 }
 
@@ -798,6 +902,14 @@ fn binop_symbol(op: BinOp) -> &'static str {
 /// decide se eles são necessários ([`emit_exp`]) ou proibidos pelo lint
 /// ([`emit_delimited_exp`]).
 fn emit_binop(op: BinOp, lhs: &TypedExp, rhs: &TypedExp, result_ty: &Type, ctx: Ctx) -> String {
+    // Os três que viram chamada saem antes de [`binop_symbol`]: não têm
+    // símbolo equivalente no Rust, e consultar a tabela cedo bateria no seu
+    // `unreachable!`.
+    match op {
+        BinOp::IDiv => return emit_idiv(lhs, rhs, result_ty, ctx),
+        BinOp::Shl | BinOp::Shr => return emit_shift(op, lhs, rhs, ctx),
+        _ => {}
+    }
     let symbol = binop_symbol(op);
     match op {
         // Aritméticos: o tipo do resultado já veio decidido do checker
@@ -819,8 +931,65 @@ fn emit_binop(op: BinOp, lhs: &TypedExp, rhs: &TypedExp, result_ty: &Type, ctx: 
         BinOp::And | BinOp::Or => {
             format!("{} {symbol} {}", emit_exp(lhs, ctx), emit_exp(rhs, ctx))
         }
+        // Bitwise sem deslocamento: o checker (T61) já garantiu `Integer`
+        // dos dois lados e resultado `Integer`, então nenhum cast entra
+        // aqui — mapeamento direto para os operadores do Rust sobre `i64`.
+        BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
+            format!("{} {symbol} {}", emit_exp(lhs, ctx), emit_exp(rhs, ctx))
+        }
+        BinOp::IDiv => unreachable!("`//` já saiu por emit_idiv acima"),
+        BinOp::Shl | BinOp::Shr => unreachable!("shifts já saíram por emit_shift acima"),
         BinOp::Pow => unreachable!("`^` é emitido como chamada a powf em emit_pow"),
     }
+}
+
+/// `//` — divisão com piso, **não** o `/` do Rust (PRD.md, T61).
+///
+/// Para inteiros, o `/` do Rust trunca em direção a zero (`-7 / 2 == -3`) e o
+/// Titan/Lua arredonda para baixo (`-7 // 2 == -4`): a emissão delega a
+/// `titan_runtime::idiv`, que faz o piso e ainda trata divisão por zero com
+/// mensagem em português. `div_euclid` **não** serve: para divisor negativo
+/// ele mantém o resto não-negativo em vez de arredondar para baixo
+/// (`(-7).div_euclid(-2)` é 4, e `-7 // -2` no Titan é 3).
+///
+/// Para float o piso é `.floor()` sobre a divisão comum, como em
+/// `coder.lua:1750-1767`.
+fn emit_idiv(lhs: &TypedExp, rhs: &TypedExp, result_ty: &Type, ctx: Ctx) -> String {
+    if *result_ty == Type::Float {
+        return format!(
+            "({} / {}).floor()",
+            emit_numeric_operand(lhs, result_ty, ctx),
+            emit_numeric_operand(rhs, result_ty, ctx)
+        );
+    }
+    format!(
+        "titan_runtime::idiv({}, {})",
+        emit_delimited_exp(lhs, ctx),
+        emit_delimited_exp(rhs, ctx)
+    )
+}
+
+/// `<<` e `>>` — deslocamento com a semântica do Titan, **não** a do Rust
+/// (PRD.md, T61).
+///
+/// O `<<` do Rust exige `0 <= b < 64` e transborda fora disso; quando o
+/// rustc consegue provar o transbordo, ele **recusa a compilação** — e a
+/// mensagem chegaria em inglês, sobre código que o usuário não escreveu
+/// (`1 << 64` é o caso mínimo). No Titan/Lua o deslocamento é um inteiro
+/// qualquer: negativo inverte a direção, 64 ou mais zera
+/// (`coder.lua:1670-1710`). A conta inteira mora no runtime, em
+/// `titan_runtime::shl`/`shr`.
+fn emit_shift(op: BinOp, lhs: &TypedExp, rhs: &TypedExp, ctx: Ctx) -> String {
+    let func = match op {
+        BinOp::Shl => "shl",
+        BinOp::Shr => "shr",
+        other => unreachable!("emit_shift só trata `<<`/`>>`, recebeu {other:?}"),
+    };
+    format!(
+        "titan_runtime::{func}({}, {})",
+        emit_delimited_exp(lhs, ctx),
+        emit_delimited_exp(rhs, ctx)
+    )
 }
 
 /// Comparações — o checker (T13) já validou as combinações: número com
@@ -886,6 +1055,10 @@ fn emit_unop(op: UnOp, operand: &TypedExp, ctx: Ctx) -> String {
     match op {
         UnOp::Neg => format!("-{}", emit_exp(operand, ctx)),
         UnOp::Not => format!("!{}", emit_exp(operand, ctx)),
+        // `~` unário do Titan é bitwise NOT, e o `!` do Rust é o mesmo
+        // operador de `not` — só que sobre `i64` em vez de `bool`. O checker
+        // (T61) já garantiu que o operando é `Integer`.
+        UnOp::BNot => format!("!{}", emit_exp(operand, ctx)),
         UnOp::Len => match &operand.ty {
             Type::Array { .. } => {
                 format!(
@@ -1515,10 +1688,10 @@ end"#;
         assert_eq!(output.status.code(), Some(0));
     }
 
-    // ---- T15: StatFor desaçucarado para while ---------------------------
+    // ---- T15/T62: StatFor emitido como `loop` com incremento no topo -----
 
     #[test]
-    fn for_emite_template_while_desacucarado() {
+    fn for_emite_loop_com_incremento_no_topo() {
         let source = r#"function main(args: {string}): integer
     for i = 1, 5 do
         print("x" .. i)
@@ -1530,12 +1703,39 @@ end"#;
         assert!(rust.contains("let titan_for_finish: i64 = 5;"));
         assert!(rust.contains("let titan_for_inc: i64 = 1;"));
         assert!(rust.contains("let titan_for_asc: bool = titan_for_inc > 0 as i64;"));
-        assert!(rust.contains("while (titan_for_asc && i <= titan_for_finish)"));
-        assert!(rust.contains("|| (!titan_for_asc && i >= titan_for_finish) {"));
+        assert!(rust.contains("let mut titan_for_primeira: bool = true;"));
+        assert!(rust.contains("loop {"));
+        assert!(rust.contains("if titan_for_primeira {"));
+        assert!(rust.contains("titan_for_primeira = false;"));
         assert!(rust.contains("i += titan_for_inc;"));
+        assert!(rust.contains("if !((titan_for_asc && i <= titan_for_finish)"));
+        assert!(rust.contains("|| (!titan_for_asc && i >= titan_for_finish)) {"));
+        // O `while` do template antigo (ADR 0004) não sobra em lugar nenhum.
+        assert!(!rust.contains("while (titan_for_asc"));
         // Nunca o Range do Rust (`.step_by` não cobre passo negativo/float).
         assert!(!rust.contains(".."));
         assert!(!rust.contains("step_by"));
+    }
+
+    /// O incremento precisa vir **antes** do corpo no texto emitido: é o que
+    /// faz um `continue` do usuário (T63) passar por ele em vez de pulá-lo.
+    #[test]
+    fn for_poe_o_incremento_antes_do_corpo_no_texto_emitido() {
+        let source = r#"function main(args: {string}): integer
+    for i = 1, 5 do
+        print("corpo")
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        let incremento = rust
+            .find("i += titan_for_inc;")
+            .expect("incremento emitido");
+        let corpo = rust.find("corpo").expect("corpo emitido");
+        assert!(
+            incremento < corpo,
+            "incremento deve preceder o corpo:\n{rust}"
+        );
     }
 
     #[test]
@@ -1551,7 +1751,9 @@ end"#;
         assert!(rust.contains("let titan_for_finish: f64 = 1.0;"));
         assert!(rust.contains("let titan_for_inc: f64 = 0.25;"));
         assert!(rust.contains("let titan_for_asc: bool = titan_for_inc > 0 as f64;"));
+        assert!(rust.contains("let mut titan_for_primeira: bool = true;"));
         assert!(rust.contains("x += titan_for_inc;"));
+        assert!(rust.contains("if !((titan_for_asc && x <= titan_for_finish)"));
     }
 
     #[test]
@@ -1997,5 +2199,266 @@ end"#;
         let rendered = emit_args_by_param(&args, &params, &ctx);
 
         assert_eq!(rendered, vec!["42", r#"&"oi".to_string()"#]);
+    }
+
+    // ---- T61: bitwise e `//` -------------------------------------------
+
+    /// Os critérios de aceite da T61 em execução real: `7 // 2` → 3,
+    /// **`-7 // 2` → -4** (piso, não truncagem), `5 & 3` → 1, `5 | 3` → 7,
+    /// `5 ~ 3` → 6 (XOR), `1 << 10` → 1024, `~0` → -1. Um programa só,
+    /// compilado com o rustc de verdade e conferido por stdout. Os
+    /// parênteses em volta dos bitwise não são decoração: na cascata do
+    /// Titan (T60, fiel a `parser.lua:369-395`) `..` liga **mais forte**
+    /// que `&`/`|`/`~`/`<<`/`>>`, então `"and=" .. 5 & 3` seria
+    /// `("and=" .. 5) & 3` — string num operando bitwise, erro de tipo.
+    #[test]
+    fn t61_bitwise_e_divisao_inteira_compilam_e_rodam_sem_warnings() {
+        let source = r#"function main(args: {string}): integer
+    print("7//2=" .. 7 // 2)
+    print("-7//2=" .. -7 // 2)
+    print("7//-2=" .. 7 // -2)
+    print("-7//-2=" .. -7 // -2)
+    print("7.0//2=" .. 7.0 // 2)
+    print("-7.0//2=" .. -7.0 // 2)
+    print("and=" .. (5 & 3))
+    print("or=" .. (5 | 3))
+    print("xor=" .. (5 ~ 3))
+    print("shl=" .. (1 << 10))
+    print("shr=" .. (1024 >> 10))
+    print("not=" .. ~0)
+    return 0
+end"#;
+        let rust = generate_source(source);
+
+        let (avisos, output) = compila_e_executa(&rust, "t61_bitwise");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        let esperado = concat!(
+            "7//2=3\n",
+            // O critério que separa `//` do `/` do Rust, que daria -3.
+            "-7//2=-4\n",
+            "7//-2=-4\n",
+            "-7//-2=3\n",
+            "7.0//2=3\n",
+            "-7.0//2=-4\n",
+            "and=1\n",
+            "or=7\n",
+            "xor=6\n",
+            "shl=1024\n",
+            "shr=1\n",
+            "not=-1\n",
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), esperado);
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// Deslocamento com quantidade fora de `0..64` é legal no Titan (zera) e
+    /// **overflow** no Rust — quando o rustc consegue provar, recusa a
+    /// compilação com mensagem em inglês. Este teste é a prova de que o
+    /// pipeline não deixa isso chegar ao rustc: a conta sai pelo runtime, e
+    /// o programa roda.
+    #[test]
+    fn deslocamento_fora_da_faixa_roda_em_vez_de_quebrar_o_rustc() {
+        let source = r#"function main(args: {string}): integer
+    local n: integer = 64
+    local m: integer = -10
+    print("shl64=" .. (1 << n))
+    print("shr64=" .. (1 >> n))
+    print("negativo=" .. (1024 << m))
+    print("logico=" .. (-1 >> 63))
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("titan_runtime::shl(1, n)"),
+            "shift deveria sair pelo runtime:\n{rust}"
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t61_shift_faixa");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "shl64=0\nshr64=0\nnegativo=1\nlogico=1\n"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// `//` inteiro sai por `titan_runtime::idiv`, nunca pelo `/` cru do
+    /// Rust; `//` float sai por `.floor()` sobre a divisão comum.
+    #[test]
+    fn divisao_inteira_emite_idiv_do_runtime_e_floor_para_float() {
+        let source = r#"function main(args: {string}): integer
+    local a: integer = 7 // 2
+    local b: float = 7.0 // 2.0
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("let a: i64 = titan_runtime::idiv(7, 2);"),
+            "esperava chamada a idiv, obteve:\n{rust}"
+        );
+        assert!(
+            rust.contains("let b: f64 = (7.0 / 2.0).floor();"),
+            "esperava floor para float, obteve:\n{rust}"
+        );
+    }
+
+    /// O cruzamento de símbolos que a T61 precisa acertar: Titan `~`
+    /// binário (XOR) vira `^` do Rust, Titan `^` (potência) vira `.powf`, e
+    /// Titan `~` unário (NOT) vira `!`.
+    #[test]
+    fn til_e_circunflexo_nao_se_confundem_na_emissao() {
+        let source = r#"function main(args: {string}): integer
+    local xor: integer = 5 ~ 3
+    local pot: float = 5.0 ^ 3.0
+    local nao: integer = ~0
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("let xor: i64 = 5 ^ 3;"), "{rust}");
+        assert!(
+            rust.contains("let pot: f64 = (5.0 as f64).powf(3.0 as f64);"),
+            "{rust}"
+        );
+        assert!(rust.contains("let nao: i64 = !0;"), "{rust}");
+    }
+
+    /// Bitwise em posição de operando continua parentetizado — a
+    /// precedência do Titan (`|` mais frouxo que `&`, que é mais frouxo que
+    /// os shifts) fica explícita no Rust gerado, sem depender de coincidir
+    /// com a do Rust.
+    #[test]
+    fn precedencia_de_bitwise_sai_explicita_em_parenteses() {
+        let source = r#"function main(args: {string}): integer
+    local a: integer = 1 | 2 & 3
+    local b: integer = 1 << 2 + 3
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("let a: i64 = 1 | (2 & 3);"), "{rust}");
+        // O shift vira chamada, e a precedência aparece no argumento: o
+        // `+` já foi agrupado pelo parser antes de virar operando.
+        assert!(
+            rust.contains("let b: i64 = titan_runtime::shl(1, 2 + 3);"),
+            "{rust}"
+        );
+    }
+
+    /// T63: `continue` do Titan emite literalmente `continue;` do Rust, sem
+    /// label e sem laço auxiliar — e, dentro do `for`, o `continue;` aparece
+    /// **depois** do incremento no texto, que é o que garante que voltar ao
+    /// topo avance a variável de controle (ADR 0022).
+    #[test]
+    fn continue_emite_continue_do_rust_depois_do_incremento() {
+        let source = r#"function main(args: {string}): integer
+    for i = 1, 5 do
+        if i == 2 then
+            continue
+        end
+        print("corpo")
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("continue;"), "{rust}");
+        let incremento = rust
+            .find("i += titan_for_inc;")
+            .expect("incremento emitido");
+        let cont = rust.find("continue;").expect("continue emitido");
+        assert!(incremento < cont, "incremento deve preceder o continue:\n{rust}");
+    }
+
+    /// No `while` o `continue;` também sai sem label: o `while` do Rust
+    /// reavalia a condição ao voltar ao topo, igual ao do Titan.
+    #[test]
+    fn continue_em_while_emite_continue_sem_label() {
+        let source = r#"function main(args: {string}): integer
+    local i: integer = 0
+    while i < 5 do
+        i = i + 1
+        continue
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("continue;"), "{rust}");
+        assert!(!rust.contains("'titan"), "sem label:\n{rust}");
+    }
+
+    /// T64: `repeat corpo until cond` vira `loop { corpo; if cond { break; }
+    /// }` — o `loop` do Rust é o único laço sem teste no topo, que é
+    /// exatamente a semântica do `repeat`.
+    #[test]
+    fn repeat_emite_loop_com_teste_no_fim() {
+        let source = r#"function main(args: {string}): integer
+    local n: integer = 0
+    repeat
+        n = n + 1
+    until n > 3
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("loop {"), "{rust}");
+        // O teste sai **depois** do corpo, e não antes: é isso que faz o
+        // laço rodar ao menos uma vez.
+        let corpo = rust.find("n = n + 1;").expect("corpo emitido");
+        let teste = rust.find("if n > 3 {").expect("teste do until emitido");
+        assert!(corpo < teste, "corpo deve preceder o teste:\n{rust}");
+        assert!(rust.contains("break;"), "{rust}");
+        // Sem `while` nem flag de primeira iteração: o `loop` já dá isso de
+        // graça, diferente do `for` (ADR 0022).
+        assert!(!rust.contains("titan_for_primeira"), "{rust}");
+    }
+
+    /// Corpo e condição saem dentro das **mesmas** chaves, e não em blocos
+    /// separados: um `local` do corpo referenciado pelo `until` precisa
+    /// estar em escopo no Rust gerado, ou o `rustc` rejeitaria o programa.
+    #[test]
+    fn local_do_corpo_fica_visivel_para_o_teste_do_until() {
+        let source = r#"function main(args: {string}): integer
+    local n: integer = 0
+    repeat
+        local x: integer = n
+        n = n + 1
+    until x > 3
+    return 0
+end"#;
+        let rust = generate_source(source);
+        let decl = rust.find("let x: i64 = n;").expect("local emitido");
+        let teste = rust.find("if x > 3 {").expect("teste do until emitido");
+        assert!(decl < teste, "declaração deve preceder o teste:\n{rust}");
+        // Mesma indentação = mesmo bloco: se o corpo saísse num `{ ... }`
+        // próprio, o teste do `until` estaria um nível acima e `x` teria
+        // saído de escopo no Rust gerado.
+        assert!(
+            rust.contains("        let x: i64 = n;") && rust.contains("        if x > 3 {"),
+            "corpo e teste em níveis distintos:\n{rust}"
+        );
+    }
+
+    /// `break` e `continue` do usuário dentro de `repeat` saem sem label,
+    /// como em qualquer outro laço (ADR 0023) — o `loop` do Rust os aceita
+    /// sem caso especial.
+    #[test]
+    fn break_e_continue_dentro_de_repeat_saem_sem_label() {
+        let source = r#"function main(args: {string}): integer
+    local n: integer = 0
+    repeat
+        n = n + 1
+        if n == 1 then
+            continue
+        end
+        break
+    until false
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("continue;"), "{rust}");
+        assert!(!rust.contains("'titan"), "sem label:\n{rust}");
     }
 }
