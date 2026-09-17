@@ -1860,7 +1860,7 @@ dois-pontos.
 | 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
 | 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
 | **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ✅ **Concluída** (T47–T58) |
-| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | ⬅ **próxima** |
+| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | ⬅ **próxima** (detalhada adiante, T59–T92) |
 
 ---
 ---
@@ -2304,4 +2304,1088 @@ multi-assign, declaração múltipla, `repeat`/`until`, `for`-in, bitwise
 | **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ✅ **Concluída** (T47–T58) |
 | 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
 | 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
-| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | ⬅ **próxima** |
+| 5. Self-hosting pleno | tipos soma + `match`, módulos de usuário, parser/checker em Titan | ⬅ **próxima** (detalhada adiante, T59–T92) |
+
+---
+---
+
+# PRD — Titan-Rust · Fase 5: Self-hosting pleno
+
+> Continuação da Fase 4 (T47–T58, **concluída**). Objetivo da fase:
+> `titanc selfhost/main.titan && ./main examples/nucleo.titan` roda o pipeline
+> `lexer → parser → checker` **escrito em Titan** sobre um programa Titan real,
+> e a seção "O que não está implementado ainda" do `README.md` deixa de existir
+> na forma atual. Tarefas T59–T92.
+
+## Resumo executivo
+
+O ADR 0020 fechou a Fase 4 com uma promessa explícita: tipos soma, módulos de
+usuário e parser/checker auto-hospedados ficam para a Fase 5. Esta fase cumpre a
+promessa e, no mesmo movimento, fecha as 14 construções que o `README.md:257-272`
+ainda lista como pendentes.
+
+**A evidência que encomendou a fase** é `examples/lexer.titan` (282 linhas): sem
+tipos soma, `TokenKind` virou `integer` com constantes-como-função; sem retornos
+múltiplos, a posição da varredura anda num `record` passado por `&mut`; sem
+módulos de usuário, tudo mora num arquivo só. Um `Exp` tem **13 variantes**
+(`ast.rs:216-281`) — com records gordos e tags inteiras, um checker de 4498
+linhas não tem onde morar.
+
+**Baseline medida antes de a fase começar:** `cargo test` **verde, 340 testes,
+exit 0**; HEAD em `40ba595 T58`; working tree limpo exceto o binário `lexer`
+untracked na raiz.
+
+**Ponto de partida favorável** (levantado na investigação que abre a fase — três
+atalhos que o roadmap não previa):
+
+- **`StatReturn` já carrega `Vec<Exp>`** (`ast.rs:175-178`) e `parse_stat_return`
+  (`parser.rs:567-580`) já aceita lista separada por vírgula. Retornos múltiplos
+  morrem no checker (`checker.rs:1713-1718`), não na sintaxe.
+- **`Type::Option` já existe** (`types.rs:35-37`) e **`ExpCast` também**
+  (`ast.rs:264`), com `as` já sendo token desde a T20. `Option`/`?` e cast `as`
+  são trabalho de checker e codegen, sem nós novos de AST.
+- **`ArgsMethod` tem zero referências fora de `ast.rs`** — `df:metodo()` morre no
+  parser (`parser.rs:915`), então habilitá-lo é construir o nó, não inventá-lo.
+- **`KEYWORDS`** (`lexer.rs:129-156`) é fonte única de verdade já consumida pelo
+  autocomplete do LSP: keyword nova aparece no editor sem trabalho extra.
+- **`titanc` já é lib** (ADR 0018), o que permite testar o parser escrito em Titan
+  **contra o parser em Rust, como oráculo** (T88).
+- **`collect_deps`/`imported_capabilities`** (`driver.rs:158-170`) já separam
+  capability de runtime — módulos de usuário entram por caminho paralelo.
+
+**Decisões fixadas (confirmadas com o usuário):**
+
+1. **Escopo**: tudo numa fase só — as 14 construções pendentes **mais** os
+   tipos soma, os módulos de usuário e o parser/checker auto-hospedados. Nada
+   fica pela metade.
+2. **Tipos soma**: `enum` com payload e `match` **exaustivo**, verificado pelo
+   checker em português. Recursão permitida, resolvida com `Box` na emissão.
+3. **`continue` entra reabrindo o ADR 0004**: o `for` deixa de ser desaçucarado
+   para `while`, em vez do paliativo de envolver o corpo num `loop` interno.
+4. **Módulos de usuário por manifesto `titan.toml`** com mapa nome → caminho
+   (não por convenção de nome de arquivo).
+5. **Um crate Cargo por programa**, um `mod` Rust por módulo Titan.
+
+**Decisões técnicas derivadas:**
+
+6. **A rejeição de tipo recursivo não se aplica a `enum`.** `checker.rs:733`
+   rejeita record recursivo porque em Rust ele seria infinitamente grande sem
+   `Box`. Para `enum`, o codegen insere o `Box` — e um `Exp` recursivo é o motivo
+   de ser da fase.
+7. **Exaustividade no checker, não no rustc.** Delegar seria mais barato e faria
+   o erro chegar em inglês, sobre código gerado que o usuário não escreveu —
+   violando a convenção mais antiga do projeto.
+8. **ADRs 0004 e 0017 ganham status `Superado`, não são apagados.** O histórico
+   de uma decisão revista vale mais que a decisão revista.
+9. **O crate `toml` entra no workspace do compilador e nunca no `Cargo.toml`
+   gerado** — mesma disciplina que o ADR 0019 impôs às deps do LSP.
+
+**Convenções de trabalho** (herdadas, seguem valendo):
+- `titan/` e `lua/` são **somente leitura**.
+- Cada tarefa termina com `cargo test` verde antes da seguinte, e um commit.
+- Mensagens de erro do compilador em português — nunca panic.
+
+**Grafo de dependências:**
+Parte A: `T59 → T60 → T61`; `T62 → T63`; `T64`; `T65 → T66 → T67`;
+`T68 → T69`; `T70`; `T71` (depende de T63); `T72`; `T73`;
+`T74 → T75 → T76 → T77`; `T78` fecha a parte.
+Parte B: `T79 → T80 → T81 → T82 → T83` (depende de T78).
+Parte C: `T84 → T85 → T86 → T87 → T88 → T89` (depende de T83).
+Parte D: `T90 → T91 → T92`.
+
+**Skills transversais** (valem para praticamente toda tarefa de código):
+`rust-pro` · `clean-code` · `test-driven-development` ·
+`verification-before-completion`
+
+---
+
+# Parte A — Construções de linguagem (T59–T78)
+
+## T59 — `lexer.rs`: os tokens que faltam
+
+**Objetivo:** abrir o léxico para tudo que a fase precisa, de uma vez, sem
+quebrar o que já existe.
+
+**Detalhes:**
+- Novos `TokenKind`: `KwEnum`, `KwMatch`, `KwContinue`, `KwRepeat`, `KwUntil`,
+  `KwIn`, `KwForeign` (keywords) · `Question` (`?`), `Amp` (`&`), `Pipe` (`|`),
+  `Shl` (`<<`), `Shr` (`>>`), `DoubleSlash` (`//`) (símbolos).
+- Acrescentar as keywords à tabela `KEYWORDS` (`lexer.rs:129-156`), que é fonte
+  única de verdade — o autocomplete do LSP as recebe de graça.
+- **`~` deixa de ser erro isolado** (`lexer.rs:663-669`): passa a ser bitwise NOT
+  unário e XOR binário, com `~=` continuando a ganhar por lookahead. Remover a
+  mensagem "'~' isolado não é um operador".
+- **`?` e `&` e `|` saem de `caractere inesperado`** (`lexer.rs:670-675`).
+- **Armadilha do `//` vs `--`:** comentário em Titan é `--`, então `//` não
+  colide; mas `/` seguido de `/` precisa de lookahead antes do braço `'/'` de
+  `lexer.rs:618`.
+- **Armadilha de `<<`/`>>` vs `<=`/`>=`:** o braço de lookahead precisa testar
+  `=` **e** o próprio caractere, na ordem certa.
+- **Registrar a quebra compatível:** `enum`, `match`, `continue`, `repeat`,
+  `until`, `in` e `foreign` deixam de ser identificadores válidos — mesmo tipo de
+  mudança de `as` (T20), `import` (T34) e `break` (T55).
+
+**Critério de aceite:** teste de tokenização para cada token novo; `~` isolado
+vira `Tilde`; `a ~= b` continua `Ne`; `5 // 2` não vira comentário; `1 << 2`,
+`1 <= 2` e `1 < 2` se distinguem; teste no molde de
+`keyword_nova_nao_casa_prefixo_de_identificador` (`lexer.rs:973`) provando que
+`matching` e `continuar` continuam sendo `Name`.
+
+**Depende de:** nada.
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T60 — `parser.rs`: bitwise e `//` na cascata de precedência
+
+**Objetivo:** reintroduzir os níveis que a Fase 1 omitiu deliberadamente.
+
+**Detalhes:**
+- `parser.rs:16` documenta "níveis bitwise fora de escopo"; esta tarefa os traz,
+  espelhando agora **por completo** `titan/titan-compiler/parser.lua:369-395`:
+
+```text
+or_exp     : and_exp (or and_exp)*
+and_exp    : rel_exp (and rel_exp)*
+rel_exp    : bor_exp ((== ~= < > <= >=) bor_exp)?
+bor_exp    : bxor_exp (| bxor_exp)*          — novo
+bxor_exp   : band_exp (~ band_exp)*          — novo (Titan `~` binário = XOR)
+band_exp   : shift_exp (& shift_exp)*        — novo
+shift_exp  : concat_exp ((<< >>) concat_exp)* — novo
+concat_exp : add_exp (.. concat_exp)?
+add_exp    : mul_exp ((+ -) mul_exp)*
+mul_exp    : unary_exp ((* / // %) unary_exp)*  — `//` entra aqui
+unary_exp  : (not | - | # | ~)* pow_exp      — `~` unário = NOT
+pow_exp    : simple_exp (^ unary_exp)?
+```
+- `ExpBinop`/`ExpUnop` com `op: String` usando as strings do original
+  (`"|"`, `"~"`, `"&"`, `"<<"`, `">>"`, `"//"`) — é o que o checker casa.
+- Atualizar o doc-comment de `parser.rs:16`, que hoje afirma o contrário.
+
+**Critério de aceite:** testes estruturais de precedência (`1 | 2 & 3` associa
+`&` primeiro · `1 << 2 + 3` associa `+` primeiro · `~x` unário vs `a ~ b`
+binário) e de parsing de `5 // 2`.
+
+**Depende de:** T59.
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T61 — `checker.rs` + `codegen.rs`: tipos e emissão de bitwise e `//`
+
+**Objetivo:** trocar duas rejeições genéricas pelos braços reais.
+
+**Detalhes:**
+- Substituir `checker.rs:2045` ("operador `{op}` não é suportado nesta fase") e
+  `checker.rs:2178` (unário) pelos casos concretos.
+- **Bitwise exige `Integer` dos dois lados**, sem coerção de float (fiel a
+  `checker.lua:910-1122`); resultado `Integer`. `1.5 & 2` dá erro claro em
+  português — é o caso que o rustc recusaria em inglês.
+- **`//`**: `Integer // Integer` → `Integer`; com qualquer `Float`, coage e
+  resulta `Float`.
+- **Emissão, com duas armadilhas de mapeamento:** Titan `~` **binário** é XOR,
+  que em Rust é `^` (e Titan `^` é potência, que em Rust é `.powf`); Titan `~`
+  **unário** é NOT, que em Rust é `!` — o mesmo `!` que já serve a `not`, mas
+  sobre inteiro.
+- **`//` não é `/` do Rust:** para inteiros, `/` do Rust trunca em direção a
+  zero e o Lua/Titan arredonda para baixo. `-7 // 2` é `-4`, não `-3`. Emitir
+  `div_euclid`/`.floor()` conforme o caso, não `/` cru.
+
+**Critério de aceite** (execução real, padrão `--emit-rust` + rustc): `7 // 2`
+→ 3 · **`-7 // 2` → -4** (floor, não trunc) · `5 & 3` → 1 · `5 | 3` → 7 ·
+`5 ~ 3` → 6 · `1 << 10` → 1024 · `~0` → -1 · `1.5 & 2` dá erro claro.
+
+**Depende de:** T60.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns` ·
+`architect-review`
+
+---
+
+## T62 — `codegen.rs`: o `for` deixa de ser desaçucarado (revisa o ADR 0004)
+
+**Objetivo:** a tarefa mais delicada da Parte A — mudar o template do `for` sem
+regredir nenhum dos casos que ele cobre hoje.
+
+**Contexto:** o template atual (`codegen.rs:495-552`) põe o incremento no **fim**
+do corpo, e é exatamente isso que o ADR 0017 apontou como impeditivo para
+`continue`. Havia o paliativo de envolver o corpo num `loop` interno; a decisão
+foi atacar a causa.
+
+**Detalhes:** substituir por um `loop` do Rust com o incremento no **topo**,
+guardado pela primeira iteração:
+
+```rust
+{
+    let mut i: i64 = start;
+    let titan_for_finish: i64 = finish;
+    let titan_for_inc: i64 = inc;
+    let titan_for_asc: bool = titan_for_inc > 0 as i64;
+    let mut titan_for_primeira: bool = true;
+    loop {
+        if titan_for_primeira {
+            titan_for_primeira = false;
+        } else {
+            i += titan_for_inc;
+        }
+        if !((titan_for_asc && i <= titan_for_finish)
+            || (!titan_for_asc && i >= titan_for_finish)) {
+            break;
+        }
+        // corpo — um `continue` aqui volta ao topo, e o incremento acontece
+    }
+}
+```
+
+- O bloco externo continua isolando a variável de controle e as auxiliares
+  (semântica Titan); laços aninhados seguem apenas sombreando.
+- O prefixo `titan_` segue a convenção de `mangle_fn_name`.
+- O template continua **único** para `i64` e `f64`, como o anterior.
+
+**Critério de aceite:** **todos** os testes de `for` da T15 passam sem
+alteração — `for i = 1, 5` → 5 iterações · `for i = 5, 1, -1` decrescente ·
+`for i = 1, 10, 2` → 1,3,5,7,9 · `for x = 0.0, 1.0, 0.25` conferido por contagem
+(não igualdade de float) · `for i = 1, 0` → zero iterações. Rodar esses testes
+**antes** de tocar no template, para saber que estavam verdes (risco 1).
+Rust gerado sem warnings.
+
+**Depende de:** nada (independente de T59–T61).
+
+**Skills:** `rust-pro` · `architect-review` · `test-driven-development` ·
+`find-bugs`
+
+---
+
+## T63 — `continue` (revisa o ADR 0017)
+
+**Objetivo:** o que a T62 viabilizou.
+
+**Detalhes:**
+- `ast.rs`: nó `StatContinue { loc }` — o segundo nó realmente novo do projeto,
+  depois de `StatBreak` (T55).
+- `parser.rs`: substituir a rejeição explícita de `parser.rs:427-430` por um
+  braço em `parse_stat`. A mensagem atual explica que `continue` pularia o
+  incremento — ela sai porque deixou de ser verdade.
+- `checker.rs`: variante em `TypedStat` e **a mesma** checagem de profundidade de
+  laço que `break` já usa (`checker.rs:1352`) — `continue` fora de laço é erro
+  claro.
+- `codegen.rs`: emite `continue;`.
+
+**Critério de aceite** (execução real, o ponto central): `continue` dentro de
+`for` **avança o laço** — um `for i = 1, 5` com `continue` para valores pares
+imprime 1, 3, 5 e **termina**. É a prova de que o bug que o ADR 0017 temia não
+existe mais. Idem em `while`; `continue` fora de laço dá erro claro.
+
+**Depende de:** T62.
+
+**Skills:** `rust-pro` · `test-driven-development` · `architect-review`
+
+---
+
+## T64 — `repeat`/`until`
+
+**Objetivo:** construir um nó que existe na AST desde a Fase 0 e nunca foi
+produzido.
+
+**Detalhes:**
+- `StatRepeat { block, condition }` já existe (`ast.rs:143-147`) e é rejeitado em
+  `checker.rs:1330`. Parser passa a produzi-lo; checker tipa a condição como
+  `Boolean`; codegen emite `loop { corpo; if cond { break; } }`.
+- **Armadilha da semântica do Lua:** a condição de `until` **enxerga as variáveis
+  declaradas no corpo** — `repeat local x = f() until x > 10` é válido. O escopo
+  do bloco precisa fechar *depois* de checar a condição, o que inverte a ordem
+  natural de `open_block`/`close_block`.
+- `break` e `continue` (T63) funcionam dentro de `repeat` sem caso especial.
+
+**Critério de aceite** (execução real): laço que roda ao menos uma vez mesmo com
+condição verdadeira de saída; `until` referenciando um `local` do corpo compila e
+roda; `break` e `continue` dentro de `repeat`.
+
+**Depende de:** T63.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns`
+
+---
+
+## T65 — `checker.rs`: retornos múltiplos
+
+**Objetivo:** remover uma rejeição cuja sintaxe já existe.
+
+**Detalhes:**
+- `parse_rettypes_opt` (`parser.rs:300`) passa a aceitar lista de tipos separada
+  por vírgula. `StatReturn` já tem `Vec<Exp>` e `parse_stat_return`
+  (`parser.rs:567-580`) já parseia a lista.
+- `checker.rs:1244` já compara aridade de retorno e produz
+  "retornou {} valor(es), mas a função espera {}" — reusar sem mudança.
+- Substituir a rejeição de `checker.rs:1713-1718` (`ExpAdjust`/`ExpExtra`) pelo
+  tratamento real: chamada em posição de expressão simples ajusta para o
+  primeiro valor (`ExpAdjust`), e o enésimo valor vira `ExpExtra`.
+- Tipo de retorno `nil` continua sendo lista vazia/`()`.
+
+**Critério de aceite:** `function divmod(a: integer, b: integer): integer, integer`
+tipa; aridade errada no `return` dá erro claro; usar uma chamada de 2 retornos em
+posição escalar ajusta para o primeiro.
+
+**Depende de:** nada (independente de T59–T64).
+
+**Skills:** `rust-pro` · `test-driven-development` · `architect-review`
+
+---
+
+## T66 — `codegen.rs`: retornos múltiplos como tupla Rust
+
+**Objetivo:** a emissão correspondente.
+
+**Detalhes:**
+- Assinatura com N>1 retornos vira `-> (T1, T2)`; `return a, b` vira
+  `return (a, b);`. Um retorno só continua exatamente como hoje (sem tupla de 1),
+  e `nil` continua `()`.
+- `rust_type_name` não muda — a tupla é montada no ponto da assinatura, a partir
+  de `rettypes`, que já é `Vec<Type>`.
+- Compostos seguem as regras do ADR 0006/0007 dentro da tupla.
+
+**Critério de aceite:** `--emit-rust` confere a tupla na assinatura e no
+`return`; execução real de uma função `divmod` imprimindo os dois valores.
+
+**Depende de:** T65.
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T67 — Multi-assign e declaração múltipla
+
+**Objetivo:** as duas rejeições que dependiam de retornos múltiplos.
+
+**Detalhes:**
+- Substituir `checker.rs:1171` ("declaração múltipla") e `checker.rs:1346`
+  ("atribuição múltipla").
+- `local a, b = f()` e `a, b = f()` desestruturam a tupla da T66.
+- **Armadilha da semântica do Lua:** `a, b = b, a` avalia **todos** os lados
+  direitos antes de atribuir qualquer um — emitir via `let` temporários, nunca
+  atribuição em sequência (que produziria `a == b`).
+- Aridade incompatível entre alvos e valores dá erro claro.
+- `fixup_mutability` (`checker.rs:1302`) precisa marcar **todos** os alvos.
+
+**Critério de aceite** (execução real): o swap `a, b = b, a` troca de verdade ·
+`local q, r = divmod(7, 2)` → 3 e 1 · aridade errada dá erro claro.
+
+**Depende de:** T66.
+
+**Skills:** `rust-pro` · `test-driven-development` · `find-bugs` ·
+`error-handling-patterns`
+
+---
+
+## T68 — `checker.rs`: `Option`/`?` e narrowing de fluxo
+
+**Objetivo:** o tipo que o ADR 0008 adiou desde a Fase 2.
+
+**Detalhes:**
+- `Type::Option { base }` já existe (`types.rs:35-37`), invariante em
+  `compatible`. Falta o `?` sufixo de tipo no parser (`integer?`) e a remoção da
+  rejeição de `checker.rs:989-991`.
+- **Narrowing**: dentro de `if x ~= nil then ... end`, `x` tem o tipo base. É a
+  parte cara — exige o checker reconhecer o teste e estreitar o símbolo no ramo,
+  sem alterar o tipo fora dele.
+- Usar um `T?` sem testar é erro claro em português ("pode ser nil").
+- `Decl.option` (`ast.rs:128`) já existe para `local x?`.
+
+**Critério de aceite:** `local x: integer? = nil` tipa; usar `x` diretamente dá
+erro claro; dentro de `if x ~= nil then` funciona; o estreitamento **não** vaza
+para depois do `if`.
+
+**Depende de:** nada (independente das anteriores).
+
+**Skills:** `rust-pro` · `test-driven-development` · `architect-review` ·
+`typescript-advanced-types`
+
+---
+
+## T69 — `codegen.rs`: `Option` no Rust gerado
+
+**Objetivo:** a emissão correspondente.
+
+**Detalhes:**
+- `Type::Option { base }` → `Option<T>`; `nil` em contexto opcional → `None`;
+  valor → `Some(v)`. `rust_type_name` ganha o braço, saindo do `unreachable!`.
+- O narrowing da T68 emite `if let Some(x) = ...` ou o `match` equivalente.
+- Compostos dentro de `Option` seguem ADR 0006/0007.
+
+**Critério de aceite:** execução real de uma função que devolve `integer?` e de
+um chamador que testa; Rust gerado **sem warnings**.
+
+**Depende de:** T68.
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T70 — Cast `as`
+
+**Objetivo:** construir um nó que já existe, com uma keyword que já é token.
+
+**Detalhes:**
+- `ExpCast { exp, target }` já existe (`ast.rs:264-268`) e `KwAs` é token desde a
+  T20. Parser passa a construí-lo em `parse_suffixed_exp` ou nível próprio;
+  checker substitui a rejeição de `checker.rs:1709-1711`.
+- **Conversões permitidas:** `integer ↔ float` e qualquer tipo → `value`.
+  `"a" as integer` continua erro claro — cast não é parsing.
+- Codegen emite `as i64` / `as f64`. **Armadilha:** `3.9 as integer` é 3
+  (trunca), e isso precisa estar documentado, porque difere do `//` da T61 que
+  arredonda para baixo.
+
+**Critério de aceite:** `1 as float` → 1.0 · `3.9 as integer` → 3 ·
+`-3.9 as integer` → -3 (trunca, não floor) · `"a" as integer` dá erro claro.
+
+**Depende de:** nada.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns`
+
+---
+
+## T71 — `for`-in sobre array e map
+
+**Objetivo:** a forma de laço que a Fase 1 adiou ("`for-in` depende de
+construções da Fase 2+").
+
+**Detalhes:**
+- `for x in v do ... end` sobre `{T}`; `for k, v in m do ... end` sobre `{K: V}`.
+- **Não** reusar o template da T62 — esse é do `for` numérico. Emitir `for`
+  nativo do Rust sobre iterador (`.iter()`, `.iter_mut()` conforme o uso),
+  respeitando ADR 0007.
+- **Ordem de iteração de map é não especificada** — o `HashMap` do Rust não
+  garante ordem. Documentar explicitamente no README, porque é uma diferença
+  observável que morde quem espera ordem de inserção.
+- `break` e `continue` (T63) funcionam dentro.
+- Mutar o container durante a iteração é erro claro do checker, não do borrow
+  checker em inglês.
+
+**Critério de aceite** (execução real): soma dos elementos de um `{integer}` ·
+iteração de `{string: integer}` · `break`/`continue` dentro · mutar durante a
+iteração dá erro claro em português.
+
+**Depende de:** T63.
+
+**Skills:** `rust-pro` · `test-driven-development` · `architect-review` ·
+`error-handling-patterns`
+
+---
+
+## T72 — `import` com alias e `df:metodo()`
+
+**Objetivo:** duas rejeições baratas e independentes, no mesmo commit porque
+nenhuma das duas exige mecanismo novo.
+
+**Detalhes:**
+- **`import data as d`**: substituir a rejeição de `parser.rs:173`. O ADR 0011 já
+  trata `import data` como açúcar de `local data = import "data"` com
+  `localname == modname` — alias é simplesmente `localname != modname`. O
+  `SymbolKind::Module` (`checker.rs`) já guarda o nome do módulo separado do nome
+  local.
+- **`df:soma("valor")`**: construir `Args::ArgsMethod` (`ast.rs:290-294`), hoje
+  com **zero referências fora de `ast.rs`**. Substituir `parser.rs:915` e
+  `checker.rs:2518`. Resolve no mesmo ponto do checker que `.` já resolve
+  (`Callee::Method`), então é um braço a mais, não um mecanismo.
+- O ADR 0014 passa a registrar que **as duas formas valem**, com `.` sendo a
+  preferida — em vez de `:` ser rejeitada.
+
+**Critério de aceite:** `import data as d` seguido de `d.read_csv(...)` compila e
+roda; `df:soma("valor")` produz **o mesmo resultado** de `df.soma("valor")`;
+alias colidindo com nome já declarado dá erro claro.
+
+**Depende de:** nada.
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code`
+
+---
+
+## T73 — `foreign import`
+
+**Objetivo:** a porta de FFI que o `plano.md` sempre previu.
+
+**Detalhes:**
+- Substituir a rejeição de `checker.rs:903-905`. `TopLevelForeignImport`
+  (`ast.rs:112-116`) já existe na AST e nunca foi produzido.
+- Declara função externa com assinatura Titan; codegen emite bloco
+  `extern "C"` e envolve as chamadas em `unsafe`.
+- **Manter mínimo e explícito** — é uma porta de FFI, não um gerador de
+  bindings. Tipos permitidos na fronteira: escalares e `string` (com a conversão
+  para `CString` explícita no runtime).
+- Assinatura malformada ou tipo não suportado na fronteira dá erro claro em
+  português, antes de o rustc reclamar.
+
+**Critério de aceite:** um `.titan` que chama uma função da libc (ex.: `abs`)
+compila e roda com o valor correto; tipo composto na fronteira dá erro claro.
+
+**Depende de:** nada.
+
+**Skills:** `rust-pro` · `c-pro` · `error-handling-patterns` ·
+`architect-review`
+
+---
+
+## T74 — `ast.rs` + `types.rs`: tipos soma
+
+**Objetivo:** o item mais caro da fase, e o que justifica a fase inteira.
+
+**Detalhes:**
+- `ast.rs`: `TopLevel::TopLevelEnum { loc, name, variants: Vec<Variant> }`, com
+  `struct Variant { loc, name, fields: Vec<Type> }`.
+- `types.rs`: `Type::Sum { name, variants: Vec<(String, Vec<Type>)> }`.
+  `equals` **nominal** (compara só o nome, como `Record` em `types.rs:73`);
+  `compatible` **invariante**, com braço explícito (ADR 0008).
+- **A decisão que muda tudo (decisão técnica 6):** a checagem de ciclo de
+  `checker.rs:733` — que rejeita record recursivo porque em Rust ele seria
+  infinitamente grande — **não se aplica a `enum`**. A recursão é resolvida com
+  `Box` na emissão (T77). `enum Exp ExpBinop(string, Exp, Exp) end` é o caso
+  central, não a exceção.
+- `type_name` (`checker.rs:2763`) ganha o braço, para as mensagens de erro.
+
+**Critério de aceite:** testes de `equals`/`compatible` no molde dos de `Record`
+(`types.rs:126-289`), incluindo: dois enums de nomes diferentes não são
+compatíveis; um `enum` recursivo é representável; `value` segue compatível com
+`enum` (gradual typing no topo).
+
+**Depende de:** nada.
+
+**Skills:** `rust-pro` · `typescript-advanced-types` · `architect-review` ·
+`test-driven-development`
+
+---
+
+## T75 — `parser.rs`: `enum` e `match`
+
+**Objetivo:** a sintaxe dos tipos soma.
+
+**Detalhes:**
+- **Declaração**, no molde de `parse_toplevel_record` (T23):
+  ```lua
+  enum Exp
+      ExpNil
+      ExpInteger(integer)
+      ExpBinop(string, Exp, Exp)
+  end
+  ```
+  Variante sem payload não leva parênteses.
+- **Construção**: `ExpInteger(42)` — colide sintaticamente com chamada de função.
+  Desambiguar **no checker** (T76), não no parser: o parser produz `ExpCall` e o
+  checker decide, exatamente como `{...}` é desambiguado por contexto em
+  `check_init_list` (`checker.rs:1723`). Evita backtracking.
+- **`match`**, como statement e como expressão:
+  ```lua
+  match e with
+      ExpInteger(n) then ...
+      ExpBinop(op, l, r) then ...
+      _ then ...
+  end
+  ```
+  Braços ligam os campos a nomes locais; `_` é o braço curinga.
+
+**Critério de aceite:** testes **de parser** (AST montada) para declaração com e
+sem payload, `match` com e sem `_`, e erros claros para `enum` sem variante,
+variante com parênteses vazios, `match` sem `with`, braço sem `then`.
+
+**Depende de:** T74.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns` ·
+`clean-code`
+
+---
+
+## T76 — `checker.rs`: tipagem de `enum`/`match` com exaustividade
+
+**Objetivo:** a garantia que o projeto não delega ao rustc (decisão técnica 7).
+
+**Detalhes:**
+- Campo `enums: HashMap<String, Type>` no `Checker`, no molde de `records`
+  (`checker.rs:352-368`); coleta na sub-passada de records (`collect_records`),
+  que já roda antes das funções.
+- **Desambiguar construção de variante × chamada de função** no `check_call`:
+  se o nome casa uma variante de `enum` conhecida, é construção; aridade e tipos
+  dos campos conferidos como argumentos.
+- **`match`**: o escrutinado precisa ser `Sum`; cada braço abre bloco próprio com
+  os campos ligados (reuso direto de `open_block`/`close_block`).
+- **Exaustividade, em português:** braço faltante lista **quais** variantes não
+  foram cobertas; braço duplicado e variante inexistente dão erros **distintos**;
+  `_` satisfaz a exaustividade e um `_` inalcançável (depois de todas as
+  variantes) é aviso, não erro.
+- **`match` como expressão**: todos os braços com o mesmo tipo, senão erro claro.
+
+**Critério de aceite:** `match` não exaustivo dá erro **nomeando as variantes que
+faltam** · braço duplicado, variante inexistente e aridade errada dão erros
+distintos · `match` como expressão com braços de tipos diferentes dá erro claro ·
+`enum` recursivo tipa sem disparar a checagem de ciclo de `checker.rs:733`.
+
+**Depende de:** T75.
+
+**Skills:** `rust-pro` · `architect-review` · `test-driven-development` ·
+`error-handling-patterns`
+
+---
+
+## T77 — `codegen.rs`: `enum` Rust, `match` e o `Box` automático
+
+**Objetivo:** a emissão — e a armadilha central da fase.
+
+**Detalhes:**
+- `emit_enum` no molde de `emit_record_struct` (`codegen.rs:94-108`), com
+  `#[derive(Clone, Debug, PartialEq)]`.
+- **`Box` automático (o ponto não-óbvio):** campo cujo tipo alcança o próprio
+  enum — direta ou indiretamente — vira `Box<T>`. Sem isso o rustc recusa em
+  inglês ("recursive type has infinite size"), sobre código que o usuário não
+  escreveu. Exige detectar o ciclo **de propósito**, ao contrário de
+  `checker.rs:733`, que o detecta para rejeitar.
+- Construção de variante → `Nome::Variante(args)`, com `Box::new` onde o campo
+  foi encaixotado.
+- `match` → `match` do Rust, com os padrões ligando os campos; `_` → `_`.
+  Deref implícito nos campos encaixotados. `ref`/`clone()` conforme ADR
+  0006/0007.
+- `rust_type_name` ganha o braço `Sum`, saindo do `unreachable!`.
+
+**Critério de aceite** (execução real, o mais importante da Parte A): uma
+mini-AST recursiva (`enum Exp` com literal e operação binária) construída e
+avaliada por `match` recursivo imprime o resultado correto. Rust gerado **sem
+warnings**.
+
+**Depende de:** T76.
+
+**Skills:** `rust-pro` · `architect-review` · `test-driven-development` ·
+`find-bugs`
+
+---
+
+## T78 — Revisão de qualidade da Parte A
+
+**Objetivo:** fechar a Parte A antes de a Parte B começar, como nas fases
+anteriores (revisão ao fim de T42, T45 e T52).
+
+**Detalhes:** revisar especialmente T62 (template do `for` reescrito), T67
+(ordem de avaliação do multi-assign) e T77 (`Box` automático) — as três com maior
+risco de bug silencioso. `cargo test` verde.
+
+**Depende de:** T59–T77.
+
+**Skills:** `code-reviewer` · `architect-review` · `find-bugs` ·
+`code-review-checklist`
+
+---
+
+# Parte B — Módulos de usuário (T79–T83)
+
+## T79 — `manifesto.rs`: o `titan.toml`
+
+**Objetivo:** dar ao programa um conjunto de fontes **declarado**, não inferido.
+
+**Detalhes:**
+- `crates/titanc/src/manifesto.rs` novo, declarado em `lib.rs`.
+- Formato:
+  ```toml
+  [pacote]
+  nome = "meucompilador"
+  principal = "src/main.titan"
+
+  [modulos]
+  lexer  = "src/lexer.titan"
+  parser = "src/parser.titan"
+  ```
+- Nome do módulo **pode diferir** do nome do arquivo; caminhos relativos ao
+  diretório do manifesto.
+- **O crate `toml` entra no workspace do compilador e nunca no `Cargo.toml`
+  gerado** (decisão técnica 9, mesma disciplina do ADR 0019).
+- Erros claros em português: manifesto malformado, campo obrigatório ausente,
+  caminho inexistente, nome de módulo duplicado, nome colidindo com capability
+  (`data`, `texto`, `io`).
+
+**Critério de aceite:** teste de parse feliz; um teste por caso de erro acima,
+conferindo a mensagem.
+
+**Depende de:** T78.
+
+**Skills:** `rust-pro` · `test-driven-development` · `error-handling-patterns` ·
+`clean-code`
+
+---
+
+## T80 — `driver.rs`: resolução e grafo de módulos
+
+**Objetivo:** o compilador deixa de ler um arquivo só.
+
+**Detalhes:**
+- `compile` (`driver.rs:173-236`) hoje faz um `read_to_string` de `opts.input`
+  (`driver.rs:174`). Passa a: procurar `titan.toml` ao lado do arquivo (ou via
+  `--manifesto`), carregar os módulos declarados, e montar o grafo a partir dos
+  `TopLevelImport` de cada um.
+- **Detecção de ciclo com mensagem clara nomeando o ciclo** (`a → b → a`),
+  espelhando o que `checker.rs:733` já faz para record recursivo.
+- Ordem topológica define a ordem de checagem e de emissão.
+- **Sem manifesto, o caminho de arquivo único fica inalterado** — é o que
+  preserva `hello`, `nucleo`, `compostos`, `dados` e `lexer`.
+- CLI (`main.rs`) ganha `--manifesto DIR|ARQUIVO`.
+
+**Critério de aceite:** programa de 3 módulos compila e roda; ciclo dá erro claro
+nomeando o caminho; módulo declarado mas inexistente dá erro claro;
+`hello.titan` sem manifesto produz **byte-a-byte** o que produzia antes.
+
+**Depende de:** T79.
+
+**Skills:** `rust-pro` · `architect-review` · `test-driven-development` ·
+`bash-defensive-patterns`
+
+---
+
+## T81 — `checker.rs`: importar módulo de usuário
+
+**Objetivo:** `import lexer` ao lado de `import texto`, sem confundir os dois.
+
+**Detalhes:**
+- `TopLevelImport` (`checker.rs:873-898`) hoje só consulta
+  `capabilities::lookup_module`. Passa a tentar **primeiro** a capability, depois
+  o módulo de usuário do manifesto; não achando nenhum, o erro lista **as duas**
+  fontes (hoje `checker.rs:897` lista só as capabilities).
+- Cada módulo é checado **uma vez** e seus símbolos exportados entram
+  qualificados pelo nome local do import (que pode ser alias, T72).
+- **Visibilidade:** `local function` **não** é exportada; função, record e enum
+  não-locais são. Chamar uma `local function` de outro módulo dá erro claro.
+- Reusar `Callee::Module` (`checker.rs`) — módulo de usuário e capability
+  resolvem no mesmo ponto, como `.`/`:` resolvem no mesmo ponto na T72.
+
+**Critério de aceite:** `lexer.proximo_token(e)` tipa entre arquivos; record e
+enum de um módulo usados em outro tipam; chamar `local function` de fora dá erro
+claro; nome de módulo de usuário colidindo com capability dá erro claro.
+
+**Depende de:** T80.
+
+**Skills:** `rust-pro` · `architect-review` · `test-driven-development` ·
+`error-handling-patterns`
+
+---
+
+## T82 — `codegen.rs`: um `mod` Rust por módulo Titan
+
+**Objetivo:** a emissão multi-módulo num único `main.rs`.
+
+**Detalhes:**
+- Cada módulo Titan vira `mod lexer { ... }` no `main.rs` gerado, com `pub` nos
+  símbolos exportados (T81).
+- `mangle_fn_name` (`codegen.rs:122`) continua valendo **dentro** de cada `mod` —
+  o namespace do Rust já separa, então não há mudança no mangling.
+- Record e enum de um módulo referenciados de outro saem qualificados
+  (`lexer::Token`). `rust_type_name` precisa saber o módulo de origem do tipo
+  nominal.
+- O shim de entrada (`ENTRY_SHIM`, `codegen.rs:113`) chama o `main` do módulo
+  principal.
+
+**Critério de aceite:** `--emit-rust` de um programa de 3 módulos mostra os
+`mod`s e as referências qualificadas; execução real com saída correta;
+programa de arquivo único emite **exatamente** o que emitia antes (sem `mod`
+supérfluo).
+
+**Depende de:** T81.
+
+**Skills:** `rust-pro` · `test-driven-development` · `clean-code` ·
+`architect-review`
+
+---
+
+## T83 — `driver.rs`: dependências do build multi-módulo
+
+**Objetivo:** capability importada por módulo interno tem de chegar ao
+`Cargo.toml`.
+
+**Detalhes:**
+- `collect_deps` (`driver.rs:158-170`) hoje olha só o programa principal. Passa a
+  **unir** as capabilities de todos os módulos do grafo, sem duplicar entradas.
+- **Um único crate Cargo por programa** (decisão 5) — o custo do Polars é pago
+  uma vez, não por módulo.
+- `imported_capabilities` (`checker.rs:2866`) passa a receber o conjunto de
+  programas, ou o driver faz a união.
+
+**Critério de aceite:** módulo interno com `import texto` faz `titan-texto`
+aparecer no `Cargo.toml` gerado; dois módulos importando `data` geram **uma**
+entrada; programa sem `import` nenhum segue com só `titan-runtime` — o teste
+`programa_sem_import_so_depende_do_titan_runtime` (`driver.rs:287`) passa sem
+alteração.
+
+**Depende de:** T82.
+
+**Skills:** `rust-pro` · `test-driven-development` · `monorepo-architect`
+
+---
+
+# Parte C — Parser e checker em Titan (T84–T89)
+
+> A prova da fase. Com tipos soma (T74–T77) e módulos de usuário (T79–T83), o
+> estilo deselegante que o ADR 0020 registrou deixa de ser imposto pela
+> linguagem.
+
+## T84 — `selfhost/ast.titan`
+
+**Objetivo:** a AST do Titan escrita em Titan — o arquivo que prova que os tipos
+soma resolveram o problema real.
+
+**Detalhes:**
+- `enum Exp` com as 13 variantes de `ast.rs:216-281`, **recursivo de verdade**
+  (`ExpBinop(string, Exp, Exp)`), sem tag inteira e sem record gordo.
+- `enum Stat`, `enum TopLevel`, `enum Var`, `enum Type`; `record Loc`.
+- `titan.toml` do projeto `selfhost/` declarando os módulos.
+- Comparar lado a lado com `examples/lexer.titan` (que usa
+  `function TK_NAME(): integer return 1 end`) — o contraste é o resultado
+  mensurável da fase, e vale um comentário no topo do arquivo.
+
+**Critério de aceite:** `selfhost/ast.titan` compila como módulo; um teste
+constrói uma `Exp` recursiva (`1 + 2 * 3`) e a percorre com `match`.
+
+**Depende de:** T83.
+
+**Skills:** `test-driven-development` · `clean-code` · `architecture`
+
+---
+
+## T85 — `selfhost/lexer.titan`
+
+**Objetivo:** o lexer no estilo novo, agora como módulo importável.
+
+**Detalhes:**
+- Port de `examples/lexer.titan` (282 linhas): `TokenKind` vira `enum` de
+  verdade; retornos múltiplos onde o record de estado era contorno; `for`-in
+  onde cabe.
+- **`examples/lexer.titan` permanece intocado.** É o registro histórico que o
+  ADR 0020 cita como evidência empírica — apagá-lo destruiria a justificativa da
+  fase. O ADR 0027 aponta um para o outro.
+
+**Critério de aceite:** tokeniza `examples/nucleo.titan` produzindo **a mesma
+lista** que `examples/lexer.titan` produz; teste comparando as duas saídas.
+
+**Depende de:** T84.
+
+**Skills:** `test-driven-development` · `clean-code` · `legacy-modernizer`
+
+---
+
+## T86 — `selfhost/parser.titan`
+
+**Objetivo:** descida recursiva em Titan produzindo a AST da T84.
+
+**Detalhes:**
+- Cobre o subconjunto que aparece em `examples/*.titan`: funções, `local`,
+  `return`, `if`/`while`/`for`, atribuição, chamadas, e a cascata de precedência
+  espelhando `parser.rs:583-600`.
+- Erros de sintaxe com linha/coluna, em português — a mesma convenção do
+  compilador em Rust.
+
+**Critério de aceite:** parseia `examples/hello.titan` e `examples/nucleo.titan`
+sem erro; erro claro (sem abortar) para `end` faltando.
+
+**Depende de:** T85.
+
+**Skills:** `test-driven-development` · `clean-code` · `architecture`
+
+---
+
+## T87 — `selfhost/checker.titan`
+
+**Objetivo:** a análise semântica em Titan.
+
+**Detalhes:**
+- Symtab em pilha e duas passadas, espelhando a estratégia do `checker.rs`
+  (coleta de assinaturas, depois verificação de corpos).
+- Regras de tipo do núcleo: aritmética, comparação, lógica, chamadas, `if`/
+  `while`/`for`, atribuição.
+- **Cobre o subconjunto que o parser da T86 aceita** — explicitamente **não** as
+  4498 linhas do `checker.rs`. Registrar isso no cabeçalho do arquivo e no ADR
+  0027 (risco 5).
+
+**Critério de aceite:** aceita `examples/nucleo.titan`; rejeita um programa com
+erro de tipo, com mensagem e posição.
+
+**Depende de:** T86.
+
+**Skills:** `test-driven-development` · `architecture` · `clean-code`
+
+---
+
+## T88 — `selfhost/main.titan` e a validação por oráculo
+
+**Objetivo:** **a prova da fase.**
+
+**Detalhes:**
+- Amarra `lexer → parser → checker` e imprime a AST tipada ou os erros.
+- **Validação por oráculo:** um teste de integração em Rust roda o pipeline
+  auto-hospedado e o pipeline do `titanc` (usável como lib desde o ADR 0018)
+  sobre os mesmos `examples/*.titan`, e **compara**. Divergência é falha de
+  teste — é o que impede o self-hosting de ser uma demonstração superficial.
+- Comparar a lista de tokens, a forma da AST e o conjunto de erros de tipo.
+
+**Critério de aceite:**
+`./target/release/titanc selfhost/main.titan && ./main examples/nucleo.titan`
+imprime a AST tipada e sai com 0; o teste de oráculo passa para `hello.titan` e
+`nucleo.titan`; os erros de tipo de um `.titan` inválido **batem** com os do
+`titanc`.
+
+**Depende de:** T87.
+
+**Skills:** `test-automator` · `verification-before-completion` · `find-bugs` ·
+`test-driven-development`
+
+---
+
+## T89 — Revisão de qualidade da Parte C
+
+**Objetivo:** como nas fases anteriores, revisar antes de fechar.
+
+**Depende de:** T88.
+
+**Skills:** `code-reviewer` · `architect-review` · `find-bugs`
+
+---
+
+# Parte D — Fechamento (T90–T92)
+
+## T90 — Curadoria dos testes de integração
+
+**Objetivo:** o que era fora de escopo e passou a funcionar sai da tabela de
+negativos; o que continua fora ganha caso próprio.
+
+**Detalhes:**
+- Mover para casos positivos tudo que a fase habilitou — há precedente
+  documentado desse movimento na T30/T31 e na T44
+  (`integration.rs:344-349`, `:365-368`).
+- **Casos negativos novos**, cada um pela tripla de `verifica_caso_negativo`
+  (`integration.rs:292-328`): `match` não exaustivo · variante de enum
+  inexistente · aridade errada de variante · ciclo de módulos · módulo não
+  declarado no manifesto · nome de módulo colidindo com capability · `continue`
+  fora de laço · bitwise com float · cast inválido · `foreign import` com tipo
+  composto na fronteira · mutar container durante `for`-in.
+- **Disciplina de custo herdada da Fase 3 (risco 1):** um único caso ponta a
+  ponta por capability pesada; todo o resto com `--emit-rust`, que não invoca o
+  `cargo`. **Isto importa mais nesta fase:** a suíte já leva ~13 min por causa do
+  Polars (`integration.rs:225`), e a Parte C acrescenta programas grandes.
+
+**Critério de aceite:** `cargo test` verde; nenhum caso negativo invoca o
+`cargo build` do projeto gerado desnecessariamente.
+
+**Depende de:** T89.
+
+**Skills:** `test-automator` · `test-driven-development` ·
+`verification-before-completion`
+
+---
+
+## T91 — Regressão e verificação ponta a ponta
+
+**Objetivo:** provar que 34 tarefas não moveram nada que já funcionava.
+
+**Detalhes:**
+- `hello`, `nucleo`, `compostos`, `dados` e `lexer` com saída **byte-a-byte
+  idêntica** à de antes da fase.
+- Teste conferindo que `titan.toml` e as deps do LSP **não** aparecem no
+  `Cargo.toml` gerado (risco 5 da Fase 4, agora com uma fonte a mais).
+- `cargo test` verde, com a contagem final registrada (baseline: 340).
+
+**Depende de:** T90.
+
+**Skills:** `verification-before-completion` · `test-automator` · `find-bugs`
+
+---
+
+## T92 — ADRs, documentação e fechamento da Fase 5
+
+**Objetivo:** deixar as decisões não-óbvias registradas e o projeto
+compreensível.
+
+**Entregáveis:**
+- ADRs `0021`–`0027` no formato Status/Contexto/Decisão/Consequências,
+  seguindo `0020-self-hosting-por-etapas.md`:
+
+  | ADR | Decisão |
+  |---|---|
+  | 0021 | Tipos soma como `enum` Rust nominal, com `Box` automático na recursão |
+  | 0022 | Exaustividade de `match` verificada pelo checker, em português |
+  | 0023 | **Supera o 0004** — `for` deixa de ser desaçucarado para `while` |
+  | 0024 | **Supera o 0017** — `continue` entra, viabilizado pelo 0023 |
+  | 0025 | Módulos de usuário por manifesto `titan.toml` explícito (nome → caminho) |
+  | 0026 | Um crate Cargo por programa, um `mod` Rust por módulo Titan |
+  | 0027 | Self-hosting pleno: parser/checker em Titan validados por oráculo |
+
+- **ADRs 0004 e 0017 ganham o status `Superado por 0023`/`Superado por 0024`**,
+  com um parágrafo explicando o que mudou — **não são apagados** (decisão
+  técnica 8).
+- `docs/adr/README.md`: acrescentar as 7 linhas à tabela e marcar os dois
+  superados.
+- `README.md`: **esvaziar a seção "O que não está implementado ainda"**
+  (`README.md:257-272`) — ela é, literalmente, a lista desta fase; o que sobra
+  são as Fases 3b/3c. Documentar a ordem não especificada do `for`-in sobre map
+  e o custo do build multi-módulo.
+- `docs/arquitetura.md`: manifesto e grafo de módulos no pipeline; `selfhost/`
+  como terceiro consumidor do compilador, ao lado do LSP.
+- `PRD.md`: marcar a Fase 5 como concluída no roadmap.
+
+**Depende de:** T91.
+
+**Skills:** `readme` · `docs-architect` · `architecture-decision-records` ·
+`mermaid-expert`
+
+---
+
+## Revisão de qualidade (contínua)
+
+Como nas fases anteriores: revisão ao fim de **T78** (fecha a Parte A), **T83**
+(fecha a Parte B) e **T89** (fecha a Parte C), antes de seguir.
+
+**Skills:** `code-reviewer` · `architect-review` · `find-bugs` ·
+`code-review-checklist`
+
+---
+
+## Riscos da fase
+
+1. **T62 (redesenho do `for`) pode regredir silenciosamente** casos que o
+   template atual cobre — float, passo negativo, passo só conhecido em runtime.
+   Nenhum deles falha em compilação: falham em valor. Os testes de `for` da T15
+   são a rede; **rodá-los antes** de tocar no template, para saber que estavam
+   verdes.
+2. **Exaustividade de `match` é o item mais caro da Parte A.** Se apertar, o
+   fallback é exigir braço `_` sempre — entrega a linguagem sem a garantia, e a
+   garantia entra depois, sem bloquear a Parte C.
+3. **O `Box` automático da T77 é a armadilha mais silenciosa da fase.** Esquecer
+   um caminho de recursão indireta produz erro do rustc em inglês, sobre código
+   gerado. Testar recursão direta **e** indireta (`A → B → A`).
+4. **Custo de build.** A suíte já leva ~13 min por causa do Polars. A Parte C
+   acrescenta cinco programas Titan grandes; manter a disciplina de
+   `--emit-rust` da T90 não é cosmético.
+5. **O escopo é grande — 34 tarefas.** A ordem é desenhada para que cada parte
+   feche verde: se a fase precisar parar, ela para num limite (T78, T83 ou T89),
+   nunca no meio de um mecanismo.
+6. **`selfhost/checker.titan` cobre um subconjunto**, não as 4498 linhas do
+   `checker.rs`. Isso é dado, não defeito — mas precisa estar escrito no ADR
+   0027 e no cabeçalho do arquivo, para não repetir a ambiguidade que o ADR 0020
+   teve de esclarecer depois.
+
+---
+
+## Fora de escopo nesta fase
+
+`titan-crypto` e `titan-ai` (Fases 3b/3c — com o mecanismo da Fase 3 pronto,
+cada um é um crate novo e uma tabela de funções: engenharia de biblioteca, não
+de compilador).
+
+**Redox OS** segue fora de escopo — compilar para Linux nativo. Nada na
+arquitetura impede um `--target` depois, já que o alvo real é o `cargo`.
+
+---
+
+## Roadmap atualizado (fim da Fase 5)
+
+| Fase | Escopo | Estado |
+|---|---|---|
+| **0. Hello world** | pipeline completo, subconjunto mínimo | ✅ **Concluída** |
+| **1. Núcleo da linguagem** | int/float/bool, aritmética, `if`/`while`/`for`, funções | ✅ **Concluída** |
+| **2. Tipos compostos** | arrays, maps, records, strings dinâmicas | ✅ **Concluída** |
+| **3. Capability Runtimes** | mecanismo (`import`, namespaces, tipos opacos) + `titan-data` | ✅ **Concluída** |
+| **4. Self-hosting / LSP** | LSP em Rust + `texto`/`io`/`break` + lexer em Titan | ✅ **Concluída** (T47–T58) |
+| **5. Self-hosting pleno** | tipos soma + `match`, módulos de usuário, parser/checker em Titan | ⬅ **em execução** (T59–T92) |
+| 3b. Crypto Runtime | `titan-crypto` sobre o mecanismo da Fase 3 | Pendente |
+| 3c. AI Runtime | `titan-ai` sobre o mecanismo da Fase 3 | Pendente |
