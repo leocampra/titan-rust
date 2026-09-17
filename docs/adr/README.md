@@ -22,3 +22,4 @@
 | [0018](0018-titanc-lib-lsp-reusa-pipeline.md) | `titanc` exposto como lib: o LSP reusa o pipeline sem invocar o `cargo` |
 | [0019](0019-lsp-tower-lsp-deps-isoladas.md) | LSP sobre `tower-lsp`; deps do servidor nunca entram no `Cargo.toml` gerado |
 | [0020](0020-self-hosting-por-etapas.md) | Self-hosting por etapas: lexer na Fase 4, parser/checker na Fase 5 |
+| [0021](0021-bitwise-exige-integer-sem-coercao.md) | Bitwise exige `integer` estrito, sem coagir `float` (diverge do original); `//` e deslocamentos vão para o runtime |

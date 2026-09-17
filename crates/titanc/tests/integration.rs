@@ -21,9 +21,9 @@
 //!   escopo após arrays/records/maps serem aceitos — retornos múltiplos,
 //!   métodos, `import`, `repeat`, `break`, bitwise, `//`, `Option`, `as`,
 //!   multi-assign e as regras de tipos de record/map — continua rejeitado
-//!   com erro claro (bitwise e `//` agora pelo checker, não mais pelo
-//!   parser: T60). `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
-//!   real no codegen desde a T30;
+//!   com erro claro. `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
+//!   real no codegen desde a T30; bitwise e `//` saíram na T61, e o que
+//!   resta deles é o negativo de tipo (`1.5 & 2`);
 //! - arquivos `.titan` reais do Titan original nunca panicam ao serem
 //!   processados (compilam ou falham com erro claro), e os que usam somente
 //!   o idioma de arrays já suportado (`sieve.titan`, `selection_sort.titan`)
@@ -47,9 +47,14 @@
 //!   risco 5 (Cargo.toml gerado nunca depender do LSP) é conferido dentro do
 //!   build de `hello.titan` já pago pelo caminho feliz, sem custo extra.
 //! - abertura da Fase 5 (PRD.md, T59): as tabelas de fora-de-escopo mudam de
-//!   camada onde o léxico abriu (`& | ~ << >> // ?` agora são tokens, então
-//!   a rejeição virou sintática) e `KEYWORDS_NOVAS_DA_T59` registra a quebra
-//!   compatível das sete palavras-chave novas.
+//!   camada onde o léxico abriu (`?` agora é token, então a rejeição de
+//!   `tipo_option` virou sintática) e `KEYWORDS_NOVAS_DA_T59` registra a quebra compatível das
+//!   sete palavras-chave novas;
+//! - bitwise e `//` completos (PRD.md, T61): `& | ~ << >> //` percorreram
+//!   lexer (T59), parser (T60) e agora checker/codegen — o caminho feliz é
+//!   provado por execução real em
+//!   `compila_e_executa_bitwise_e_divisao_inteira`, com `-7 // 2` dando -4
+//!   (piso, não truncagem).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -793,9 +798,10 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// rejeitada em alguma etapa (léxica, sintática ou de tipos) com erro claro,
 /// nunca panic.
 ///
-/// `indexacao_de_array`, `construtor_de_array` e `operador_length` saíram
-/// desta tabela na T30/T31: viraram casos positivos (arrays têm suporte real
-/// no codegen). `chamada_de_metodo` e `tipo_option` continuam rejeitados,
+/// `indexacao_de_array`, `construtor_de_array`, `operador_length` (T30/T31)
+/// e os seis de bitwise/`//` (T61) saíram desta tabela por terem virado
+/// caminho feliz — arrays e operadores têm suporte real no codegen.
+/// `chamada_de_metodo` e `tipo_option` continuam rejeitados,
 /// mas por outra camada: com `.` e `[` lexados e o parser sabendo indexação,
 /// a rejeição de `chamada_de_metodo` já não vem do lexer, e sim do parser não
 /// reconhecer `:` como início de chamada de método. `break_fora_de_escopo`
@@ -823,41 +829,16 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    repeat print(\"x\") until true\n    return 0\nend",
         trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
-    // Os seis casos abaixo mudaram de camada duas vezes na Fase 5. Na T59
-    // `& | ~ << >> // ?` viraram tokens e a rejeição saiu do lexer para o
-    // parser; na T60 o parser ganhou os níveis de precedência e ela desceu
-    // outra vez, agora para o checker — mesmo trajeto do `break` na T55.
-    // Continuam rejeitados: quem fecha o buraco é a T61, que troca estes
-    // braços genéricos de `check_binop`/`check_unop` pelos braços reais.
+    // Os seis casos de bitwise e `//` que ficavam aqui saíram da tabela na
+    // T61: viraram casos **positivos**, com execução real em
+    // `compila_e_executa_bitwise_e_divisao_inteira` — mesmo movimento que
+    // `indexacao_de_array` fez na T30 e `break` na T55. O que sobrou da
+    // família é o negativo de tipo, `bitwise_com_float`, logo abaixo: o
+    // operador existe, o que não existe é coerção float→integer.
     CasoNegativo {
-        nome: "bitwise_and",
-        fonte: "function main(args: {string}): integer\n    local a = 1 & 2\n    return 0\nend",
-        trecho_esperado: "operador `&` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "bitwise_or",
-        fonte: "function main(args: {string}): integer\n    local a = 1 | 2\n    return 0\nend",
-        trecho_esperado: "operador `|` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "bitwise_not_isolado",
-        fonte: "function main(args: {string}): integer\n    local a = ~2\n    return 0\nend",
-        trecho_esperado: "operador unário `~` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "shift_esquerda",
-        fonte: "function main(args: {string}): integer\n    local a = 1 << 2\n    return 0\nend",
-        trecho_esperado: "operador `<<` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "shift_direita",
-        fonte: "function main(args: {string}): integer\n    local a = 1 >> 2\n    return 0\nend",
-        trecho_esperado: "operador `>>` não é suportado nesta fase",
-    },
-    CasoNegativo {
-        nome: "divisao_inteira",
-        fonte: "function main(args: {string}): integer\n    local a = 1 // 2\n    return 0\nend",
-        trecho_esperado: "operador `//` não é suportado nesta fase",
+        nome: "bitwise_com_float",
+        fonte: "function main(args: {string}): integer\n    local a = 1.5 & 2\n    return 0\nend",
+        trecho_esperado: "operando de `&` precisa ser integer",
     },
     CasoNegativo {
         nome: "tipo_option",
@@ -1191,6 +1172,90 @@ fn compila_e_executa_break_saindo_de_while_e_de_for() {
     let esperado = "while-1\nwhile-2\nwhile-3\nfor-1\nfor-2\n";
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T61 pelo pipeline completo (`titanc` → Rust →
+/// `cargo build` → executável): bitwise e `//` percorrem lexer, parser,
+/// checker e codegen e produzem os valores certos em execução real. O caso
+/// que dá nome à tarefa é `-7 // 2`: o `/` do Rust truncaria para -3, e o
+/// `//` do Titan/Lua arredonda para baixo, dando -4.
+#[test]
+fn compila_e_executa_bitwise_e_divisao_inteira() {
+    let out_dir = temp_dir("bitwise-execucao-real");
+
+    // Os parênteses em volta dos bitwise são necessários: na cascata de
+    // precedência do Titan (T60) `..` liga mais forte que `&`/`|`/`~`, então
+    // sem eles a string entraria como operando do operador bitwise.
+    let source = concat!(
+        "function main(args: {string}): integer\n",
+        "    print(\"7//2=\" .. 7 // 2)\n",
+        "    print(\"-7//2=\" .. -7 // 2)\n",
+        "    print(\"and=\" .. (5 & 3))\n",
+        "    print(\"or=\" .. (5 | 3))\n",
+        "    print(\"xor=\" .. (5 ~ 3))\n",
+        "    print(\"shl=\" .. (1 << 10))\n",
+        // Deslocamento fora de `0..64` é legal no Titan (zera) e overflow no
+        // Rust — com constantes, o rustc recusaria a compilação em inglês.
+        "    print(\"shl64=\" .. (1 << 64))\n",
+        "    print(\"shlneg=\" .. (1024 << -10))\n",
+        "    print(\"not=\" .. ~0)\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "bitwise_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de bitwise: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("bitwise_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./bitwise_exec");
+    let esperado = "7//2=3\n-7//2=-4\nand=1\nor=7\nxor=6\nshl=1024\nshl64=0\nshlneg=1\nnot=-1\n";
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// `1.5 & 2` é o caso que o PRD (T61) destaca: o rustc recusaria em inglês,
+/// sobre código que o usuário não escreveu — aqui o erro chega em português,
+/// do checker, antes de qualquer `cargo build`.
+#[test]
+fn bitwise_com_float_produz_erro_em_portugues_sem_panic() {
+    let out_dir = temp_dir("bitwise-float");
+    let source_path = write_source(
+        &out_dir,
+        "bitwise_float.titan",
+        "function main(args: {string}): integer\n    local a = 1.5 & 2\n    return 0\nend",
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&output);
+    assert!(!output.status.success(), "esperava falha de checagem");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("operando de `&` precisa ser integer"),
+        "stderr inesperado: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }

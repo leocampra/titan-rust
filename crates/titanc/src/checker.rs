@@ -16,11 +16,13 @@
 //!   (`checker.lua:365-368` e `447-457`), `for` numérico espelhando
 //!   `checkfor` (`checker.lua:239-288`) e atribuição single-target
 //!   (`checker.lua:378-410`).
-//! - Operadores da Fase 1 (T13): regras de tipo espelhando
-//!   `checker.lua:910-1122` (sem bitwise/gradual typing), com a coerção
-//!   int→float centralizada em `numeric_result`. O checker **não** emite nó
-//!   de cast: o codegen decide o `as f64` comparando o tipo do operando com
-//!   o tipo do resultado.
+//! - Operadores (T13, completados na T61): regras de tipo espelhando
+//!   `checker.lua:910-1122` (sem gradual typing), com a coerção int→float
+//!   centralizada em `numeric_result`. O checker **não** emite nó de cast:
+//!   o codegen decide o `as f64` comparando o tipo do operando com o tipo
+//!   do resultado. Bitwise (`& | ~ << >>`) exige `integer` estrito, sem
+//!   coerção de float — divergência deliberada do original, ADR 0021; `//`
+//!   segue a regra aritmética de `+ - * %`.
 //! - **Rastreio de mutabilidade** (decisão 6 da Fase 1): cada `local` recebe
 //!   um id; atribuições registram o id do símbolo resolvido (mesmo espírito
 //!   do `var._decl._assigned = true` do original) e um fix-up ao final do
@@ -366,6 +368,9 @@ pub enum BinOp {
     Div,
     Mod,
     Pow,
+    /// `//` — divisão com piso (T61). Não é o `/` do Rust: para inteiros o
+    /// Rust trunca em direção a zero e o Titan/Lua arredonda para baixo.
+    IDiv,
     Eq,
     Ne,
     Lt,
@@ -374,12 +379,24 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// `&` — bitwise AND (T61).
+    BAnd,
+    /// `|` — bitwise OR (T61).
+    BOr,
+    /// `~` **binário** — XOR no Titan (o `~` unário é NOT, e o `^` do Titan
+    /// é potência, não XOR). Vira `^` na emissão (T61).
+    BXor,
+    /// `<<` — deslocamento à esquerda (T61).
+    Shl,
+    /// `>>` — deslocamento à direita (T61).
+    Shr,
 }
 
 impl BinOp {
     /// Grafia do operador no fonte Titan — as mesmas strings que o parser
-    /// coloca em `ExpBinop.op`. `None` para operadores fora do subconjunto
-    /// (bitwise, `//`), que viram erro claro no chamador.
+    /// coloca em `ExpBinop.op`. Desde a T61 cobre todos os operadores
+    /// binários que o parser produz (bitwise e `//` inclusive); `None`
+    /// sobra só para AST montada à mão, que vira erro claro no chamador.
     fn from_source(op: &str) -> Option<BinOp> {
         Some(match op {
             "+" => BinOp::Add,
@@ -396,6 +413,13 @@ impl BinOp {
             ">=" => BinOp::Ge,
             "and" => BinOp::And,
             "or" => BinOp::Or,
+            "//" => BinOp::IDiv,
+            "&" => BinOp::BAnd,
+            "|" => BinOp::BOr,
+            // Titan `~` binário é XOR (o `^` é potência) — ver `BinOp::BXor`.
+            "~" => BinOp::BXor,
+            "<<" => BinOp::Shl,
+            ">>" => BinOp::Shr,
             _ => return None,
         })
     }
@@ -461,6 +485,9 @@ pub enum UnOp {
     Neg,
     Not,
     Len,
+    /// `~` **unário** — bitwise NOT sobre inteiro (T61). Vira `!` no Rust,
+    /// o mesmo operador de `Not`, mas sobre `i64` em vez de `bool`.
+    BNot,
 }
 
 // ---- Checker -------------------------------------------------------------
@@ -2036,8 +2063,8 @@ impl Checker {
         })
     }
 
-    /// Regras de tipo dos operadores binários (T13), espelhando
-    /// `checker.lua:910-1122` sem bitwise nem gradual typing.
+    /// Regras de tipo dos operadores binários (T13/T61), espelhando
+    /// `checker.lua:910-1122` sem gradual typing.
     fn check_binop(&mut self, loc: Loc, op_str: &str, lhs: &Exp, rhs: &Exp) -> Option<TypedExp> {
         let Some(op) = BinOp::from_source(op_str) else {
             self.error(
@@ -2052,7 +2079,9 @@ impl Checker {
 
         let ty = match op {
             // Ambos numéricos; int/int → int, qualquer float promove a float.
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
+            // `//` entra aqui: no original é o mesmo braço de `+ - * %`
+            // (`checker.lua:988`) — int/int → int, qualquer float promove.
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::IDiv => {
                 if !self.check_numeric_operands(op_str, &lhs, &rhs) {
                     return None;
                 }
@@ -2127,6 +2156,18 @@ impl Checker {
                 }
                 Type::Boolean
             }
+            // Bitwise exige `Integer` dos dois lados, resultado `Integer`.
+            // Divergência deliberada de `checker.lua:1097-1109`, que coage
+            // float para integer (ADR 0021): aqui `1.5 & 2` é erro claro em
+            // português, e não uma truncagem silenciosa — quem quiser
+            // truncar escreve o cast (T71). Nenhuma promoção int→float
+            // acontece, então o resultado é sempre `Integer`.
+            BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
+                if !self.check_integer_operands(op_str, &lhs, &rhs) {
+                    return None;
+                }
+                Type::Integer
+            }
         };
 
         Some(TypedExp {
@@ -2159,19 +2200,43 @@ impl Checker {
         ok
     }
 
+    /// Reporta um erro por lado não-inteiro de um operador bitwise,
+    /// apontando o `loc` do operando culpado. Separado de
+    /// [`Checker::check_numeric_operands`] porque bitwise **não** aceita
+    /// float: a mensagem precisa dizer `integer`, não "numérico".
+    fn check_integer_operands(&mut self, op_str: &str, lhs: &TypedExp, rhs: &TypedExp) -> bool {
+        let mut ok = true;
+        for side in [lhs, rhs] {
+            if !side.ty.equals(&Type::Integer) {
+                self.error(
+                    side.loc,
+                    format!(
+                        "operando de `{op_str}` precisa ser integer, encontrado {}.",
+                        type_name(&side.ty)
+                    ),
+                );
+                ok = false;
+            }
+        }
+        ok
+    }
+
     /// Regras de tipo dos operadores unários (T13/T29): `-` numérico preserva
     /// o tipo do operando; `not` é boolean → boolean (`checker.lua:1100-1122`);
     /// `#` (`checker.lua:852-859`) sobre `Array`/`String` resulta `Integer` —
     /// `parser::parse_unary_exp` produz `#` como prefixo de expressão desde a
     /// T30 (lacuna do parser fechada ali; `check_unop` já sabia mapear `"#"`
-    /// desde a T29).
+    /// desde a T29). `~` (bitwise NOT) entrou na T61: `Integer` → `Integer`,
+    /// sem coerção de float.
     fn check_unop(&mut self, loc: Loc, op_str: &str, exp: &Exp) -> Option<TypedExp> {
         let op = match op_str {
             "-" => UnOp::Neg,
             "not" => UnOp::Not,
             "#" => UnOp::Len,
-            // O parser (T11) só produz `-` e `not`; defensivo para AST
-            // montada à mão (`~`).
+            // `~` unário é bitwise NOT (T61) — o XOR é o `~` binário.
+            "~" => UnOp::BNot,
+            // Defensivo para AST montada à mão: o parser (T60) só produz
+            // `-`, `not`, `#` e `~` como prefixo.
             _ => {
                 self.error(
                     loc,
@@ -2208,6 +2273,22 @@ impl Checker {
                     return None;
                 }
                 Type::Boolean
+            }
+            // Mesma exigência do bitwise binário: `Integer` estrito, sem
+            // coerção de float (ADR 0021 — divergência deliberada de
+            // `checker.lua:870-881`).
+            UnOp::BNot => {
+                if !exp.ty.equals(&Type::Integer) {
+                    self.error(
+                        exp.loc,
+                        format!(
+                            "operando de `~` precisa ser integer, encontrado {}.",
+                            type_name(&exp.ty)
+                        ),
+                    );
+                    return None;
+                }
+                Type::Integer
             }
             UnOp::Len => {
                 if !matches!(exp.ty, Type::Array { .. } | Type::String) {
@@ -3849,10 +3930,11 @@ end"#;
 
     #[test]
     fn operadores_fora_do_subconjunto_montados_a_mao_produzem_erro() {
-        // O parser (T11) nunca produz `//` nem `~` — AST montada à mão para
-        // exercitar o braço defensivo `_` da conversão String → BinOp/UnOp.
-        // `#` deixou de ser exemplo aqui na T29 (passou a ser suportado);
-        // ver a seção de testes da T29 mais abaixo.
+        // AST montada à mão para exercitar o braço defensivo `_` da
+        // conversão String → BinOp/UnOp, que só é alcançável assim: o
+        // parser nunca produz estas grafias. `#` deixou de ser exemplo aqui
+        // na T29 e `//`/`~` na T61 — os três passaram a ser suportados —,
+        // então o que resta são grafias inventadas.
         let loc = Loc { line: 1, col: 1 };
         let program: Program = vec![TopLevel::TopLevelFunc {
             loc,
@@ -3876,12 +3958,12 @@ end"#;
                         Exp::ExpBinop {
                             loc,
                             lhs: Box::new(Exp::ExpInteger { loc, value: 1 }),
-                            op: "//".to_string(),
+                            op: "<=>".to_string(),
                             rhs: Box::new(Exp::ExpInteger { loc, value: 2 }),
                         },
                         Exp::ExpUnop {
                             loc,
-                            op: "~".to_string(),
+                            op: "++".to_string(),
                             exp: Box::new(Exp::ExpInteger { loc, value: 1 }),
                         },
                     ],
@@ -3892,11 +3974,11 @@ end"#;
         let errs = check(&program).unwrap_err();
         assert!(
             errs.iter()
-                .any(|e| e.message.contains("operador `//` não é suportado"))
+                .any(|e| e.message.contains("operador `<=>` não é suportado"))
         );
         assert!(
             errs.iter()
-                .any(|e| e.message.contains("operador unário `~` não é suportado"))
+                .any(|e| e.message.contains("operador unário `++` não é suportado"))
         );
     }
 
@@ -4492,7 +4574,119 @@ end"#;
             "xs é passada por valor composto a `usa` → marcada mutável (uso sob &mut)"
         );
     }
+
+    // ---- T61: tipos de bitwise e `//` -----------------------------------
+
+    /// Tipo da expressão do primeiro `local` do corpo de `main` — atalho
+    /// para afirmar sobre o resultado de um operador sem desmontar a AST
+    /// tipada inteira.
+    fn tipo_do_primeiro_local(source: &str) -> Type {
+        let stats = typed_body_stats(source);
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl, obteve {:?}", stats[0]);
+        };
+        value.ty.clone()
+    }
+
+    fn fonte_com_local(exp: &str) -> String {
+        format!("function main(args: {{string}}): integer\n    local a = {exp}\n    return 0\nend")
+    }
+
+    #[test]
+    fn bitwise_entre_inteiros_resulta_integer() {
+        for exp in ["1 & 2", "1 | 2", "1 ~ 2", "1 << 2", "1 >> 2", "~1"] {
+            assert_eq!(
+                tipo_do_primeiro_local(&fonte_com_local(exp)),
+                Type::Integer,
+                "`{exp}` deveria resultar integer"
+            );
+        }
+    }
+
+    /// Divergência deliberada de `checker.lua:1097-1109`, que coage float
+    /// para integer: aqui o erro chega em português, em vez de truncar em
+    /// silêncio (PRD.md, T61).
+    #[test]
+    fn bitwise_com_float_produz_erro_em_portugues() {
+        for exp in ["1.5 & 2", "2 | 1.5", "1.5 ~ 2", "1.5 << 2", "1 >> 1.5"] {
+            let errs = check_source(&fonte_com_local(exp)).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("precisa ser integer")),
+                "`{exp}` deveria acusar operando não-integer, obteve {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bitwise_not_unario_com_float_produz_erro() {
+        let errs = check_source(&fonte_com_local("~1.5")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("`~` precisa ser integer"))
+        );
+    }
+
+    #[test]
+    fn bitwise_com_string_produz_erro() {
+        let errs = check_source(&fonte_com_local("\"a\" & 1")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("precisa ser integer"))
+        );
+    }
+
+    #[test]
+    fn divisao_inteira_segue_a_regra_aritmetica_dos_demais() {
+        assert_eq!(
+            tipo_do_primeiro_local(&fonte_com_local("7 // 2")),
+            Type::Integer
+        );
+        for exp in ["7.0 // 2", "7 // 2.0", "7.0 // 2.0"] {
+            assert_eq!(
+                tipo_do_primeiro_local(&fonte_com_local(exp)),
+                Type::Float,
+                "`{exp}` deveria promover a float"
+            );
+        }
+    }
+
+    #[test]
+    fn divisao_inteira_com_string_produz_erro_de_operando_numerico() {
+        let errs = check_source(&fonte_com_local("\"a\" // 2")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("precisa ser numérico"))
+        );
+    }
+
+    /// `~` desambigua pelo número de operandos: binário é XOR, prefixo é NOT
+    /// — os dois no mesmo programa, para provar que o checker não confunde.
+    #[test]
+    fn til_binario_e_unario_convivem_no_mesmo_programa() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local x = 5 ~ 3\n\
+             \x20   local y = ~0\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::Decl { value: x, .. } = &stats[0] else {
+            panic!("esperava Decl");
+        };
+        assert!(matches!(
+            x.kind,
+            TypedExpKind::Binop {
+                op: BinOp::BXor,
+                ..
+            }
+        ));
+        let TypedStat::Decl { value: y, .. } = &stats[1] else {
+            panic!("esperava Decl");
+        };
+        assert!(matches!(
+            y.kind,
+            TypedExpKind::Unop { op: UnOp::BNot, .. }
+        ));
+    }
 }
-
-
-
