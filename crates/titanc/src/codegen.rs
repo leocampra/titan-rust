@@ -258,7 +258,7 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             collect_referenced_names_lvalue(target, names);
             collect_referenced_names_exp(value, names);
         }
-        TypedStat::Break { .. } => {}
+        TypedStat::Break { .. } | TypedStat::Continue { .. } => {}
     }
 }
 
@@ -602,6 +602,14 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
         TypedStat::Break { .. } => {
             indent(out, depth);
             out.push_str("break;\n");
+        }
+        // `continue` (T63) emite literalmente `continue;`, sem label: o
+        // template do `for` (ADR 0022) põe o incremento no topo do `loop`, de
+        // modo que voltar ao topo já avança a variável de controle, e o
+        // `while` do Rust reavalia a condição — nenhum laço auxiliar.
+        TypedStat::Continue { .. } => {
+            indent(out, depth);
+            out.push_str("continue;\n");
         }
     }
 }
@@ -2302,5 +2310,46 @@ end"#;
             rust.contains("let b: i64 = titan_runtime::shl(1, 2 + 3);"),
             "{rust}"
         );
+    }
+
+    /// T63: `continue` do Titan emite literalmente `continue;` do Rust, sem
+    /// label e sem laço auxiliar — e, dentro do `for`, o `continue;` aparece
+    /// **depois** do incremento no texto, que é o que garante que voltar ao
+    /// topo avance a variável de controle (ADR 0022).
+    #[test]
+    fn continue_emite_continue_do_rust_depois_do_incremento() {
+        let source = r#"function main(args: {string}): integer
+    for i = 1, 5 do
+        if i == 2 then
+            continue
+        end
+        print("corpo")
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("continue;"), "{rust}");
+        let incremento = rust
+            .find("i += titan_for_inc;")
+            .expect("incremento emitido");
+        let cont = rust.find("continue;").expect("continue emitido");
+        assert!(incremento < cont, "incremento deve preceder o continue:\n{rust}");
+    }
+
+    /// No `while` o `continue;` também sai sem label: o `while` do Rust
+    /// reavalia a condição ao voltar ao topo, igual ao do Titan.
+    #[test]
+    fn continue_em_while_emite_continue_sem_label() {
+        let source = r#"function main(args: {string}): integer
+    local i: integer = 0
+    while i < 5 do
+        i = i + 1
+        continue
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("continue;"), "{rust}");
+        assert!(!rust.contains("'titan"), "sem label:\n{rust}");
     }
 }

@@ -418,20 +418,15 @@ impl<'a> Parser<'a> {
             return Ok(Stat::StatBreak { loc });
         }
 
-        // `continue` virou keyword na T59, mas ainda não tem semântica: o
-        // `for` continua desaçucarado para `while` com o incremento no fim do
-        // corpo (T15, ADR 0004), então um `continue` pularia o incremento e
-        // daria laço infinito silencioso. A rejeição sai daqui quando a T65
-        // reabrir o ADR 0004 e o `for` deixar de ser desaçucarado.
-        if self.check(&TokenKind::KwContinue) {
-            return Err(ParseError {
-                message: "`continue` não é suportado: o `for` é desaçucarado para `while` \
-                          com o incremento no fim do corpo, e um `continue` pularia esse \
-                          incremento, causando um laço infinito silencioso. Reestruture o \
-                          laço com `if`/`break`."
-                    .to_string(),
-                loc,
-            });
+        // `continue` (T63): até a T62 esta posição carregava uma rejeição
+        // explícita, porque o `for` desaçucarado punha o incremento no fim do
+        // corpo e um `continue` pularia por cima dele (ADR 0017). Com o
+        // incremento no topo do `loop` (ADR 0022), a mensagem deixou de ser
+        // verdade e o comando entra como qualquer outro — a checagem de estar
+        // dentro de laço fica no checker, igual a `break`.
+        if self.eat(&TokenKind::KwContinue) {
+            self.eat(&TokenKind::Semicolon);
+            return Ok(Stat::StatContinue { loc });
         }
 
         // Chamada ou atribuição — desambiguadas sem backtracking, como no
@@ -444,7 +439,7 @@ impl<'a> Parser<'a> {
         if !matches!(exp, Exp::ExpCall { .. }) {
             return Err(ParseError {
                 message: "Esperava um comando (`local`, `return`, `if`, `while`, `for`, \
-                          `break`, uma atribuição ou uma chamada de função)."
+                          `break`, `continue`, uma atribuição ou uma chamada de função)."
                     .to_string(),
                 loc,
             });
@@ -2142,5 +2137,45 @@ end"#,
     fn operador_bitwise_sem_operando_direito_produz_erro_claro() {
         let err = parse_exp_source("1 |").unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    /// T63: `continue` deixou de ser rejeitado no parser (a mensagem do
+    /// ADR 0017 explicava que ele pularia o incremento do `for`, o que a T62
+    /// tornou falso) e passou a produzir `StatContinue`, exatamente como
+    /// `break` produz `StatBreak`.
+    #[test]
+    fn continue_produz_stat_continue() {
+        let source = r#"function main(args: {string}): integer
+    for i = 1, 5 do
+        continue
+    end
+    return 0
+end"#;
+        let program = parse_source(source).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava função");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava bloco");
+        };
+        let Stat::StatFor { block, .. } = &stats[0] else {
+            panic!("esperava for");
+        };
+        let Stat::StatBlock { stats, .. } = block.as_ref() else {
+            panic!("esperava bloco do for");
+        };
+        assert!(matches!(stats[0], Stat::StatContinue { .. }), "{stats:?}");
+    }
+
+    /// Fora de laço o parser **aceita** `continue` — quem rejeita é o
+    /// checker, pela profundidade de laço. Mesma divisão de camadas que
+    /// `break` tem desde a T55.
+    #[test]
+    fn continue_fora_de_laco_passa_pelo_parser() {
+        let source = r#"function main(args: {string}): integer
+    continue
+    return 0
+end"#;
+        assert!(parse_source(source).is_ok());
     }
 }

@@ -256,6 +256,11 @@ pub enum TypedStat {
     Break {
         loc: Loc,
     },
+    /// `continue` (Fase 5, T63) — mesma disciplina de `Break`: só produzido
+    /// dentro de laço, com a **mesma** checagem de `loop_depth`.
+    Continue {
+        loc: Loc,
+    },
 }
 
 /// Alvo de uma atribuição já verificado (T25 — estrutural; T29/T30 são quem
@@ -529,8 +534,9 @@ struct Checker {
     /// do campo) -> Loc`, pela mesma razão de `record_def_locs`.
     field_def_locs: HashMap<(String, String), Loc>,
     /// Profundidade de `while`/`for` aninhados (Fase 4, T55) — `break` só é
-    /// válido quando `> 0`. Incrementada/decrementada em `check_stat` ao
-    /// entrar/sair do bloco do laço.
+    /// válido quando `> 0`, e `continue` (T63) usa exatamente a mesma
+    /// checagem. Incrementada/decrementada em `check_stat` ao entrar/sair do
+    /// bloco do laço.
     loop_depth: usize,
 }
 
@@ -1382,6 +1388,16 @@ impl Checker {
                     return None;
                 }
                 Some(TypedStat::Break { loc: *loc })
+            }
+            // `continue` (T63): a **mesma** checagem de `break`, palavra por
+            // palavra — `loop_depth` já é incrementado por `while` e por
+            // `check_for`, então não há nada a acrescentar ao rastreamento.
+            Stat::StatContinue { loc } => {
+                if self.loop_depth == 0 {
+                    self.error(*loc, "`continue` fora de um laço (`while`/`for`).");
+                    return None;
+                }
+                Some(TypedStat::Continue { loc: *loc })
             }
         }
     }
@@ -2726,7 +2742,8 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
         TypedStat::Call { .. }
         | TypedStat::Return { .. }
         | TypedStat::Assign { .. }
-        | TypedStat::Break { .. } => {}
+        | TypedStat::Break { .. }
+        | TypedStat::Continue { .. } => {}
     }
 }
 
@@ -2815,7 +2832,8 @@ fn stat_loc(stat: &Stat) -> Loc {
         | Stat::StatDecl { loc, .. }
         | Stat::StatCall { loc, .. }
         | Stat::StatReturn { loc, .. }
-        | Stat::StatBreak { loc, .. } => *loc,
+        | Stat::StatBreak { loc, .. }
+        | Stat::StatContinue { loc, .. } => *loc,
     }
 }
 
@@ -4688,5 +4706,76 @@ end"#;
             y.kind,
             TypedExpKind::Unop { op: UnOp::BNot, .. }
         ));
+    }
+
+    /// T63: dentro de laço, `continue` vira `TypedStat::Continue` — em
+    /// `while` e em `for`, que é onde `loop_depth` é incrementado.
+    #[test]
+    fn continue_dentro_de_laco_e_aceito() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   while true do\n\
+             \x20       continue\n\
+             \x20   end\n\
+             \x20   for i = 1, 3 do\n\
+             \x20       continue\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::While { block, .. } = &stats[0] else {
+            panic!("esperava While");
+        };
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert!(matches!(corpo[0], TypedStat::Continue { .. }));
+        let TypedStat::For { block, .. } = &stats[1] else {
+            panic!("esperava For");
+        };
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert!(matches!(corpo[0], TypedStat::Continue { .. }));
+    }
+
+    /// Fora de laço é erro claro em português, com a mesma forma da mensagem
+    /// de `break` — a checagem é literalmente a mesma.
+    #[test]
+    fn continue_fora_de_laco_e_erro_claro() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   continue\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("`continue` fora de um laço")),
+            "{erros:?}"
+        );
+    }
+
+    /// Depois do laço fechado `loop_depth` voltou a zero: um `continue` ali
+    /// é erro, mesmo havendo um laço antes no mesmo corpo.
+    #[test]
+    fn continue_depois_do_laco_e_erro_claro() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   while false do\n\
+             \x20   end\n\
+             \x20   continue\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("`continue` fora de um laço")),
+            "{erros:?}"
+        );
     }
 }

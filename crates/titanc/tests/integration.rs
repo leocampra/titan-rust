@@ -975,9 +975,9 @@ fn construcoes_fora_de_escopo_da_fase_3_produzem_erro_claro_sem_panic() {
 /// Negativos da Fase 4 (PRD.md, T55 e T57): `break` é keyword e é aceito
 /// dentro de `while`/`for`, mas continua rejeitado fora de laço — agora por
 /// erro de tipos (`checker.rs`), não mais de sintaxe, já que o parser aceita
-/// `break` em qualquer posição de comando. `continue` nunca foi keyword
-/// (decisão técnica 7 do PRD.md) e é rejeitado explicando o motivo (o `for`
-/// desaçucarado para `while` teria seu incremento pulado). Os últimos três
+/// `break` em qualquer posição de comando. Desde a T63 (Fase 5) `continue`
+/// segue exatamente o mesmo desenho: aceito dentro de laço, rejeitado fora
+/// dele pelo checker, com a mesma mensagem em português. Os últimos três
 /// casos são a curadoria da T57 (risco 5 à parte, coberto em
 /// `compila_e_executa_hello_titan_conferindo_stdout_e_exit_code`): tipos soma
 /// e `match` seguem sem sintaxe própria (Fase 5, pendente — PRD.md linha
@@ -1003,22 +1003,22 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    local break = 1\n    return 0\nend",
         trecho_esperado: "Esperava um nome de variável",
     },
-    CasoNegativo {
-        nome: "continue_em_while",
-        fonte: "function main(args: {string}): integer\n    while true do\n        continue\n    end\n    return 0\nend",
-        trecho_esperado: "`continue` não é suportado",
-    },
-    CasoNegativo {
-        nome: "continue_em_for",
-        fonte: "function main(args: {string}): integer\n    for i = 1, 10 do\n        continue\n    end\n    return 0\nend",
-        trecho_esperado: "`continue` não é suportado",
-    },
+    // `continue_em_while` e `continue_em_for` saíram desta tabela na T63:
+    // viraram casos **positivos**, com execução real em
+    // `compila_e_executa_continue_em_for_e_em_while` — o mesmo movimento que
+    // `break` fez na T55. O que sobrou da família é o negativo de escopo,
+    // logo abaixo, e ele mudou de camada: era erro de sintaxe (o parser
+    // rejeitava `continue` em qualquer posição) e agora é erro de tipos, do
+    // checker, exatamente como `break_fora_de_laco`.
     CasoNegativo {
         nome: "continue_fora_de_laco",
-        // Fora de laço `continue` também é rejeitado — é a mesma checagem
-        // léxica/sintática, independente de haver ou não um laço em volta.
         fonte: "function main(args: {string}): integer\n    continue\n    return 0\nend",
-        trecho_esperado: "`continue` não é suportado",
+        trecho_esperado: "`continue` fora de um laço",
+    },
+    CasoNegativo {
+        nome: "continue_depois_do_laco",
+        fonte: "function main(args: {string}): integer\n    while false do\n    end\n    continue\n    return 0\nend",
+        trecho_esperado: "`continue` fora de um laço",
     },
     CasoNegativo {
         // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria: a
@@ -1170,6 +1170,101 @@ fn compila_e_executa_break_saindo_de_while_e_de_for() {
         .output()
         .expect("executa ./break_exec");
     let esperado = "while-1\nwhile-2\nwhile-3\nfor-1\nfor-2\n";
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T63 — o ponto central da tarefa, e a prova de que o
+/// bug que o ADR 0017 temia deixou de existir: `continue` dentro de um `for`
+/// **avança o laço**. Com o template antigo (incremento no fim do corpo,
+/// ADR 0004) este programa entraria em laço infinito na primeira iteração
+/// par; com o incremento no topo do `loop` (ADR 0022, T62) ele imprime os
+/// ímpares e **termina**. O `while` cobre o outro laço da linguagem: lá o
+/// incremento é escrito pelo usuário, então o `continue` precisa vir depois
+/// dele — é a mesma semântica do Lua, e do Rust.
+#[test]
+fn compila_e_executa_continue_em_for_e_em_while() {
+    let out_dir = temp_dir("continue-execucao-real");
+
+    let source = concat!(
+        "function main(args: {string}): integer\n",
+        // `for i = 1, 5` pulando os pares: imprime 1, 3, 5 e termina. Se o
+        // `continue` pulasse o incremento, o programa travaria em i = 2.
+        "    for i = 1, 5 do\n",
+        "        if i % 2 == 0 then\n",
+        "            continue\n",
+        "        end\n",
+        "        print(\"for-\" .. i)\n",
+        "    end\n",
+        // Decrescente com passo negativo: o `continue` também precisa passar
+        // pelo `i += titan_for_inc` com `titan_for_asc` falso.
+        "    for j = 5, 1, -2 do\n",
+        "        if j == 3 then\n",
+        "            continue\n",
+        "        end\n",
+        "        print(\"dec-\" .. j)\n",
+        "    end\n",
+        // `while`: o incremento é do usuário e vem antes do `continue`.
+        "    local k: integer = 0\n",
+        "    while k < 5 do\n",
+        "        k = k + 1\n",
+        "        if k % 2 == 1 then\n",
+        "            continue\n",
+        "        end\n",
+        "        print(\"while-\" .. k)\n",
+        "    end\n",
+        // `continue` em laço aninhado afeta só o laço mais interno.
+        "    for a = 1, 2 do\n",
+        "        for b = 1, 3 do\n",
+        "            if b == 2 then\n",
+        "                continue\n",
+        "            end\n",
+        "            print(\"ani-\" .. a .. \"-\" .. b)\n",
+        "        end\n",
+        "    end\n",
+        // `continue` convivendo com `break` no mesmo laço.
+        "    for c = 1, 10 do\n",
+        "        if c == 2 then\n",
+        "            continue\n",
+        "        end\n",
+        "        if c == 4 then\n",
+        "            break\n",
+        "        end\n",
+        "        print(\"mix-\" .. c)\n",
+        "    end\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "continue_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de continue: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("continue_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./continue_exec");
+    let esperado = concat!(
+        "for-1\nfor-3\nfor-5\n",
+        "dec-5\ndec-1\n",
+        "while-2\nwhile-4\n",
+        "ani-1-1\nani-1-3\nani-2-1\nani-2-3\n",
+        "mix-1\nmix-3\n",
+    );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));
 
