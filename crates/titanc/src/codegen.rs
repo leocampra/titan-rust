@@ -45,8 +45,8 @@
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
 
 use crate::checker::{
-    BinOp, Callee, TypedExp, TypedExpKind, TypedLValue, TypedProgram, TypedStat, TypedTopLevel,
-    UnOp,
+    BinOp, Callee, TypedExp, TypedExpKind, TypedLValue, TypedMultiValues, TypedProgram, TypedStat,
+    TypedTopLevel, UnOp,
 };
 use crate::types::Type;
 use std::collections::HashSet;
@@ -219,6 +219,17 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             }
         }
         TypedStat::Decl { value, .. } => collect_referenced_names_exp(value, names),
+        // T67: os alvos da declaração múltipla são destinos, não leituras —
+        // só o lado direito conta, como no `Decl` simples.
+        TypedStat::DeclMulti { values, .. } => collect_referenced_names_multi(values, names),
+        TypedStat::AssignMulti {
+            targets, values, ..
+        } => {
+            for target in targets {
+                collect_referenced_names_lvalue(target, names);
+            }
+            collect_referenced_names_multi(values, names);
+        }
         TypedStat::Call { call, .. } => collect_referenced_names_exp(call, names),
         TypedStat::Return { exps, .. } => {
             for e in exps {
@@ -285,6 +296,22 @@ fn collect_referenced_names_lvalue(
             collect_referenced_names_exp(index, names);
         }
         TypedLValue::Field { base, .. } => collect_referenced_names_exp(base, names),
+    }
+}
+
+/// Lado direito de uma declaração/atribuição múltipla (T67): a chamada
+/// única ou cada expressão da lista.
+fn collect_referenced_names_multi(
+    values: &TypedMultiValues,
+    names: &mut std::collections::HashSet<String>,
+) {
+    match values {
+        TypedMultiValues::Call(call) => collect_referenced_names_exp(call, names),
+        TypedMultiValues::List(exps) => {
+            for e in exps {
+                collect_referenced_names_exp(e, names);
+            }
+        }
     }
 }
 
@@ -394,6 +421,50 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str(&emit_slot_value(ty, value, ctx));
             out.push_str(";\n");
         }
+        // `local a, b = ...` (T67). Os valores saem **todos** para
+        // temporários antes de qualquer `let` do usuário: na forma de
+        // chamada, porque é uma tupla a desestruturar; na forma de lista,
+        // pela mesma ordem de avaliação que o `AssignMulti` abaixo exige —
+        // e aqui o efeito extra é que um nome sendo declarado não sombreia
+        // o homônimo externo que o lado direito lê (`local x, y = y, x`).
+        TypedStat::DeclMulti {
+            targets, values, ..
+        } => {
+            let slots: Vec<&Type> = targets.iter().map(|t| &t.ty).collect();
+            let temporarios = emit_multi_values(out, values, &slots, targets.len(), depth, ctx);
+            for (target, temporario) in targets.iter().zip(&temporarios) {
+                indent(out, depth);
+                out.push_str(if target.mutable { "let mut " } else { "let " });
+                out.push_str(&target.name);
+                out.push_str(": ");
+                out.push_str(&rust_type_name(&target.ty));
+                out.push_str(" = ");
+                out.push_str(temporario);
+                out.push_str(";\n");
+            }
+        }
+        // `a, b = ...` (T67) — a armadilha central da tarefa. Em Titan,
+        // como em Lua, **todo** o lado direito é avaliado antes de qualquer
+        // escrita: `a, b = b, a` troca de verdade, e emitir as atribuições
+        // em sequência (`a = b; b = a;`) daria `a == b`. Por isso os valores
+        // vão primeiro para `let` temporários e só depois são escritos nos
+        // alvos, cada um pelo mesmo caminho do `Assign` single-target.
+        TypedStat::AssignMulti {
+            targets, values, ..
+        } => {
+            let slots: Vec<&Type> = match values {
+                // O tipo do slot é o do próprio valor, como no `Assign`
+                // single-target: o checker já garantiu `compatible`.
+                TypedMultiValues::List(exps) => exps.iter().map(|e| &e.ty).collect(),
+                // Na desestruturação os componentes já vêm da tupla tipada
+                // pela assinatura; `emit_multi_values` ignora os slots aqui.
+                TypedMultiValues::Call(_) => Vec::new(),
+            };
+            let temporarios = emit_multi_values(out, values, &slots, targets.len(), depth, ctx);
+            for (target, temporario) in targets.iter().zip(&temporarios) {
+                emit_assign_to_lvalue(out, target, temporario, depth, ctx);
+            }
+        }
         TypedStat::Call { call, .. } => {
             indent(out, depth);
             out.push_str(&emit_exp(call, ctx));
@@ -491,87 +562,11 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str("}\n");
         }
         TypedStat::Assign { target, value, .. } => {
-            indent(out, depth);
-            match target {
-                TypedLValue::Name(name) => {
-                    out.push_str(name);
-                    out.push_str(" = ");
-                    // O tipo do valor serve de tipo do slot: o checker
-                    // garantiu que ele é `compatible` com o da variável, e
-                    // `compatible` não coage entre primitivas distintas
-                    // nesta fase.
-                    out.push_str(&emit_slot_value(&value.ty, value, ctx));
-                    out.push_str(";\n");
-                }
-                // `v[i] = x`: `array_set`/`map_set` do runtime (decisão 5 da
-                // Fase 2 — `array_set` escreve em `1..#v`, faz append em
-                // `#v + 1`, aborta com mensagem em português no resto).
-                // `base` é o array/map inteiro — [`emit_place_mut`] resolve
-                // um `&mut` de verdade a ele, mesmo quando `base` é ele
-                // mesmo aninhado (`m["a"][1] = x`, `xs[i][j] = x`).
-                // Índice e valor são pré-computados em variáveis `let` antes
-                // do `&mut` do `base` ser tomado: o índice pode ler o
-                // próprio `base` (`res[#res + 1] = x`, o idioma de "append"
-                // da decisão 5 da Fase 2), e `emit_place_mut(base)` produz um
-                // empréstimo mutável que o rustc não consegue provar
-                // disjunto de um segundo empréstimo do mesmo `base` dentro
-                // dos argumentos da mesma chamada — mesmo sendo
-                // semanticamente sequencial (E0502). Nomes prefixados com
-                // `titan_` seguem a convenção de mangling existente.
-                TypedLValue::Index { base, index } => match &base.ty {
-                    Type::Array { .. } => {
-                        out.push_str(&format!(
-                            "let titan_idx = {};\n",
-                            emit_delimited_exp(index, ctx)
-                        ));
-                        indent(out, depth);
-                        out.push_str(&format!(
-                            "let titan_val = {};\n",
-                            emit_slot_value(&value.ty, value, ctx)
-                        ));
-                        indent(out, depth);
-                        out.push_str(&format!(
-                            "titan_runtime::array_set({}, titan_idx, titan_val);\n",
-                            emit_place_mut(base, ctx),
-                        ));
-                    }
-                    Type::Map { .. } => {
-                        out.push_str(&format!(
-                            "let titan_key = {};\n",
-                            emit_slot_value(&index.ty, index, ctx)
-                        ));
-                        indent(out, depth);
-                        out.push_str(&format!(
-                            "let titan_val = {};\n",
-                            emit_slot_value(&value.ty, value, ctx)
-                        ));
-                        indent(out, depth);
-                        out.push_str(&format!(
-                            "titan_runtime::map_set({}, titan_key, titan_val);\n",
-                            emit_place_mut(base, ctx),
-                        ));
-                    }
-                    other => unreachable!(
-                        "checker só produz `Index` sobre array/map, encontrado {other:?}"
-                    ),
-                },
-                // `p.campo = x`: campo é `pub`, atribuição direta. `base`
-                // pode ser aninhado (`pontos[1].x = 9`, onde `base` é um
-                // `Index`) — `emit_place_mut(base)` resolve um `&mut Ponto`
-                // de verdade (via `array_get_mut` na recursão) em vez do
-                // `Ponto` clonado que `emit_exp`/`array_get` devolveriam.
-                // Os parênteses são obrigatórios: sem eles, `&mut p.x = ..`
-                // parsearia como `&mut (p.x) = ..` (atribuição a uma
-                // referência recém-criada, não ao campo) — `(&mut p).x = ..`
-                // é que aciona o auto-deref do Rust e escreve no lugar certo.
-                TypedLValue::Field { base, name } => {
-                    out.push_str(&format!(
-                        "({}).{name} = {};\n",
-                        emit_place_mut(base, ctx),
-                        emit_slot_value(&value.ty, value, ctx)
-                    ));
-                }
-            }
+            // O tipo do valor serve de tipo do slot: o checker garantiu que
+            // ele é `compatible` com o da variável, e `compatible` não coage
+            // entre primitivas distintas nesta fase.
+            let valor = emit_slot_value(&value.ty, value, ctx);
+            emit_assign_to_lvalue(out, target, &valor, depth, ctx);
         }
         // `for` numérico emitido como `loop` do Rust, nunca `Range`:
         // `.step_by` não aceita passo negativo nem float, e `Range<f64>` não
@@ -672,6 +667,139 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
         TypedStat::Continue { .. } => {
             indent(out, depth);
             out.push_str("continue;\n");
+        }
+    }
+}
+
+/// Escreve `valor` — texto Rust **já emitido** — no lugar designado por
+/// `target`. É o corpo que o braço `TypedStat::Assign` sempre teve; virou
+/// função na T67 para a atribuição múltipla escrever em cada um dos seus
+/// alvos exatamente pelo mesmo caminho, inclusive `v[i]` e `p.campo`.
+fn emit_assign_to_lvalue(
+    out: &mut String,
+    target: &TypedLValue,
+    valor: &str,
+    depth: usize,
+    ctx: Ctx,
+) {
+    indent(out, depth);
+    match target {
+        TypedLValue::Name(name) => {
+            out.push_str(name);
+            out.push_str(" = ");
+            out.push_str(valor);
+            out.push_str(";\n");
+        }
+        // `v[i] = x`: `array_set`/`map_set` do runtime (decisão 5 da
+        // Fase 2 — `array_set` escreve em `1..#v`, faz append em
+        // `#v + 1`, aborta com mensagem em português no resto).
+        // `base` é o array/map inteiro — [`emit_place_mut`] resolve
+        // um `&mut` de verdade a ele, mesmo quando `base` é ele
+        // mesmo aninhado (`m["a"][1] = x`, `xs[i][j] = x`).
+        // Índice e valor são pré-computados em variáveis `let` antes
+        // do `&mut` do `base` ser tomado: o índice pode ler o
+        // próprio `base` (`res[#res + 1] = x`, o idioma de "append"
+        // da decisão 5 da Fase 2), e `emit_place_mut(base)` produz um
+        // empréstimo mutável que o rustc não consegue provar
+        // disjunto de um segundo empréstimo do mesmo `base` dentro
+        // dos argumentos da mesma chamada — mesmo sendo
+        // semanticamente sequencial (E0502). Nomes prefixados com
+        // `titan_` seguem a convenção de mangling existente.
+        TypedLValue::Index { base, index } => match &base.ty {
+            Type::Array { .. } => {
+                out.push_str(&format!(
+                    "let titan_idx = {};\n",
+                    emit_delimited_exp(index, ctx)
+                ));
+                indent(out, depth);
+                out.push_str(&format!("let titan_val = {valor};\n"));
+                indent(out, depth);
+                out.push_str(&format!(
+                    "titan_runtime::array_set({}, titan_idx, titan_val);\n",
+                    emit_place_mut(base, ctx),
+                ));
+            }
+            Type::Map { .. } => {
+                out.push_str(&format!(
+                    "let titan_key = {};\n",
+                    emit_slot_value(&index.ty, index, ctx)
+                ));
+                indent(out, depth);
+                out.push_str(&format!("let titan_val = {valor};\n"));
+                indent(out, depth);
+                out.push_str(&format!(
+                    "titan_runtime::map_set({}, titan_key, titan_val);\n",
+                    emit_place_mut(base, ctx),
+                ));
+            }
+            other => {
+                unreachable!("checker só produz `Index` sobre array/map, encontrado {other:?}")
+            }
+        },
+        // `p.campo = x`: campo é `pub`, atribuição direta. `base`
+        // pode ser aninhado (`pontos[1].x = 9`, onde `base` é um
+        // `Index`) — `emit_place_mut(base)` resolve um `&mut Ponto`
+        // de verdade (via `array_get_mut` na recursão) em vez do
+        // `Ponto` clonado que `emit_exp`/`array_get` devolveriam.
+        // Os parênteses são obrigatórios: sem eles, `&mut p.x = ..`
+        // parsearia como `&mut (p.x) = ..` (atribuição a uma
+        // referência recém-criada, não ao campo) — `(&mut p).x = ..`
+        // é que aciona o auto-deref do Rust e escreve no lugar certo.
+        TypedLValue::Field { base, name } => {
+            out.push_str(&format!(
+                "({}).{name} = {valor};\n",
+                emit_place_mut(base, ctx)
+            ));
+        }
+    }
+}
+
+/// Emite o lado direito de uma declaração/atribuição múltipla (T67) em
+/// `let` temporários e devolve os nomes deles, na ordem dos alvos.
+///
+/// É aqui que a semântica do Lua fica garantida: quando a emissão chega aos
+/// alvos, **todo** o lado direito já foi avaliado. Para `a, b = b, a` isso é
+/// a diferença entre trocar de verdade e acabar com `a == b`.
+///
+/// `slots` traz o tipo de slot de cada valor da forma-lista (ver
+/// [`emit_slot_value`]: é o que decide `String` dona e `.clone()` de
+/// composto); na forma-chamada ele é vazio, porque a tupla devolvida pela
+/// função já é dona dos seus componentes — lá quem dá a contagem é
+/// `alvos`.
+fn emit_multi_values(
+    out: &mut String,
+    values: &TypedMultiValues,
+    slots: &[&Type],
+    alvos: usize,
+    depth: usize,
+    ctx: Ctx,
+) -> Vec<String> {
+    match values {
+        // Desestruturação da tupla da T66 num único `let` com padrão: o
+        // checker já conferiu que a aridade da assinatura bate com a dos
+        // alvos, então cada componente tem seu temporário.
+        TypedMultiValues::Call(call) => {
+            let nomes: Vec<String> = (0..alvos).map(|i| format!("titan_multi_{i}")).collect();
+            indent(out, depth);
+            out.push_str(&format!(
+                "let ({}) = {};\n",
+                nomes.join(", "),
+                emit_delimited_exp(call, ctx)
+            ));
+            nomes
+        }
+        TypedMultiValues::List(exps) => {
+            let mut nomes = Vec::with_capacity(exps.len());
+            for (i, exp) in exps.iter().enumerate() {
+                let nome = format!("titan_multi_{i}");
+                indent(out, depth);
+                out.push_str(&format!(
+                    "let {nome} = {};\n",
+                    emit_slot_value(slots[i], exp, ctx)
+                ));
+                nomes.push(nome);
+            }
+            nomes
         }
     }
 }
@@ -2713,5 +2841,156 @@ end"#;
             rust.contains("let q: i64 = titan_divmod(7, 2).1;"),
             "`Extra` não indexou o segundo valor da tupla:\n{rust}"
         );
+    }
+    // ---- T67: multi-assign e declaração múltipla -----------------------
+
+    /// A armadilha central da tarefa, no texto emitido: `a, b = b, a`
+    /// precisa avaliar **todo** o lado direito antes de escrever em
+    /// qualquer alvo. Emitir `a = b; b = a;` — a tradução ingênua — daria
+    /// `a == b`, um bug silencioso que nenhuma checagem de tipo pegaria.
+    #[test]
+    fn swap_passa_por_temporarios_antes_de_qualquer_escrita() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer = 1\n\
+             \x20   local b: integer = 2\n\
+             \x20   a, b = b, a\n\
+             \x20   return 0\n\
+             end",
+        );
+        let esperado = "let titan_multi_0 = b;\n    \
+                        let titan_multi_1 = a;\n    \
+                        a = titan_multi_0;\n    \
+                        b = titan_multi_1;";
+        assert!(
+            rust.contains(esperado),
+            "o swap não passou por temporários:\n{rust}"
+        );
+    }
+
+    /// A desestruturação da tupla da T66 sai num `let` de padrão só, e cada
+    /// alvo recebe o seu componente.
+    #[test]
+    fn declaracao_multipla_desestrutura_a_tupla_num_let_so() {
+        let rust = generate_source(
+            "function divmod(a: integer, b: integer): integer, integer\n\
+             \x20   return a // b, a % b\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local q, r = divmod(7, 2)\n\
+             \x20   return q + r\n\
+             end",
+        );
+        assert!(
+            rust.contains("let (titan_multi_0, titan_multi_1) = titan_divmod(7, 2);"),
+            "tupla não desestruturada:\n{rust}"
+        );
+        assert!(rust.contains("let q: i64 = titan_multi_0;"), "{rust}");
+        assert!(rust.contains("let r: i64 = titan_multi_1;"), "{rust}");
+    }
+
+    /// Só o alvo reatribuído sai `let mut` — o fix-up marca cada alvo por
+    /// si, e `unused_mut` no Rust gerado seria warning.
+    #[test]
+    fn so_o_alvo_reatribuido_sai_mutavel() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer, b: integer = 1, 2\n\
+             \x20   a = a + b\n\
+             \x20   return a\n\
+             end",
+        );
+        assert!(rust.contains("let mut a: i64 = titan_multi_0;"), "{rust}");
+        assert!(rust.contains("let b: i64 = titan_multi_1;"), "{rust}");
+    }
+
+    /// Alvos compostos entram pelo mesmo caminho do single-target:
+    /// `array_set` para `v[i]` e escrita direta para `p.campo` — com os
+    /// valores já nos temporários, de modo que o swap também vale ali.
+    #[test]
+    fn alvos_compostos_da_atribuicao_multipla_usam_o_caminho_de_sempre() {
+        let rust = generate_source(
+            "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   y: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local v: {integer} = {10, 20}\n\
+             \x20   v[1], v[2] = v[2], v[1]\n\
+             \x20   local p: Ponto = {x = 1, y = 2}\n\
+             \x20   p.x, p.y = p.y, p.x\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(
+            rust.contains("let titan_val = titan_multi_0;")
+                && rust.contains("titan_runtime::array_set(&mut v, titan_idx, titan_val);"),
+            "`v[i]` não passou por array_set:\n{rust}"
+        );
+        assert!(
+            rust.contains("(&mut p).x = titan_multi_0;")
+                && rust.contains("(&mut p).y = titan_multi_1;"),
+            "`p.campo` não recebeu dos temporários:\n{rust}"
+        );
+    }
+
+    /// `string` e composto desestruturados de uma chamada chegam **donos**
+    /// aos alvos: a tupla devolvida já é dona dos componentes, então nada
+    /// de `.clone()` extra na desestruturação.
+    #[test]
+    fn desestruturacao_de_string_e_composto_nao_reclona() {
+        let rust = generate_source(
+            "function rotula(n: integer): string, {integer}\n\
+             \x20   return \"rot\", {n, n + 1}\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local s, w = rotula(5)\n\
+             \x20   return #w\n\
+             end",
+        );
+        assert!(
+            rust.contains("let (titan_multi_0, titan_multi_1) = titan_rotula(5);"),
+            "{rust}"
+        );
+        assert!(rust.contains("let s: String = titan_multi_0;"), "{rust}");
+        assert!(rust.contains("let w: Vec<i64> = titan_multi_1;"), "{rust}");
+    }
+
+    /// O critério de aceite da T67 em execução real, com o rustc de
+    /// verdade: o swap troca, `divmod` dá 3 e 1, e nada disso gera warning.
+    #[test]
+    fn t67_multi_assign_compila_e_roda_sem_warnings() {
+        let rust = generate_source(
+            "function divmod(a: integer, b: integer): integer, integer\n\
+             \x20   return a // b, a % b\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local a: integer = 1\n\
+             \x20   local b: integer = 2\n\
+             \x20   a, b = b, a\n\
+             \x20   print(\"swap-\" .. a .. \"-\" .. b)\n\
+             \x20   local q, r = divmod(7, 2)\n\
+             \x20   print(\"divmod-\" .. q .. \"-\" .. r)\n\
+             \x20   local s: string = \"um\"\n\
+             \x20   local t: string = \"dois\"\n\
+             \x20   s, t = t, s\n\
+             \x20   print(\"str-\" .. s .. \"-\" .. t)\n\
+             \x20   local v: {integer} = {10, 20}\n\
+             \x20   v[1], v[2] = v[2], v[1]\n\
+             \x20   print(\"vetor-\" .. v[1] .. \"-\" .. v[2])\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "multi_assign");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "swap-2-1\ndivmod-3-1\nstr-dois-um\nvetor-20-10\n"
+        );
+        assert_eq!(output.status.code(), Some(0));
     }
 }
