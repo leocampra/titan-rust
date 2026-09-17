@@ -242,6 +242,15 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             collect_referenced_names_exp(condition, names);
             collect_referenced_names_stat(block, names);
         }
+        // `repeat` (T64): mesma leitura do `while`, invertida só na ordem em
+        // que corpo e condição aparecem no fonte — para efeito de "que nomes
+        // este statement lê", a ordem não importa.
+        TypedStat::Repeat {
+            block, condition, ..
+        } => {
+            collect_referenced_names_stat(block, names);
+            collect_referenced_names_exp(condition, names);
+        }
         TypedStat::For {
             start,
             finish,
@@ -425,6 +434,34 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str(&emit_delimited_exp(condition, ctx));
             out.push_str(" {\n");
             emit_block_stats(out, block, depth + 1, ctx);
+            indent(out, depth);
+            out.push_str("}\n");
+        }
+        // `repeat corpo until cond` (T64) → `loop { corpo; if cond {
+        // break; } }`. O `loop` do Rust é o único laço que não testa nada no
+        // topo, que é exatamente a semântica do `repeat`: o corpo roda ao
+        // menos uma vez. Corpo e condição saem dentro das **mesmas** chaves,
+        // e não em blocos separados, porque em Titan — como em Lua — o
+        // `until` enxerga os `local` do corpo (o checker já tipou os dois no
+        // mesmo escopo). `break` e `continue` do usuário caem no `loop` sem
+        // caso especial (ADR 0023): `break` sai, e `continue` volta ao topo
+        // — o que, aqui, **pula o teste do `until`** daquela iteração, uma
+        // divergência deliberada do C e do idioma `goto continue` do Lua,
+        // registrada no ADR.
+        TypedStat::Repeat {
+            block, condition, ..
+        } => {
+            indent(out, depth);
+            out.push_str("loop {\n");
+            emit_block_stats(out, block, depth + 1, ctx);
+            indent(out, depth + 1);
+            out.push_str("if ");
+            out.push_str(&emit_delimited_exp(condition, ctx));
+            out.push_str(" {\n");
+            indent(out, depth + 2);
+            out.push_str("break;\n");
+            indent(out, depth + 1);
+            out.push_str("}\n");
             indent(out, depth);
             out.push_str("}\n");
         }
@@ -2346,6 +2383,78 @@ end"#;
         i = i + 1
         continue
     end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("continue;"), "{rust}");
+        assert!(!rust.contains("'titan"), "sem label:\n{rust}");
+    }
+
+    /// T64: `repeat corpo until cond` vira `loop { corpo; if cond { break; }
+    /// }` — o `loop` do Rust é o único laço sem teste no topo, que é
+    /// exatamente a semântica do `repeat`.
+    #[test]
+    fn repeat_emite_loop_com_teste_no_fim() {
+        let source = r#"function main(args: {string}): integer
+    local n: integer = 0
+    repeat
+        n = n + 1
+    until n > 3
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("loop {"), "{rust}");
+        // O teste sai **depois** do corpo, e não antes: é isso que faz o
+        // laço rodar ao menos uma vez.
+        let corpo = rust.find("n = n + 1;").expect("corpo emitido");
+        let teste = rust.find("if n > 3 {").expect("teste do until emitido");
+        assert!(corpo < teste, "corpo deve preceder o teste:\n{rust}");
+        assert!(rust.contains("break;"), "{rust}");
+        // Sem `while` nem flag de primeira iteração: o `loop` já dá isso de
+        // graça, diferente do `for` (ADR 0022).
+        assert!(!rust.contains("titan_for_primeira"), "{rust}");
+    }
+
+    /// Corpo e condição saem dentro das **mesmas** chaves, e não em blocos
+    /// separados: um `local` do corpo referenciado pelo `until` precisa
+    /// estar em escopo no Rust gerado, ou o `rustc` rejeitaria o programa.
+    #[test]
+    fn local_do_corpo_fica_visivel_para_o_teste_do_until() {
+        let source = r#"function main(args: {string}): integer
+    local n: integer = 0
+    repeat
+        local x: integer = n
+        n = n + 1
+    until x > 3
+    return 0
+end"#;
+        let rust = generate_source(source);
+        let decl = rust.find("let x: i64 = n;").expect("local emitido");
+        let teste = rust.find("if x > 3 {").expect("teste do until emitido");
+        assert!(decl < teste, "declaração deve preceder o teste:\n{rust}");
+        // Mesma indentação = mesmo bloco: se o corpo saísse num `{ ... }`
+        // próprio, o teste do `until` estaria um nível acima e `x` teria
+        // saído de escopo no Rust gerado.
+        assert!(
+            rust.contains("        let x: i64 = n;") && rust.contains("        if x > 3 {"),
+            "corpo e teste em níveis distintos:\n{rust}"
+        );
+    }
+
+    /// `break` e `continue` do usuário dentro de `repeat` saem sem label,
+    /// como em qualquer outro laço (ADR 0023) — o `loop` do Rust os aceita
+    /// sem caso especial.
+    #[test]
+    fn break_e_continue_dentro_de_repeat_saem_sem_label() {
+        let source = r#"function main(args: {string}): integer
+    local n: integer = 0
+    repeat
+        n = n + 1
+        if n == 1 then
+            continue
+        end
+        break
+    until false
     return 0
 end"#;
         let rust = generate_source(source);

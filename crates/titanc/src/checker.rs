@@ -35,8 +35,8 @@
 //! `codegen.rs` (T6) vai consumir.
 //!
 //! Tudo fora do subconjunto (records, maps, arrays manipuláveis, `import`,
-//! `foreign import`, métodos, retornos múltiplos, `repeat`, `Option`/`?`)
-//! produz um erro semântico claro — nunca panic.
+//! `foreign import`, métodos, retornos múltiplos, `Option`/`?`) produz um
+//! erro semântico claro — nunca panic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -232,6 +232,17 @@ pub enum TypedStat {
         loc: Loc,
         condition: TypedExp,
         block: Box<TypedStat>,
+    },
+    /// `repeat` (Fase 5, T64) — o laço que testa no fim. `block` é sempre um
+    /// [`TypedStat::Block`], mas o escopo que ele representa engloba também
+    /// `condition`: o `until` enxerga os `local` do corpo (semântica do Lua),
+    /// e é por isso que `check_repeat` só fecha o escopo depois de tipar a
+    /// condição. O codegen (`loop { corpo; if cond { break; } }`) emite os
+    /// dois dentro das mesmas chaves, preservando a visibilidade.
+    Repeat {
+        loc: Loc,
+        block: Box<TypedStat>,
+        condition: TypedExp,
     },
     For {
         loc: Loc,
@@ -1359,10 +1370,11 @@ impl Checker {
                     block: Box::new(block?),
                 })
             }
-            Stat::StatRepeat { loc, .. } => {
-                self.error(*loc, "`repeat` não é suportado nesta fase.");
-                None
-            }
+            Stat::StatRepeat {
+                loc,
+                block,
+                condition,
+            } => self.check_repeat(*loc, block, condition, rettypes),
             Stat::StatFor {
                 loc,
                 decl,
@@ -1418,6 +1430,65 @@ impl Checker {
             return None;
         }
         Some(typed)
+    }
+
+    /// `repeat block until cond` (T64).
+    ///
+    /// A armadilha da tarefa é de **escopo**, não de tipos: em Lua a
+    /// condição do `until` enxerga os `local` declarados no corpo
+    /// (`repeat local x = f() until x > 10` é válido), o que inverte a ordem
+    /// natural de abrir/fechar bloco. Por isso este método **não** delega o
+    /// corpo a `check_stat` — que abriria e fecharia o escopo antes de a
+    /// condição ser vista — e sim repete aqui o que o braço `StatBlock` faz,
+    /// intercalando a condição entre o último statement e o `close_scope`.
+    ///
+    /// Fora isso é um laço como os outros: `loop_depth` sobe pelo corpo, e
+    /// `break`/`continue` (T63) entram sem caso especial (ADR 0023).
+    fn check_repeat(
+        &mut self,
+        loc: Loc,
+        block: &Stat,
+        condition: &Exp,
+        rettypes: &[Type],
+    ) -> Option<TypedStat> {
+        let Stat::StatBlock {
+            loc: block_loc,
+            stats,
+        } = block
+        else {
+            // Defensivo: `parse_stat_repeat` só produz `StatBlock` como corpo.
+            self.error(loc, "corpo de `repeat` precisa ser um bloco.");
+            return None;
+        };
+
+        self.touch_loc(*block_loc);
+        self.st.open_block();
+        let mut typed_stats = Vec::with_capacity(stats.len());
+        let mut ok = true;
+        self.loop_depth += 1;
+        for stat in stats {
+            match self.check_stat(stat, rettypes) {
+                Some(typed) => typed_stats.push(typed),
+                None => ok = false,
+            }
+        }
+        self.loop_depth -= 1;
+        // Aqui está o ponto da tarefa: a condição é tipada com o escopo do
+        // corpo ainda aberto.
+        let typed_condition = self.check_condition(condition, "until");
+        self.close_scope(*block_loc);
+
+        if !ok {
+            return None;
+        }
+        Some(TypedStat::Repeat {
+            loc,
+            block: Box::new(TypedStat::Block {
+                loc: *block_loc,
+                stats: typed_stats,
+            }),
+            condition: typed_condition?,
+        })
     }
 
     /// `for` numérico, espelhando `checkfor` (`checker.lua:239-288`):
@@ -2736,7 +2807,9 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
                 fixup_mutability(stat, assigned);
             }
         }
-        TypedStat::While { block, .. } | TypedStat::For { block, .. } => {
+        TypedStat::While { block, .. }
+        | TypedStat::Repeat { block, .. }
+        | TypedStat::For { block, .. } => {
             fixup_mutability(block, assigned);
         }
         TypedStat::Call { .. }
@@ -4756,6 +4829,121 @@ end"#;
                 .any(|e| e.to_string().contains("`continue` fora de um laço")),
             "{erros:?}"
         );
+    }
+
+    /// T64: `repeat` deixou de ser rejeitado ("não é suportado nesta fase")
+    /// e passou a produzir `TypedStat::Repeat`, com a condição tipada como
+    /// `Boolean` — a mesma exigência do `while` (ADR 0005: sem truthy).
+    #[test]
+    fn repeat_produz_typed_repeat_com_condicao_boolean() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local n: integer = 0\n\
+             \x20   repeat\n\
+             \x20       n = n + 1\n\
+             \x20   until n > 3\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::Repeat {
+            block, condition, ..
+        } = &stats[1]
+        else {
+            panic!("esperava TypedStat::Repeat, obteve {:?}", stats[1]);
+        };
+        assert_eq!(condition.ty, Type::Boolean);
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert_eq!(corpo.len(), 1);
+    }
+
+    /// A armadilha da T64: em Lua a condição do `until` enxerga os `local`
+    /// declarados no corpo, o que obriga o escopo do bloco a fechar
+    /// **depois** de a condição ser tipada. Se `check_repeat` delegasse o
+    /// corpo a `check_stat` (que fecha o escopo ao sair do `StatBlock`),
+    /// este caso falharia com "nome não declarado".
+    #[test]
+    fn until_enxerga_local_declarado_no_corpo() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local n: integer = 0\n\
+             \x20   repeat\n\
+             \x20       local x: integer = n * 2\n\
+             \x20       n = n + 1\n\
+             \x20   until x > 10\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(matches!(stats[1], TypedStat::Repeat { .. }), "{stats:?}");
+    }
+
+    /// O outro lado da mesma moeda: o escopo **fecha**. O `local` do corpo
+    /// não vaza para depois do laço, senão o `repeat` estaria declarando no
+    /// escopo de fora.
+    #[test]
+    fn local_do_corpo_nao_vaza_para_depois_do_repeat() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   repeat\n\
+             \x20       local x: integer = 1\n\
+             \x20   until true\n\
+             \x20   return x\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("'x' não foi declarado")),
+            "{erros:?}"
+        );
+    }
+
+    /// Condição não-boolean é erro claro em português, nomeando `until` —
+    /// não `repeat` — porque é a palavra que o usuário escreveu antes dela.
+    #[test]
+    fn until_com_condicao_nao_boolean_e_erro_claro() {
+        let erros = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   repeat\n\
+             \x20   until 1\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect_err("esperava erro");
+        assert!(
+            erros
+                .iter()
+                .any(|e| e.to_string().contains("condição do `until`")),
+            "{erros:?}"
+        );
+    }
+
+    /// O corpo do `repeat` é laço para efeito de `loop_depth`: `break` e
+    /// `continue` dentro dele são aceitos sem caso especial (ADR 0023).
+    #[test]
+    fn break_e_continue_dentro_de_repeat_sao_aceitos() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local n: integer = 0\n\
+             \x20   repeat\n\
+             \x20       n = n + 1\n\
+             \x20       if n == 1 then\n\
+             \x20           continue\n\
+             \x20       end\n\
+             \x20       break\n\
+             \x20   until true\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::Repeat { block, .. } = &stats[1] else {
+            panic!("esperava Repeat");
+        };
+        let TypedStat::Block { stats: corpo, .. } = block.as_ref() else {
+            panic!("esperava Block");
+        };
+        assert!(matches!(corpo[2], TypedStat::Break { .. }), "{corpo:?}");
     }
 
     /// Depois do laço fechado `loop_depth` voltou a zero: um `continue` ali

@@ -19,11 +19,12 @@
 //!   'main' panicked");
 //! - suíte consolidada da Fase 2 (PRD.md, T31): tudo que **segue** fora de
 //!   escopo após arrays/records/maps serem aceitos — retornos múltiplos,
-//!   métodos, `import`, `repeat`, `break`, bitwise, `//`, `Option`, `as`,
+//!   métodos, `import`, `break`, bitwise, `//`, `Option`, `as`,
 //!   multi-assign e as regras de tipos de record/map — continua rejeitado
 //!   com erro claro. `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
-//!   real no codegen desde a T30; bitwise e `//` saíram na T61, e o que
-//!   resta deles é o negativo de tipo (`1.5 & 2`);
+//!   real no codegen desde a T30; bitwise e `//` saíram na T61 e
+//!   `repeat`/`until` na T64, e o que resta deles é o negativo de tipo
+//!   (`1.5 & 2`, condição do `until` não-boolean);
 //! - arquivos `.titan` reais do Titan original nunca panicam ao serem
 //!   processados (compilam ou falham com erro claro), e os que usam somente
 //!   o idioma de arrays já suportado (`sieve.titan`, `selection_sort.titan`)
@@ -822,13 +823,11 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    local p = ponto:dist()\n    return 0\nend",
         trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
-    CasoNegativo {
-        nome: "repeat_until",
-        // `repeat`/`until` viraram keywords na T59: deixaram de ser lidas
-        // como identificador, então o comando morre em `parse_primary_exp`.
-        fonte: "function main(args: {string}): integer\n    repeat print(\"x\") until true\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
-    },
+    // `repeat_until` saiu desta tabela na T64: virou caso **positivo**, com
+    // execução real em `compila_e_executa_repeat_until` — o mesmo movimento
+    // que `break` fez na T55, bitwise na T61 e `continue` na T63. O que
+    // sobrou da família é o negativo de sintaxe (`repeat` sem `until`) e o
+    // de tipo (condição não-boolean), ambos na tabela da Fase 4.
     // Os seis casos de bitwise e `//` que ficavam aqui saíram da tabela na
     // T61: viraram casos **positivos**, com execução real em
     // `compila_e_executa_bitwise_e_divisao_inteira` — mesmo movimento que
@@ -1019,6 +1018,28 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         nome: "continue_depois_do_laco",
         fonte: "function main(args: {string}): integer\n    while false do\n    end\n    continue\n    return 0\nend",
         trecho_esperado: "`continue` fora de um laço",
+    },
+    // `repeat`/`until` (T64) são positivos desde a fase — o que resta de
+    // negativo é o `until` que falta (sintaxe) e a condição não-boolean
+    // (tipos, ADR 0005: sem truthy/falsy), na mesma divisão de camadas de
+    // `break` e `continue`.
+    CasoNegativo {
+        nome: "repeat_sem_until",
+        fonte: "function main(args: {string}): integer\n    repeat\n        print(\"x\")\n    end\n    return 0\nend",
+        trecho_esperado: "Esperava 'until' para fechar o 'repeat'",
+    },
+    CasoNegativo {
+        nome: "until_com_condicao_nao_boolean",
+        fonte: "function main(args: {string}): integer\n    repeat\n    until 1\n    return 0\nend",
+        trecho_esperado: "condição do `until` precisa ser boolean",
+    },
+    CasoNegativo {
+        nome: "local_do_repeat_nao_vaza",
+        // O outro lado da armadilha de escopo da T64: o `until` enxerga os
+        // `local` do corpo, mas depois do laço eles saem de escopo como em
+        // qualquer bloco.
+        fonte: "function main(args: {string}): integer\n    repeat\n        local x: integer = 1\n    until true\n    return x\nend",
+        trecho_esperado: "'x' não foi declarado",
     },
     CasoNegativo {
         // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria: a
@@ -1264,6 +1285,102 @@ fn compila_e_executa_continue_em_for_e_em_while() {
         "while-2\nwhile-4\n",
         "ani-1-1\nani-1-3\nani-2-1\nani-2-3\n",
         "mix-1\nmix-3\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T64 (execução real, os três pontos da tarefa): o
+/// `repeat` roda ao menos uma vez **mesmo** com a condição de saída já
+/// verdadeira; o `until` referencia um `local` declarado no corpo — a
+/// armadilha de escopo herdada do Lua, que obriga o checker a fechar o bloco
+/// só depois de tipar a condição; e `break`/`continue` (T63) funcionam lá
+/// dentro sem caso especial, porque `repeat` também é emitido como um `loop`
+/// do Rust (ADR 0023).
+#[test]
+fn compila_e_executa_repeat_until() {
+    let out_dir = temp_dir("repeat-execucao-real");
+
+    let source = concat!(
+        "function main(args: {string}): integer\n",
+        // 1. Condição de saída já verdadeira na entrada: o corpo roda uma
+        //    vez. Com um `while` no lugar, não imprimiria nada.
+        "    local n: integer = 0\n",
+        "    repeat\n",
+        "        n = n + 1\n",
+        "        print(\"uma-vez-\" .. n)\n",
+        "    until true\n",
+        // 2. O `until` lê `dobro`, um `local` do corpo.
+        "    local m: integer = 0\n",
+        "    repeat\n",
+        "        local dobro: integer = m * 2\n",
+        "        m = m + 1\n",
+        "        print(\"dobro-\" .. dobro)\n",
+        "    until dobro >= 6\n",
+        // 3. `break` e `continue` no mesmo `repeat`. A condição do `until`
+        //    nunca fica verdadeira: quem termina o laço é o `break`.
+        "    local k: integer = 0\n",
+        "    repeat\n",
+        "        k = k + 1\n",
+        "        if k == 2 then\n",
+        "            continue\n",
+        "        end\n",
+        "        if k == 5 then\n",
+        "            break\n",
+        "        end\n",
+        "        print(\"mix-\" .. k)\n",
+        "    until k > 100\n",
+        // 4. Aninhado: o `break` interno fecha só o laço de dentro.
+        "    local a: integer = 0\n",
+        "    repeat\n",
+        "        a = a + 1\n",
+        "        local b: integer = 0\n",
+        "        repeat\n",
+        "            b = b + 1\n",
+        "            print(\"ani-\" .. a .. \"-\" .. b)\n",
+        "        until b >= 2\n",
+        "    until a >= 2\n",
+        // 5. `repeat` dentro de `for` e `for` dentro de `repeat`: os dois
+        //    laços convivem sem o template de um atrapalhar o do outro.
+        "    for i = 1, 2 do\n",
+        "        local c: integer = 0\n",
+        "        repeat\n",
+        "            c = c + 1\n",
+        "        until c >= i\n",
+        "        print(\"for-rep-\" .. i .. \"-\" .. c)\n",
+        "    end\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "repeat_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de repeat: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("repeat_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./repeat_exec");
+    let esperado = concat!(
+        "uma-vez-1\n",
+        "dobro-0\ndobro-2\ndobro-4\ndobro-6\n",
+        "mix-1\nmix-3\nmix-4\n",
+        "ani-1-1\nani-1-2\nani-2-1\nani-2-2\n",
+        "for-rep-1-1\nfor-rep-2-2\n",
     );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));

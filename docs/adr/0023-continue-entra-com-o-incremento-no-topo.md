@@ -74,6 +74,14 @@ o C e o Rust têm, e que o compilador não tenta adivinhar.
   laço mais interno) e convivendo com `break` no mesmo laço. O que resta de
   negativo é `continue` fora de laço, que mudou de camada — era erro de
   sintaxe, agora é erro de tipos, igual a `break`.
-- `break` e `continue` funcionarão dentro de `repeat`/`until` (T64) sem caso
+- `break` e `continue` funcionam dentro de `repeat`/`until` (T64) sem caso
   especial: ambos emitem a instrução do Rust sem label, e `repeat` também é
-  emitido como um `loop`.
+  emitido como um `loop`. Disso segue uma divergência que vale registrar: no
+  `repeat`, um `continue` volta ao topo do `loop` e portanto **pula o teste do
+  `until`** daquela iteração. O C testa a condição (`do { ... } while (cond)`
+  com `continue` salta para o teste) e o idioma `goto continue` do Lua também,
+  porque põe o label **antes** do `until`. O Titan não testa, por coerência com
+  "sem label, sem laço auxiliar": emitir o teste em cada ponto de salto
+  duplicaria a condição — e seus efeitos colaterais — ou exigiria o laço
+  auxiliar que este ADR descartou. Quem quiser o teste no `continue` escreve o
+  `if` à mão; é código do usuário, não do compilador.
