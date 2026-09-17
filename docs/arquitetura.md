@@ -112,6 +112,7 @@ adiada; o modelo escolhido é **semântica de valor com `clone()`**, sem
 | `boolean` | `bool` |
 | `string` (qualquer posição) | `String` |
 | `nil` (retorno) | `()` |
+| N>1 retornos (T66) | tupla `(T1, T2, ...)`, montada só na assinatura e no `return` |
 | `{T}` (array) | `Vec<T>` |
 | `{K: V}` (map) | `std::collections::HashMap<K, V>` |
 | `record Nome` | `struct Nome` própria, `#[derive(Clone, Debug, PartialEq)]` |
