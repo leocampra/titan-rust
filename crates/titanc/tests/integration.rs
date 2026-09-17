@@ -18,13 +18,13 @@
 //!   de erro clara na saída do `titanc`, nunca um panic (sem "thread
 //!   'main' panicked");
 //! - suíte consolidada da Fase 2 (PRD.md, T31): tudo que **segue** fora de
-//!   escopo após arrays/records/maps serem aceitos — retornos múltiplos,
-//!   métodos, `import`, `break`, bitwise, `//`, `Option`, `as`,
-//!   multi-assign e as regras de tipos de record/map — continua rejeitado
-//!   com erro claro. `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
-//!   real no codegen desde a T30; bitwise e `//` saíram na T61 e
-//!   `repeat`/`until` na T64, e o que resta deles é o negativo de tipo
-//!   (`1.5 & 2`, condição do `until` não-boolean);
+//!   escopo após arrays/records/maps serem aceitos — métodos, `import`,
+//!   `break`, bitwise, `//`, `Option`, `as`, multi-assign e as regras de
+//!   tipos de record/map — continua rejeitado com erro claro. `v[i]`,
+//!   `{...}` e `#` saíram desta lista: têm suporte real no codegen desde a
+//!   T30; bitwise e `//` saíram na T61, `repeat`/`until` na T64 e os
+//!   retornos múltiplos na T65, e o que resta deles é o negativo de tipo
+//!   (`1.5 & 2`, condição do `until` não-boolean, aridade de `return`);
 //! - arquivos `.titan` reais do Titan original nunca panicam ao serem
 //!   processados (compilam ou falham com erro claro), e os que usam somente
 //!   o idioma de arrays já suportado (`sieve.titan`, `selection_sort.titan`)
@@ -809,12 +809,14 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// saiu desta tabela na T55 (Fase 4): `break` é keyword e vira caso positivo
 /// dentro de laço — os negativos de `break`/`continue` da T55 têm tabela
 /// própria, [`CASOS_FORA_DE_ESCOPO_FASE_4`].
+///
+/// `retornos_multiplos` saiu desta tabela na T65 (Fase 5): a assinatura
+/// `: integer, integer` e o `return a, b` passaram a ser sintaxe e tipagem
+/// legítimas — mesmo movimento de `indexacao_de_array` (T30), `break` (T55),
+/// bitwise (T61) e `repeat` (T64). O que restou da família são negativos de
+/// **aridade** e de **tipo por posição**, cobertos nos testes de unidade do
+/// checker.
 const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
-    CasoNegativo {
-        nome: "retornos_multiplos",
-        fonte: "function main(args: {string}): integer\n    return 1, 2\nend",
-        trecho_esperado: "erro de sintaxe",
-    },
     CasoNegativo {
         nome: "chamada_de_metodo",
         // Com `.` lexado e sufixos de acesso a campo suportados desde a T23,
