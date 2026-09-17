@@ -1004,3 +1004,148 @@ vez de disfarçada.
 **Redox segue fora de escopo** — o alvo é Linux nativo via cargo.
 
 A lista de tarefas executável da Fase 4 (T47–T58) está no `PRD.md`.
+
+---
+
+# Fase 5 — Self-hosting pleno
+
+As Fases 0–4 entregaram um compilador que leva um `.titan` até executável nativo,
+um mecanismo de capabilities provado por três runtimes (`data`, `texto`, `io`) e
+um LSP em Rust que reusa o pipeline sem invocar o `cargo`. O ADR 0020 fechou a
+Fase 4 com uma promessa explícita: tipos soma, módulos de usuário e
+parser/checker auto-hospedados ficam para a Fase 5.
+
+Esta é a fase que cumpre a promessa — e a que esvazia, de uma vez, a seção
+"O que não está implementado ainda" do `README.md`.
+
+## A evidência que justifica a fase
+
+A Fase 4 provou self-hosting **parcial**: `examples/lexer.titan`, 282 linhas,
+tokeniza um programa Titan de verdade. Mas o ADR 0020 registrou honestamente o
+preço, e o arquivo é a prova:
+
+- Sem tipos soma, `TokenKind` virou `integer` e as constantes viraram funções
+  sem argumento — `function TK_NAME(): integer return 1 end`.
+- Sem retornos múltiplos, a posição da varredura anda num `record Estado`
+  passado por `&mut`, porque reatribuir um parâmetro escalar é proibido.
+- Sem módulos de usuário, tudo mora num arquivo só.
+
+Um parser precisa representar `Exp`, que tem **13 variantes**. Com records
+gordos e tags inteiras, um checker de 4498 linhas não tem onde morar nem como
+representar sua própria AST. A deselegância de `lexer.titan` não era defeito —
+era a medição que encomendou esta fase.
+
+## O ponto de partida é melhor do que o roadmap sugeria
+
+A investigação que abre a fase encontrou três atalhos que ninguém tinha
+catalogado:
+
+- **`StatReturn` já carrega `Vec<Exp>`** e o parser já aceita lista separada por
+  vírgula. Retornos múltiplos morrem no *checker*, não na sintaxe.
+- **`Type::Option` e `ExpCast` já existem**, e `as` já é token desde a Fase 2.
+  `Option`/`?` e cast `as` são trabalho de checker e codegen, sem nós novos.
+- **`ArgsMethod` tem zero referências fora de `ast.rs`** — `df:metodo()` morre
+  no parser, então habilitá-lo é construir o nó, não inventar mecanismo.
+
+Some-se a isso que `KEYWORDS` é fonte única de verdade já consumida pelo
+autocomplete do LSP (keywords novas aparecem no editor de graça) e que o
+`titanc` já é lib desde o ADR 0018 — o que permite testar o parser escrito em
+Titan **contra o parser em Rust, como oráculo**.
+
+Sobra, portanto, o trabalho que de fato importa: tipos soma, módulos de usuário,
+e o redesenho do `for`.
+
+## As decisões desta fase
+
+**1. Tipos soma são `enum` Rust nominal, com `Box` automático na recursão.**
+`enum Exp ExpInteger(integer) ExpBinop(string, Exp, Exp) end` vira um `enum`
+Rust, espelhando exatamente o que records já fazem desde o ADR 0009. O ponto
+não-óbvio é a recursão: hoje o checker **rejeita** record recursivo, porque em
+Rust ele seria infinitamente grande sem `Box`. Para `enum` essa rejeição não se
+aplica — a recursão é resolvida com `Box` na emissão, e um `Exp` recursivo é
+precisamente o motivo de ser da fase.
+
+**2. A exaustividade de `match` é verificada pelo checker, em português.**
+Delegar ao rustc seria mais barato e violaria a convenção mais antiga do
+projeto: o erro chegaria em inglês, sobre código gerado que o usuário não
+escreveu. O checker lista as variantes não cobertas, e um braço `_` continua
+valendo como saída.
+
+**3. `continue` entra, e o ADR 0004 é reaberto.**
+O ADR 0017 rejeitou `continue` por uma razão concreta: o `for` numérico é
+desaçucarado para `while` com o incremento no **fim** do corpo, então um
+`continue` pularia o incremento e travaria o laço — bug silencioso, em runtime,
+no idioma mais comum de um lexer. Havia um paliativo possível (envolver o corpo
+num `loop` interno), mas a decisão foi **atacar a causa**: o `for` passa a ser
+emitido como um `loop` do Rust com o incremento no topo, guardado pela primeira
+iteração. `continue` então mapeia direto, sem truque.
+
+Os ADRs 0004 e 0017 não são apagados — ganham status **Superado**, com os ADRs
+novos explicando o que mudou e por quê. O histórico de uma decisão revista vale
+mais que a decisão revista.
+
+**4. Módulos de usuário por manifesto explícito.**
+Um `titan.toml` com mapa nome → caminho:
+
+```toml
+[pacote]
+nome = "meucompilador"
+principal = "src/main.titan"
+
+[modulos]
+lexer  = "src/lexer.titan"
+parser = "src/parser.titan"
+```
+
+O nome do módulo pode diferir do nome do arquivo, e as fontes podem morar em
+subdiretórios arbitrários. `import lexer` só resolve contra `[modulos]` —
+resolução implícita por convenção de nome de arquivo foi recusada
+deliberadamente, porque deixa o conjunto de fontes do programa dependente de
+quem varre o diretório. **Sem manifesto, `titanc arquivo.titan` segue
+funcionando exatamente como hoje.**
+
+**5. Um crate Cargo por programa, um `mod` Rust por módulo Titan.**
+Todos os `.titan` alcançáveis compilam num único projeto `build/<nome>/`. A
+alternativa (um crate por módulo) multiplicaria por módulo um custo de build que
+já é de ~2min por causa do Polars.
+
+## O que a fase cobre
+
+```text
+Tipos soma     enum com payload  ·  match exaustivo  ·  recursão via Box
+Controle       continue  ·  repeat/until  ·  for-in (array e map)
+Valores        Option/?  com narrowing  ·  cast as
+Chamadas       retornos múltiplos  ·  multi-assign  ·  declaração múltipla
+Operadores     bitwise (& | ~ << >>)  ·  //
+Módulos        titan.toml  ·  import de .titan  ·  import com alias  ·  df:metodo()
+FFI            foreign import
+Prova          selfhost/  — ast, lexer, parser, checker e main escritos em Titan
+```
+
+## O que continua fora
+
+`titan-crypto` e `titan-ai` (Fases 3b/3c — com o mecanismo da Fase 3 pronto,
+cada um é um crate novo e uma tabela de funções, engenharia de biblioteca e não
+de compilador). E o `selfhost/checker.titan` cobre **o subconjunto que o parser
+auto-hospedado aceita**, não as 4498 linhas do `checker.rs` — isso é registrado
+no ADR 0027 em vez de subentendido, para não repetir a ambiguidade que o ADR
+0020 teve de esclarecer depois.
+
+Ao fim desta fase, a seção "O que não está implementado ainda" do `README.md`
+deixa de existir na forma atual.
+
+## Divergências deliberadas, registradas em ADR
+
+| ADR | Decisão |
+|---|---|
+| 0021 | Tipos soma como `enum` Rust nominal, com `Box` automático na recursão |
+| 0022 | Exaustividade de `match` verificada pelo checker, em português |
+| 0023 | **Supera o 0004** — `for` deixa de ser desaçucarado para `while` |
+| 0024 | **Supera o 0017** — `continue` entra, viabilizado pelo 0023 |
+| 0025 | Módulos de usuário por manifesto `titan.toml` explícito (nome → caminho) |
+| 0026 | Um crate Cargo por programa, um `mod` Rust por módulo Titan |
+| 0027 | Self-hosting pleno: parser/checker em Titan validados por oráculo |
+
+**Redox segue fora de escopo** — o alvo é Linux nativo via cargo.
+
+A lista de tarefas executável da Fase 5 (T59–T92) está no `PRD.md`.
