@@ -21,7 +21,8 @@
 //!   escopo após arrays/records/maps serem aceitos — retornos múltiplos,
 //!   métodos, `import`, `repeat`, `break`, bitwise, `//`, `Option`, `as`,
 //!   multi-assign e as regras de tipos de record/map — continua rejeitado
-//!   com erro claro. `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
+//!   com erro claro (bitwise e `//` agora pelo checker, não mais pelo
+//!   parser: T60). `v[i]`, `{...}` e `#` saíram desta lista: têm suporte
 //!   real no codegen desde a T30;
 //! - arquivos `.titan` reais do Titan original nunca panicam ao serem
 //!   processados (compilam ou falham com erro claro), e os que usam somente
@@ -822,38 +823,41 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    repeat print(\"x\") until true\n    return 0\nend",
         trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
-    // Os seis casos abaixo mudaram de camada na T59 (Fase 5): `& | ~ << >>
-    // // ?` passaram a ser tokens, então a rejeição saiu do lexer e virou
-    // erro de sintaxe — o parser só ganha esses níveis de precedência na T60.
+    // Os seis casos abaixo mudaram de camada duas vezes na Fase 5. Na T59
+    // `& | ~ << >> // ?` viraram tokens e a rejeição saiu do lexer para o
+    // parser; na T60 o parser ganhou os níveis de precedência e ela desceu
+    // outra vez, agora para o checker — mesmo trajeto do `break` na T55.
+    // Continuam rejeitados: quem fecha o buraco é a T61, que troca estes
+    // braços genéricos de `check_binop`/`check_unop` pelos braços reais.
     CasoNegativo {
         nome: "bitwise_and",
         fonte: "function main(args: {string}): integer\n    local a = 1 & 2\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        trecho_esperado: "operador `&` não é suportado nesta fase",
     },
     CasoNegativo {
         nome: "bitwise_or",
         fonte: "function main(args: {string}): integer\n    local a = 1 | 2\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        trecho_esperado: "operador `|` não é suportado nesta fase",
     },
     CasoNegativo {
         nome: "bitwise_not_isolado",
         fonte: "function main(args: {string}): integer\n    local a = ~2\n    return 0\nend",
-        trecho_esperado: "Esperava uma expressão",
+        trecho_esperado: "operador unário `~` não é suportado nesta fase",
     },
     CasoNegativo {
         nome: "shift_esquerda",
         fonte: "function main(args: {string}): integer\n    local a = 1 << 2\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        trecho_esperado: "operador `<<` não é suportado nesta fase",
     },
     CasoNegativo {
         nome: "shift_direita",
         fonte: "function main(args: {string}): integer\n    local a = 1 >> 2\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        trecho_esperado: "operador `>>` não é suportado nesta fase",
     },
     CasoNegativo {
         nome: "divisao_inteira",
         fonte: "function main(args: {string}): integer\n    local a = 1 // 2\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        trecho_esperado: "operador `//` não é suportado nesta fase",
     },
     CasoNegativo {
         nome: "tipo_option",
