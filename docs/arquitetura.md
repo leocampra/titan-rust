@@ -207,6 +207,11 @@ desaçucarado para `while` com o incremento no fim do corpo
 pularia esse incremento, travando o laço
 ([ADR 0017](adr/0017-break-sim-continue-nao.md)).
 
+> A Fase 5 volta atrás nesse ponto: a T62 troca o template do `for` por um
+> `loop` com o incremento no **topo**
+> ([ADR 0022](adr/0022-for-como-loop-com-incremento-no-topo.md), que supera o
+> 0004), removendo o impeditivo que mantinha o `continue` fora da linguagem.
+
 ## Duas armadilhas do Cargo (por que `driver.rs` faz o que faz)
 
 1. O `Cargo.toml` gerado em `build/<nome>/` leva um `[workspace]` **vazio**.

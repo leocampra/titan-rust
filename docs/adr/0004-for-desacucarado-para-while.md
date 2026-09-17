@@ -2,7 +2,11 @@
 
 ## Status
 
-Aceito.
+**Superado** pelo [ADR 0022](0022-for-como-loop-com-incremento-no-topo.md)
+(PRD T62), que mantém o desaçucaramento manual e todas as razões contra
+`Range`/`step_by` registradas aqui, mas move o incremento do fim do corpo para
+o topo de um `loop` — o que este template impedia era o `continue` (ver
+[ADR 0017](0017-break-sim-continue-nao.md)).
 
 ## Contexto
 

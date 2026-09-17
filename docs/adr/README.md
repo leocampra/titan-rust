@@ -5,7 +5,7 @@
 | [0001](0001-compilador-novo-em-rust.md) | Compilador novo, escrito em Rust, do zero — Titan original só como referência |
 | [0002](0002-print-via-runtime.md) | `print` vem do runtime, não é palavra-chave |
 | [0003](0003-extensao-titan-e-nomes-fixados.md) | Extensão `.titan`, binário `titanc`, runtime `titan-runtime` |
-| [0004](0004-for-desacucarado-para-while.md) | `for` numérico desaçucarado para `while`, nunca `Range` do Rust |
+| [0004](0004-for-desacucarado-para-while.md) | ~~`for` numérico desaçucarado para `while`, nunca `Range` do Rust~~ — superado pelo 0022 |
 | [0005](0005-and-or-boolean-estrito.md) | `and`/`or` boolean estrito, divergindo do truthy/falsy do original |
 | [0006](0006-semantica-de-valor-clone-na-atribuicao.md) | Semântica de valor com `clone()` na atribuição de compostos (diverge do aliasing do original) |
 | [0007](0007-parametros-compostos-por-mut.md) | Parâmetros compostos passados por `&mut`, preservando o idioma in-place |
@@ -23,3 +23,4 @@
 | [0019](0019-lsp-tower-lsp-deps-isoladas.md) | LSP sobre `tower-lsp`; deps do servidor nunca entram no `Cargo.toml` gerado |
 | [0020](0020-self-hosting-por-etapas.md) | Self-hosting por etapas: lexer na Fase 4, parser/checker na Fase 5 |
 | [0021](0021-bitwise-exige-integer-sem-coercao.md) | Bitwise exige `integer` estrito, sem coagir `float` (diverge do original); `//` e deslocamentos vão para o runtime |
+| [0022](0022-for-como-loop-com-incremento-no-topo.md) | `for` numérico como `loop` com o incremento no topo (supera o 0004, viabiliza `continue`) |

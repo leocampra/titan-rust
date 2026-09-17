@@ -511,12 +511,20 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                 }
             }
         }
-        // `for` numérico sempre desaçucarado para `while`, nunca `Range` do
-        // Rust: `.step_by` não aceita passo negativo nem float, e `Range<f64>`
-        // não implementa `Iterator`. Um único template cobre integer/float,
-        // `inc` omitido (o checker já materializou `1`/`1.0`), `inc` negativo
-        // e `inc` só conhecido em runtime (PRD T15; ADR na T18). Sem caminho
-        // otimizado para `inc = 1` literal nesta fase — otimização futura.
+        // `for` numérico emitido como `loop` do Rust, nunca `Range`:
+        // `.step_by` não aceita passo negativo nem float, e `Range<f64>` não
+        // implementa `Iterator`. Um único template cobre integer/float, `inc`
+        // omitido (o checker já materializou `1`/`1.0`), `inc` negativo e
+        // `inc` só conhecido em runtime (PRD T15; ADR 0004 na T18).
+        //
+        // T62 revisa o ADR 0004: o desaçucaramento para `while` punha o
+        // incremento no **fim** do corpo, e um `continue` do usuário pularia
+        // por cima dele — laço infinito (o impeditivo que o ADR 0017
+        // registrou). Aqui o incremento vai para o **topo** do `loop`,
+        // guardado por um flag de primeira iteração, e o teste de parada vem
+        // logo depois. Assim todo caminho que volta ao topo — queda natural
+        // do fim do corpo ou `continue` explícito — passa pelo incremento.
+        // Sem caminho otimizado para `inc = 1` literal nesta fase.
         TypedStat::For {
             name,
             ty,
@@ -554,17 +562,38 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str(&format!(
                 "let titan_for_asc: bool = titan_for_inc > 0 as {t};\n"
             ));
+            // Incremento no topo, pulado só na primeira volta. O flag é a
+            // única forma de manter o incremento antes do corpo sem alterar o
+            // valor visto na primeira iteração.
             indent(out, inner);
-            out.push_str(&format!(
-                "while (titan_for_asc && {name} <= titan_for_finish)\n"
-            ));
+            out.push_str("let mut titan_for_primeira: bool = true;\n");
+            indent(out, inner);
+            out.push_str("loop {\n");
             indent(out, inner + 1);
-            out.push_str(&format!(
-                "|| (!titan_for_asc && {name} >= titan_for_finish) {{\n"
-            ));
-            emit_block_stats(out, block, inner + 1, ctx);
+            out.push_str("if titan_for_primeira {\n");
+            indent(out, inner + 2);
+            out.push_str("titan_for_primeira = false;\n");
             indent(out, inner + 1);
+            out.push_str("} else {\n");
+            indent(out, inner + 2);
             out.push_str(&format!("{name} += titan_for_inc;\n"));
+            indent(out, inner + 1);
+            out.push_str("}\n");
+            // Teste de parada depois do incremento: mesma condição de
+            // continuação de antes, negada.
+            indent(out, inner + 1);
+            out.push_str(&format!(
+                "if !((titan_for_asc && {name} <= titan_for_finish)\n"
+            ));
+            indent(out, inner + 2);
+            out.push_str(&format!(
+                "|| (!titan_for_asc && {name} >= titan_for_finish)) {{\n"
+            ));
+            indent(out, inner + 2);
+            out.push_str("break;\n");
+            indent(out, inner + 1);
+            out.push_str("}\n");
+            emit_block_stats(out, block, inner + 1, ctx);
             indent(out, inner);
             out.push_str("}\n");
             indent(out, depth);
@@ -1614,10 +1643,10 @@ end"#;
         assert_eq!(output.status.code(), Some(0));
     }
 
-    // ---- T15: StatFor desaçucarado para while ---------------------------
+    // ---- T15/T62: StatFor emitido como `loop` com incremento no topo -----
 
     #[test]
-    fn for_emite_template_while_desacucarado() {
+    fn for_emite_loop_com_incremento_no_topo() {
         let source = r#"function main(args: {string}): integer
     for i = 1, 5 do
         print("x" .. i)
@@ -1629,12 +1658,39 @@ end"#;
         assert!(rust.contains("let titan_for_finish: i64 = 5;"));
         assert!(rust.contains("let titan_for_inc: i64 = 1;"));
         assert!(rust.contains("let titan_for_asc: bool = titan_for_inc > 0 as i64;"));
-        assert!(rust.contains("while (titan_for_asc && i <= titan_for_finish)"));
-        assert!(rust.contains("|| (!titan_for_asc && i >= titan_for_finish) {"));
+        assert!(rust.contains("let mut titan_for_primeira: bool = true;"));
+        assert!(rust.contains("loop {"));
+        assert!(rust.contains("if titan_for_primeira {"));
+        assert!(rust.contains("titan_for_primeira = false;"));
         assert!(rust.contains("i += titan_for_inc;"));
+        assert!(rust.contains("if !((titan_for_asc && i <= titan_for_finish)"));
+        assert!(rust.contains("|| (!titan_for_asc && i >= titan_for_finish)) {"));
+        // O `while` do template antigo (ADR 0004) não sobra em lugar nenhum.
+        assert!(!rust.contains("while (titan_for_asc"));
         // Nunca o Range do Rust (`.step_by` não cobre passo negativo/float).
         assert!(!rust.contains(".."));
         assert!(!rust.contains("step_by"));
+    }
+
+    /// O incremento precisa vir **antes** do corpo no texto emitido: é o que
+    /// faz um `continue` do usuário (T63) passar por ele em vez de pulá-lo.
+    #[test]
+    fn for_poe_o_incremento_antes_do_corpo_no_texto_emitido() {
+        let source = r#"function main(args: {string}): integer
+    for i = 1, 5 do
+        print("corpo")
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        let incremento = rust
+            .find("i += titan_for_inc;")
+            .expect("incremento emitido");
+        let corpo = rust.find("corpo").expect("corpo emitido");
+        assert!(
+            incremento < corpo,
+            "incremento deve preceder o corpo:\n{rust}"
+        );
     }
 
     #[test]
@@ -1650,7 +1706,9 @@ end"#;
         assert!(rust.contains("let titan_for_finish: f64 = 1.0;"));
         assert!(rust.contains("let titan_for_inc: f64 = 0.25;"));
         assert!(rust.contains("let titan_for_asc: bool = titan_for_inc > 0 as f64;"));
+        assert!(rust.contains("let mut titan_for_primeira: bool = true;"));
         assert!(rust.contains("x += titan_for_inc;"));
+        assert!(rust.contains("if !((titan_for_asc && x <= titan_for_finish)"));
     }
 
     #[test]
