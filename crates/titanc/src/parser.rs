@@ -13,7 +13,8 @@
 //! `StatFor` (numérico), `StatAssign` (single-target).
 //! Expressões: literais, `ExpVar`, `ExpCall`, `ExpConcat` (`..`) e
 //! `ExpBinop`/`ExpUnop` numa cascata de precedência que espelha
-//! `parser.lua:369-395` (níveis bitwise fora de escopo).
+//! `parser.lua:369-395` **por completo**, incluindo os níveis bitwise
+//! (`|`, `~`, `&`, `<<`, `>>`) e a divisão inteira `//` (T60).
 //! Tipos: `integer`, `float`, `boolean`, `string`, `nil`, `{T}`.
 //!
 //! Tudo fora desse subconjunto (records, maps, arrays manipuláveis,
@@ -580,19 +581,30 @@ impl<'a> Parser<'a> {
     // ---- Expressões ----------------------------------------------------
     //
     // Cascata de níveis de precedência (do mais fraco ao mais forte),
-    // espelhando `parser.lua:369-395` com os níveis bitwise omitidos:
+    // espelhando `parser.lua:369-395` por completo — os níveis bitwise
+    // (`op4`–`op7` do original) entraram na T60:
     //
     // ```text
     // parse_exp → parse_or_exp
     // or_exp     : and_exp (or and_exp)*                       — assoc. esquerda
     // and_exp    : rel_exp (and rel_exp)*                      — assoc. esquerda
-    // rel_exp    : concat_exp ((== ~= < > <= >=) concat_exp)?  — sem encadear
+    // rel_exp    : bor_exp ((== ~= < > <= >=) bor_exp)?        — sem encadear
+    // bor_exp    : bxor_exp (| bxor_exp)*                      — assoc. esquerda
+    // bxor_exp   : band_exp (~ band_exp)*                      — assoc. esquerda
+    // band_exp   : shift_exp (& shift_exp)*                    — assoc. esquerda
+    // shift_exp  : concat_exp ((<< >>) concat_exp)*            — assoc. esquerda
     // concat_exp : add_exp (.. add_exp)*                       — assoc. direita
     // add_exp    : mul_exp ((+ -) mul_exp)*                    — assoc. esquerda
-    // mul_exp    : unary_exp ((* / %) unary_exp)*              — assoc. esquerda
-    // unary_exp  : (not | -)* pow_exp
+    // mul_exp    : unary_exp ((* / // %) unary_exp)*           — assoc. esquerda
+    // unary_exp  : (not | - | # | ~)* pow_exp
     // pow_exp    : simple_exp (^ unary_exp)?                   — assoc. direita
     // ```
+    //
+    // O `~` é ambíguo por natureza: binário é XOR (nível `bxor_exp`),
+    // unário é NOT (nível `unary_exp`). A cascata resolve sozinha — quem
+    // chega em `parse_unary_exp` com um `~` na frente está em posição de
+    // prefixo; quem chega em `parse_bxor_exp` já consumiu o operando
+    // esquerdo.
 
     fn parse_exp(&mut self) -> Result<Exp, ParseError> {
         self.parse_or_exp()
@@ -640,7 +652,7 @@ impl<'a> Parser<'a> {
     /// Relacionais **não encadeiam** (fiel ao original): `a == b == c` é
     /// erro sintático, não `(a == b) == c`.
     fn parse_rel_exp(&mut self) -> Result<Exp, ParseError> {
-        let lhs = self.parse_concat_exp()?;
+        let lhs = self.parse_bor_exp()?;
         let op = match &self.peek().kind {
             TokenKind::Eq => "==",
             TokenKind::Ne => "~=",
@@ -652,12 +664,47 @@ impl<'a> Parser<'a> {
         };
         let loc = self.loc();
         self.advance();
-        let rhs = self.parse_concat_exp()?;
+        let rhs = self.parse_bor_exp()?;
         Ok(Exp::ExpBinop {
             loc,
             lhs: Box::new(lhs),
             op: op.to_string(),
             rhs: Box::new(rhs),
+        })
+    }
+
+    /// `bxor (| bxor)*` — OU bitwise, o mais fraco dos níveis bitwise.
+    fn parse_bor_exp(&mut self) -> Result<Exp, ParseError> {
+        self.parse_left_assoc_binop(Self::parse_bxor_exp, |kind| match kind {
+            TokenKind::Pipe => Some("|"),
+            _ => None,
+        })
+    }
+
+    /// `band (~ band)*` — XOR bitwise. No Titan, como em Lua 5.3, o `~`
+    /// binário é XOR (o `~=` já foi resolvido pelo lexer por lookahead).
+    fn parse_bxor_exp(&mut self) -> Result<Exp, ParseError> {
+        self.parse_left_assoc_binop(Self::parse_band_exp, |kind| match kind {
+            TokenKind::Tilde => Some("~"),
+            _ => None,
+        })
+    }
+
+    /// `shift (& shift)*` — E bitwise.
+    fn parse_band_exp(&mut self) -> Result<Exp, ParseError> {
+        self.parse_left_assoc_binop(Self::parse_shift_exp, |kind| match kind {
+            TokenKind::Amp => Some("&"),
+            _ => None,
+        })
+    }
+
+    /// `concat ((<< >>) concat)*` — deslocamentos, logo acima da
+    /// concatenação: `1 << 2 + 3` agrupa o `+` primeiro.
+    fn parse_shift_exp(&mut self) -> Result<Exp, ParseError> {
+        self.parse_left_assoc_binop(Self::parse_concat_exp, |kind| match kind {
+            TokenKind::Shl => Some("<<"),
+            TokenKind::Shr => Some(">>"),
+            _ => None,
         })
     }
 
@@ -690,23 +737,27 @@ impl<'a> Parser<'a> {
         self.parse_left_assoc_binop(Self::parse_unary_exp, |kind| match kind {
             TokenKind::Star => Some("*"),
             TokenKind::Slash => Some("/"),
+            TokenKind::DoubleSlash => Some("//"),
             TokenKind::Percent => Some("%"),
             _ => None,
         })
     }
 
-    /// `(not | - | #)* pow_exp` — a repetição vira recursão: `- -1` e
+    /// `(not | - | # | ~)* pow_exp` — a repetição vira recursão: `- -1` e
     /// `not not true` produzem `ExpUnop` aninhados. `#` (T20/T25: lexado
     /// desde a T20, mas sem produtor no parser até aqui — T30 fecha essa
     /// lacuna, exigida por `#xs`/`#s` ponta a ponta) segue o mesmo lugar na
     /// gramática: `checker::check_unop` já sabe mapear `"#"` para
-    /// `UnOp::Len`.
+    /// `UnOp::Len`. O `~` em posição de prefixo é o NOT bitwise (`BNEG` do
+    /// original) — é aqui que ele se separa do XOR binário de
+    /// `parse_bxor_exp`.
     fn parse_unary_exp(&mut self) -> Result<Exp, ParseError> {
         let loc = self.loc();
         let op = match &self.peek().kind {
             TokenKind::Not => "not",
             TokenKind::Minus => "-",
             TokenKind::Hash => "#",
+            TokenKind::Tilde => "~",
             _ => return self.parse_pow_exp(),
         };
         self.advance();
@@ -1883,5 +1934,213 @@ end"#,
     fn erro_de_toplevel_menciona_import() {
         let err = parse_source("42").unwrap_err();
         assert!(err.message.contains("import"), "obteve: {}", err.message);
+    }
+
+    // ---- T60: bitwise e `//` na cascata de precedência -------------------
+
+    /// Devolve `(op, lhs, rhs)` de um `ExpBinop`, falhando com a forma real
+    /// quando a expressão não é binária — o que torna o erro de um teste de
+    /// precedência legível sem depurador.
+    fn binop_parts(exp: &Exp) -> (&str, &Exp, &Exp) {
+        let Exp::ExpBinop { op, lhs, rhs, .. } = exp else {
+            panic!("esperava ExpBinop, obteve {exp:?}");
+        };
+        (op.as_str(), lhs, rhs)
+    }
+
+    /// Devolve `(op, exp)` de um `ExpUnop`.
+    fn unop_parts(exp: &Exp) -> (&str, &Exp) {
+        let Exp::ExpUnop { op, exp, .. } = exp else {
+            panic!("esperava ExpUnop, obteve {exp:?}");
+        };
+        (op.as_str(), exp)
+    }
+
+    #[test]
+    fn parse_or_bitwise_produz_binop_com_barra_vertical() {
+        let exp = parse_exp_source("1 | 2").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, _, _) = binop_parts(&exp);
+        assert_eq!(op, "|");
+    }
+
+    #[test]
+    fn parse_xor_binario_produz_binop_com_til() {
+        let exp = parse_exp_source("a ~ b").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, _, _) = binop_parts(&exp);
+        assert_eq!(op, "~");
+    }
+
+    #[test]
+    fn parse_and_bitwise_produz_binop_com_e_comercial() {
+        let exp = parse_exp_source("1 & 2").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, _, _) = binop_parts(&exp);
+        assert_eq!(op, "&");
+    }
+
+    #[test]
+    fn parse_shifts_produzem_binop_com_as_grafias_do_original() {
+        let exp = parse_exp_source("1 << 2").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert_eq!(binop_parts(&exp).0, "<<");
+        let exp = parse_exp_source("1 >> 2").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert_eq!(binop_parts(&exp).0, ">>");
+    }
+
+    #[test]
+    fn parse_divisao_inteira_produz_binop_com_barra_dupla() {
+        let exp = parse_exp_source("5 // 2").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, rhs) = binop_parts(&exp);
+        assert_eq!(op, "//");
+        assert!(matches!(lhs, Exp::ExpInteger { value: 5, .. }));
+        assert!(matches!(rhs, Exp::ExpInteger { value: 2, .. }));
+    }
+
+    #[test]
+    fn precedencia_or_bitwise_e_mais_fraca_que_and_bitwise() {
+        // `1 | 2 & 3` ≡ `1 | (2 & 3)`
+        let exp = parse_exp_source("1 | 2 & 3").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, rhs) = binop_parts(&exp);
+        assert_eq!(op, "|");
+        assert!(matches!(lhs, Exp::ExpInteger { value: 1, .. }));
+        assert_eq!(binop_parts(rhs).0, "&");
+    }
+
+    #[test]
+    fn precedencia_xor_fica_entre_or_e_and_bitwise() {
+        // `1 | 2 ~ 3 & 4` ≡ `1 | (2 ~ (3 & 4))`
+        let exp =
+            parse_exp_source("1 | 2 ~ 3 & 4").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, _, rhs) = binop_parts(&exp);
+        assert_eq!(op, "|");
+        let (op, _, rhs) = binop_parts(rhs);
+        assert_eq!(op, "~");
+        assert_eq!(binop_parts(rhs).0, "&");
+    }
+
+    #[test]
+    fn precedencia_shift_e_mais_fraca_que_soma() {
+        // `1 << 2 + 3` ≡ `1 << (2 + 3)`
+        let exp = parse_exp_source("1 << 2 + 3").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, rhs) = binop_parts(&exp);
+        assert_eq!(op, "<<");
+        assert!(matches!(lhs, Exp::ExpInteger { value: 1, .. }));
+        assert_eq!(binop_parts(rhs).0, "+");
+    }
+
+    #[test]
+    fn precedencia_shift_e_mais_forte_que_and_bitwise() {
+        // `1 & 2 << 3` ≡ `1 & (2 << 3)`
+        let exp = parse_exp_source("1 & 2 << 3").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, _, rhs) = binop_parts(&exp);
+        assert_eq!(op, "&");
+        assert_eq!(binop_parts(rhs).0, "<<");
+    }
+
+    #[test]
+    fn precedencia_shift_e_mais_fraca_que_concatenacao() {
+        // `op7` (shift) vem antes de `op8` (concat) no original, então o
+        // `..` liga mais forte: `"s" .. 1 << 2` ≡ `("s" .. 1) << 2`.
+        let exp =
+            parse_exp_source(r#""s" .. 1 << 2"#).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, _) = binop_parts(&exp);
+        assert_eq!(op, "<<");
+        let Exp::ExpConcat { exps, .. } = lhs else {
+            panic!("esperava ExpConcat à esquerda, obteve {lhs:?}");
+        };
+        assert_eq!(exps.len(), 2);
+    }
+
+    #[test]
+    fn precedencia_relacional_e_mais_fraca_que_or_bitwise() {
+        // `1 | 2 == 3` ≡ `(1 | 2) == 3`
+        let exp = parse_exp_source("1 | 2 == 3").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, _) = binop_parts(&exp);
+        assert_eq!(op, "==");
+        assert_eq!(binop_parts(lhs).0, "|");
+    }
+
+    #[test]
+    fn precedencia_divisao_inteira_e_igual_a_multiplicacao() {
+        // Mesmo nível, associativo à esquerda: `8 // 2 * 3` ≡ `(8 // 2) * 3`.
+        let exp = parse_exp_source("8 // 2 * 3").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, _) = binop_parts(&exp);
+        assert_eq!(op, "*");
+        assert_eq!(binop_parts(lhs).0, "//");
+    }
+
+    #[test]
+    fn precedencia_divisao_inteira_e_mais_forte_que_soma() {
+        // `1 + 8 // 2` ≡ `1 + (8 // 2)`
+        let exp = parse_exp_source("1 + 8 // 2").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, _, rhs) = binop_parts(&exp);
+        assert_eq!(op, "+");
+        assert_eq!(binop_parts(rhs).0, "//");
+    }
+
+    #[test]
+    fn til_unario_vira_unop_e_nao_binop() {
+        let exp = parse_exp_source("~x").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, operando) = unop_parts(&exp);
+        assert_eq!(op, "~");
+        assert!(matches!(operando, Exp::ExpVar { .. }));
+    }
+
+    #[test]
+    fn til_unario_e_binario_convivem_na_mesma_expressao() {
+        // `~a ~ b` ≡ `(~a) ~ b`: prefixo é NOT, infixo é XOR.
+        let exp = parse_exp_source("~a ~ b").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, rhs) = binop_parts(&exp);
+        assert_eq!(op, "~");
+        assert_eq!(unop_parts(lhs).0, "~");
+        assert!(matches!(rhs, Exp::ExpVar { .. }));
+    }
+
+    #[test]
+    fn til_unario_se_aplica_antes_do_xor_binario() {
+        // `a ~ ~b` ≡ `a ~ (~b)`
+        let exp = parse_exp_source("a ~ ~b").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, _, rhs) = binop_parts(&exp);
+        assert_eq!(op, "~");
+        assert_eq!(unop_parts(rhs).0, "~");
+    }
+
+    #[test]
+    fn til_unario_repetido_aninha_unops() {
+        let exp = parse_exp_source("~ ~x").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, dentro) = unop_parts(&exp);
+        assert_eq!(op, "~");
+        assert_eq!(unop_parts(dentro).0, "~");
+    }
+
+    #[test]
+    fn til_unario_e_mais_forte_que_and_bitwise() {
+        // `~a & b` ≡ `(~a) & b`
+        let exp = parse_exp_source("~a & b").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, _) = binop_parts(&exp);
+        assert_eq!(op, "&");
+        assert_eq!(unop_parts(lhs).0, "~");
+    }
+
+    #[test]
+    fn diferente_continua_sendo_relacional_e_nao_xor() {
+        // O lexer resolve `~=` por lookahead; o parser precisa vê-lo no
+        // nível relacional, não no de XOR.
+        let exp = parse_exp_source("a ~= b").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert_eq!(binop_parts(&exp).0, "~=");
+    }
+
+    #[test]
+    fn parentese_vence_a_cascata_bitwise() {
+        // `(1 | 2) & 3` inverte o agrupamento natural de `1 | 2 & 3`.
+        let exp =
+            parse_exp_source("(1 | 2) & 3").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let (op, lhs, _) = binop_parts(&exp);
+        assert_eq!(op, "&");
+        assert_eq!(binop_parts(lhs).0, "|");
+    }
+
+    #[test]
+    fn operador_bitwise_sem_operando_direito_produz_erro_claro() {
+        let err = parse_exp_source("1 |").unwrap_err();
+        assert!(!err.message.is_empty());
     }
 }
