@@ -30,8 +30,22 @@
 //! como identificador.
 //!
 //! A Fase 4 (T55 do PRD.md) acrescenta a palavra-chave `break`. Como `as` e
-//! `import`, deixa de poder ser usada como identificador. `continue` fica de
-//! fora (decisão técnica 7 do PRD.md) — não é keyword.
+//! `import`, deixa de poder ser usada como identificador.
+//!
+//! A Fase 5 (T59 do PRD.md) abre o léxico de uma vez para tudo que a fase
+//! precisa: as palavras-chave `enum match continue repeat until in foreign` e
+//! os símbolos `? & | << >> //`. Todas as sete keywords deixam de poder ser
+//! usadas como identificador — a mesma quebra compatível de `as` (T20),
+//! `import` (T34) e `break` (T55). `continue` entra no léxico aqui, mas segue
+//! rejeitado pelo parser com a mensagem do ADR 0017 até a T65 reabrir o
+//! ADR 0004 e tirar o `for` do desaçucaramento para `while`.
+//!
+//! Três ambiguidades resolvidas com o mesmo lookahead de 1 char de `.` vs `..`:
+//! `~` isolado deixa de ser erro e vira `Tilde` (XOR binário / NOT unário),
+//! com `~=` ainda ganhando por lookahead; `//` (divisão inteira) precisa ser
+//! testado antes do braço de `/`, sem colidir com comentário, que em Titan é
+//! `--`; e `<<`/`>>` precisam ser testados junto de `<=`/`>=`, checando `=`
+//! e o próprio caractere no mesmo braço.
 
 use crate::ast::Loc;
 
@@ -88,6 +102,15 @@ pub enum TokenKind {
     // Palavra-chave de controle de laço (Fase 4, T55)
     KwBreak,
 
+    // Palavras-chave da Fase 5 (T59): tipos soma, laços e FFI
+    KwEnum,
+    KwMatch,
+    KwContinue,
+    KwRepeat,
+    KwUntil,
+    KwIn,
+    KwForeign,
+
     // Símbolos
     LParen,
     RParen,
@@ -118,6 +141,15 @@ pub enum TokenKind {
     Gt, // >
     Le, // <=
     Ge, // >=
+
+    // Símbolos da Fase 5 (T59)
+    Question,    // ?
+    Amp,         // &
+    Pipe,        // |
+    Tilde,       // ~ (XOR binário, NOT unário)
+    Shl,         // <<
+    Shr,         // >>
+    DoubleSlash, // //
 
     Eof,
 }
@@ -153,6 +185,13 @@ pub const KEYWORDS: &[(&str, TokenKind)] = &[
     ("as", TokenKind::KwAs),
     ("import", TokenKind::KwImport),
     ("break", TokenKind::KwBreak),
+    ("enum", TokenKind::KwEnum),
+    ("match", TokenKind::KwMatch),
+    ("continue", TokenKind::KwContinue),
+    ("repeat", TokenKind::KwRepeat),
+    ("until", TokenKind::KwUntil),
+    ("in", TokenKind::KwIn),
+    ("foreign", TokenKind::KwForeign),
 ];
 
 /// Erro léxico com posição (`lexer.lua` reporta via `lpeglabel`; aqui viramos
@@ -549,8 +588,9 @@ impl<'a> Lexer<'a> {
         }
 
         // Símbolos suportados: ( ) { } , : ; .. = e os operadores da Fase 1
-        // (+ - * / % ^ == ~= < > <= >=). Ambiguidades resolvidas com o mesmo
-        // lookahead de 1 char já usado para `.` vs `..`.
+        // (+ - * / % ^ == ~= < > <= >=), mais os da Fase 5 (? & | ~ << >> //).
+        // Ambiguidades resolvidas com o mesmo lookahead de 1 char já usado
+        // para `.` vs `..`.
         let kind = match c {
             '(' => {
                 self.advance();
@@ -615,6 +655,13 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Star
             }
+            // `//` (divisão inteira) antes de `/`: comentário em Titan é
+            // `--`, então não há colisão — só o lookahead de 1 char.
+            '/' if self.peek2() == Some('/') => {
+                self.advance();
+                self.advance();
+                TokenKind::DoubleSlash
+            }
             '/' => {
                 self.advance();
                 TokenKind::Slash
@@ -636,10 +683,17 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Assign
             }
+            // `<=` e `<<` competem pelo mesmo lookahead: os dois braços
+            // precisam vir antes do `<` isolado (idem `>`).
             '<' if self.peek2() == Some('=') => {
                 self.advance();
                 self.advance();
                 TokenKind::Le
+            }
+            '<' if self.peek2() == Some('<') => {
+                self.advance();
+                self.advance();
+                TokenKind::Shl
             }
             '<' => {
                 self.advance();
@@ -650,6 +704,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Ge
             }
+            '>' if self.peek2() == Some('>') => {
+                self.advance();
+                self.advance();
+                TokenKind::Shr
+            }
             '>' => {
                 self.advance();
                 TokenKind::Gt
@@ -659,13 +718,24 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Ne
             }
-            // `~` só existe em `~=` — sem bitwise nesta fase.
+            // `~` isolado deixou de ser erro na T59: é XOR binário (`a ~ b`)
+            // e NOT unário (`~x`), como no Titan original. `~=` continua
+            // ganhando pelo lookahead acima.
             '~' => {
-                return Err(LexError {
-                    message: "'~' isolado não é um operador; use '~=' para desigualdade."
-                        .to_string(),
-                    loc,
-                });
+                self.advance();
+                TokenKind::Tilde
+            }
+            '?' => {
+                self.advance();
+                TokenKind::Question
+            }
+            '&' => {
+                self.advance();
+                TokenKind::Amp
+            }
+            '|' => {
+                self.advance();
+                TokenKind::Pipe
             }
             other => {
                 return Err(LexError {
@@ -1120,12 +1190,239 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Fase 5 (T59): keywords e símbolos novos.
+    // ------------------------------------------------------------------
+
     #[test]
-    fn til_isolado_produz_erro_lexico_com_posicao() {
-        let err = lex("a ~ b").unwrap_err();
-        assert!(err.message.contains("'~'"));
-        assert!(err.message.contains("'~='"));
-        assert_eq!(err.loc, Loc { line: 1, col: 3 });
+    fn keywords_da_fase_5() {
+        assert_eq!(
+            kinds("enum match continue repeat until in foreign"),
+            vec![
+                TokenKind::KwEnum,
+                TokenKind::KwMatch,
+                TokenKind::KwContinue,
+                TokenKind::KwRepeat,
+                TokenKind::KwUntil,
+                TokenKind::KwIn,
+                TokenKind::KwForeign,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_da_fase_5_nao_casa_prefixo_de_identificador() {
+        // Mesma garantia de `keyword_nova_nao_casa_prefixo_de_identificador`:
+        // `matching` não é `match` + `ing`, `continuar` não é `continue`...
+        assert_eq!(
+            kinds("matching continuar enumera repetir untilx interno foreignkey"),
+            vec![
+                TokenKind::Name("matching".to_string()),
+                TokenKind::Name("continuar".to_string()),
+                TokenKind::Name("enumera".to_string()),
+                TokenKind::Name("repetir".to_string()),
+                TokenKind::Name("untilx".to_string()),
+                TokenKind::Name("interno".to_string()),
+                TokenKind::Name("foreignkey".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn til_isolado_vira_tilde() {
+        // Quebra deliberada da T59: até a Fase 4, `~` fora de `~=` era erro
+        // léxico. Agora é XOR binário.
+        assert_eq!(
+            kinds("a ~ b"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::Tilde,
+                TokenKind::Name("b".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn til_unario_antes_de_nome() {
+        assert_eq!(
+            kinds("~x"),
+            vec![
+                TokenKind::Tilde,
+                TokenKind::Name("x".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn ne_continua_ganhando_de_tilde_por_lookahead() {
+        assert_eq!(
+            kinds("a ~= b"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::Ne,
+                TokenKind::Name("b".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tilde_seguido_de_igual_separado_por_espaco_nao_vira_ne() {
+        assert_eq!(
+            kinds("a ~ = b"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::Tilde,
+                TokenKind::Assign,
+                TokenKind::Name("b".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn interrogacao_e_bitwise_saem_de_caractere_inesperado() {
+        assert_eq!(
+            kinds("? & |"),
+            vec![
+                TokenKind::Question,
+                TokenKind::Amp,
+                TokenKind::Pipe,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tipo_option_com_interrogacao() {
+        assert_eq!(
+            kinds("x: integer?"),
+            vec![
+                TokenKind::Name("x".to_string()),
+                TokenKind::Colon,
+                TokenKind::KwInteger,
+                TokenKind::Question,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn divisao_inteira_nao_vira_comentario() {
+        // Comentário em Titan é `--`; `//` é divisão inteira e o resto da
+        // linha continua sendo tokenizado.
+        assert_eq!(
+            kinds("5 // 2 + 1"),
+            vec![
+                TokenKind::Integer(5),
+                TokenKind::DoubleSlash,
+                TokenKind::Integer(2),
+                TokenKind::Plus,
+                TokenKind::Integer(1),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn barra_simples_continua_sendo_divisao() {
+        assert_eq!(
+            kinds("5 / 2"),
+            vec![
+                TokenKind::Integer(5),
+                TokenKind::Slash,
+                TokenKind::Integer(2),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn distingue_shl_de_le_e_de_lt() {
+        assert_eq!(
+            kinds("1 << 2"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Shl,
+                TokenKind::Integer(2),
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("1 <= 2"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Le,
+                TokenKind::Integer(2),
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("1 < 2"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Lt,
+                TokenKind::Integer(2),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn distingue_shr_de_ge_e_de_gt() {
+        assert_eq!(
+            kinds("1 >> 2"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Shr,
+                TokenKind::Integer(2),
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("1 >= 2"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Ge,
+                TokenKind::Integer(2),
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("1 > 2"),
+            vec![
+                TokenKind::Integer(1),
+                TokenKind::Gt,
+                TokenKind::Integer(2),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn shl_de_tipo_generico_encostado_nao_vira_lt_lt() {
+        // `a<<b` sem espaço é `<<`, não dois `<` — o lookahead não depende
+        // de separador.
+        assert_eq!(
+            kinds("a<<b"),
+            vec![
+                TokenKind::Name("a".to_string()),
+                TokenKind::Shl,
+                TokenKind::Name("b".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn bitwise_com_posicao_correta() {
+        let tokens = lex("1 & 2").expect("lexa bitwise and");
+        assert_eq!(tokens[1].kind, TokenKind::Amp);
+        assert_eq!(tokens[1].loc, Loc { line: 1, col: 3 });
     }
 
     #[test]

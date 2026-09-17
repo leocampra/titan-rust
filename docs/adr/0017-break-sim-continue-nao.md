@@ -40,9 +40,16 @@ profundidade de `while`/`for` aninhados no `Checker`), e emissão de `break;`
 no codegen.
 
 `continue` **não** entra. É rejeitado explicitamente pelo parser
-(`parser.rs:427`) com uma mensagem que explica o motivo — pularia o
+(`parse_stat`) com uma mensagem que explica o motivo — pularia o
 incremento do `for` desaçucarado — em vez de cair no erro genérico de
 "declaração inesperada".
+
+> **Nota (Fase 5, T59):** `continue` passou a ser **palavra-chave**
+> (`TokenKind::KwContinue`) junto com as outras seis que a fase precisa. Isso
+> não muda a decisão — a rejeição continua no parser, só que agora testando o
+> token em vez de comparar um `Name` com a string `"continue"`. A decisão em
+> si só cai quando a T65 reabrir o [ADR 0004](0004-for-desacucarado-para-while.md)
+> e o `for` deixar de ser desaçucarado, como previsto abaixo.
 
 ## Consequências
 

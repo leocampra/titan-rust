@@ -536,7 +536,12 @@ fn completar_em_posicao_de_expressao_lista_escopo_builtins_e_keywords() {
     );
 
     let labels = completion_labels(&response);
-    for esperado in ["x", "args", "print", "if", "while", "function"] {
+    // As sete últimas são as keywords que a T59 acrescentou: chegam ao
+    // autocomplete só por entrarem em `KEYWORDS`, sem trabalho no LSP.
+    for esperado in [
+        "x", "args", "print", "if", "while", "function", "enum", "match", "continue", "repeat",
+        "until", "in", "foreign",
+    ] {
         assert!(
             labels.contains(&esperado.to_string()),
             "completar em posição de expressão deveria listar '{esperado}', obteve: {labels:?}"

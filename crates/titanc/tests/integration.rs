@@ -45,6 +45,10 @@
 //!   T35) e `s[i]` (indexação de string, branch própria no checker); e o
 //!   risco 5 (Cargo.toml gerado nunca depender do LSP) é conferido dentro do
 //!   build de `hello.titan` já pago pelo caminho feliz, sem custo extra.
+//! - abertura da Fase 5 (PRD.md, T59): as tabelas de fora-de-escopo mudam de
+//!   camada onde o léxico abriu (`& | ~ << >> // ?` agora são tokens, então
+//!   a rejeição virou sintática) e `KEYWORDS_NOVAS_DA_T59` registra a quebra
+//!   compatível das sete palavras-chave novas.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -813,43 +817,50 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
     },
     CasoNegativo {
         nome: "repeat_until",
+        // `repeat`/`until` viraram keywords na T59: deixaram de ser lidas
+        // como identificador, então o comando morre em `parse_primary_exp`.
         fonte: "function main(args: {string}): integer\n    repeat print(\"x\") until true\n    return 0\nend",
-        trecho_esperado: "Esperava um comando",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
+    // Os seis casos abaixo mudaram de camada na T59 (Fase 5): `& | ~ << >>
+    // // ?` passaram a ser tokens, então a rejeição saiu do lexer e virou
+    // erro de sintaxe — o parser só ganha esses níveis de precedência na T60.
     CasoNegativo {
         nome: "bitwise_and",
         fonte: "function main(args: {string}): integer\n    local a = 1 & 2\n    return 0\nend",
-        trecho_esperado: "caractere inesperado '&'",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
     CasoNegativo {
         nome: "bitwise_or",
         fonte: "function main(args: {string}): integer\n    local a = 1 | 2\n    return 0\nend",
-        trecho_esperado: "caractere inesperado '|'",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
     CasoNegativo {
         nome: "bitwise_not_isolado",
         fonte: "function main(args: {string}): integer\n    local a = ~2\n    return 0\nend",
-        trecho_esperado: "'~' isolado",
+        trecho_esperado: "Esperava uma expressão",
     },
     CasoNegativo {
         nome: "shift_esquerda",
         fonte: "function main(args: {string}): integer\n    local a = 1 << 2\n    return 0\nend",
-        trecho_esperado: "Esperava uma expressão",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
     CasoNegativo {
         nome: "shift_direita",
         fonte: "function main(args: {string}): integer\n    local a = 1 >> 2\n    return 0\nend",
-        trecho_esperado: "Esperava uma expressão",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
     CasoNegativo {
         nome: "divisao_inteira",
         fonte: "function main(args: {string}): integer\n    local a = 1 // 2\n    return 0\nend",
-        trecho_esperado: "Esperava uma expressão",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
     CasoNegativo {
         nome: "tipo_option",
+        // `?` virou token na T59: o parser lê o tipo `integer` e para no `?`,
+        // que ainda não é sufixo de tipo (T72).
         fonte: "function main(args: {string}): integer\n    local a: integer? = nil\n    return 0\nend",
-        trecho_esperado: "caractere inesperado '?'",
+        trecho_esperado: "Esperava '=' após a declaração da variável",
     },
     CasoNegativo {
         nome: "cast_as",
@@ -1025,18 +1036,20 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         trecho_esperado: "`continue` não é suportado",
     },
     CasoNegativo {
-        // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria —
-        // Fase 5, pendente. `enum` não é declaração de topo reconhecida.
+        // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria: a
+        // T59 as tornou keywords, mas a declaração só chega na T62 — `enum`
+        // segue não sendo declaração de topo reconhecida.
         nome: "tipo_soma_enum",
         fonte: "enum Cor\n    Vermelho\n    Verde\n    Azul\nend\n\nfunction main(args: {string}): integer\n    return 0\nend",
         trecho_esperado: "Esperava uma declaração de topo",
     },
     CasoNegativo {
         nome: "tipo_soma_match",
-        // `match` não é keyword: dentro de um corpo de função, o parser
-        // simplesmente não reconhece o início de comando.
+        // `match` virou keyword na T59 mas ainda não tem comando próprio
+        // (T62): dentro de um corpo de função, o parser não reconhece o
+        // início de comando nem de expressão.
         fonte: "function main(args: {string}): integer\n    local x: integer = 1\n    match x\n        1 -> print(\"um\")\n    end\n    return 0\nend",
-        trecho_esperado: "Esperava um comando",
+        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
     },
     CasoNegativo {
         // `.titan` importando `.titan` cairia exatamente na forma `import`
@@ -1060,6 +1073,47 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
 fn construcoes_fora_de_escopo_da_fase_4_produzem_erro_claro_sem_panic() {
     for caso in CASOS_FORA_DE_ESCOPO_FASE_4 {
         verifica_caso_negativo(caso, "fora-de-escopo-fase-4");
+    }
+}
+
+/// Quebra compatível registrada pela T59 (Fase 5): `enum`, `match`,
+/// `continue`, `repeat`, `until`, `in` e `foreign` viraram palavras-chave e
+/// deixaram de ser identificadores válidos — mesma mudança de `as` (T20),
+/// `import` (T34) e `break` (T55). Um programa que usava qualquer uma delas
+/// como nome de variável passa a ser erro de sintaxe claro, nunca panic.
+const KEYWORDS_NOVAS_DA_T59: &[&str] = &[
+    "enum", "match", "continue", "repeat", "until", "in", "foreign",
+];
+
+#[test]
+fn keywords_novas_da_t59_deixam_de_ser_identificadores_com_erro_claro() {
+    for kw in KEYWORDS_NOVAS_DA_T59 {
+        let out_dir = temp_dir(&format!("keyword-t59-{kw}"));
+        let fonte = format!(
+            "function main(args: {{string}}): integer\n    local {kw} = 1\n    return 0\nend"
+        );
+        let source_path = write_source(&out_dir, "caso.titan", &fonte);
+
+        let output = Command::new(titanc_bin())
+            .arg("--emit-rust")
+            .arg("--out")
+            .arg(&out_dir)
+            .arg(&source_path)
+            .output()
+            .unwrap_or_else(|e| panic!("[{kw}] falha ao invocar titanc: {e}"));
+
+        assert_never_panics(&output);
+        assert!(
+            !output.status.success(),
+            "[{kw}] esperava falha (keyword como identificador), titanc reportou sucesso"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Esperava um nome de variável"),
+            "[{kw}] esperava erro de nome de variável, obteve: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }
 

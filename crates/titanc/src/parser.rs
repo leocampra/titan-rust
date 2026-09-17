@@ -417,15 +417,12 @@ impl<'a> Parser<'a> {
             return Ok(Stat::StatBreak { loc });
         }
 
-        // `continue` não é keyword (decisão técnica 7 do PRD.md): o `for` é
-        // desaçucarado para `while` com o incremento no fim do corpo (T15,
-        // ADR 0004), então um `continue` pularia o incremento e daria laço
-        // infinito silencioso. Detectado aqui, antes de virar uma expressão
-        // sufixada comum, para dar um erro claro em vez de deixar `continue`
-        // ser usado como identificador.
-        if let TokenKind::Name(name) = &self.peek().kind
-            && name == "continue"
-        {
+        // `continue` virou keyword na T59, mas ainda não tem semântica: o
+        // `for` continua desaçucarado para `while` com o incremento no fim do
+        // corpo (T15, ADR 0004), então um `continue` pularia o incremento e
+        // daria laço infinito silencioso. A rejeição sai daqui quando a T65
+        // reabrir o ADR 0004 e o `for` deixar de ser desaçucarado.
+        if self.check(&TokenKind::KwContinue) {
             return Err(ParseError {
                 message: "`continue` não é suportado: o `for` é desaçucarado para `while` \
                           com o incremento no fim do corpo, e um `continue` pularia esse \
