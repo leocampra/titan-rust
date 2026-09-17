@@ -23,8 +23,9 @@
 //!   tipos de record/map — continua rejeitado com erro claro. `v[i]`,
 //!   `{...}` e `#` saíram desta lista: têm suporte real no codegen desde a
 //!   T30; bitwise e `//` saíram na T61, `repeat`/`until` na T64 e os
-//!   retornos múltiplos na T65, e o que resta deles é o negativo de tipo
-//!   (`1.5 & 2`, condição do `until` não-boolean, aridade de `return`);
+//!   retornos múltiplos na T65 (tipagem) e T66 (a tupla emitida), e o que
+//!   resta deles é o negativo de tipo (`1.5 & 2`, condição do `until`
+//!   não-boolean, aridade de `return`);
 //! - arquivos `.titan` reais do Titan original nunca panicam ao serem
 //!   processados (compilam ou falham com erro claro), e os que usam somente
 //!   o idioma de arrays já suportado (`sieve.titan`, `selection_sort.titan`)
@@ -1383,6 +1384,123 @@ fn compila_e_executa_repeat_until() {
         "mix-1\nmix-3\nmix-4\n",
         "ani-1-1\nani-1-2\nani-2-1\nani-2-2\n",
         "for-rep-1-1\nfor-rep-2-2\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T66, nos dois pontos que a tarefa pede: o
+/// `--emit-rust` confere a **tupla** — na assinatura (`-> (i64, i64)`) e no
+/// `return` — e a `divmod` roda de verdade, imprimindo os dois valores.
+///
+/// A divisão entre os dois trechos do teste não é acidental. Até a T67, o
+/// fonte só alcança o **primeiro** valor de retorno: a chamada em posição de
+/// expressão ajusta para ele (o `Adjust` da T65), e `local q, r = divmod(...)`
+/// — a forma que lê o segundo — é justamente a rejeição que a T67 remove.
+/// Então os dois valores são impressos de dentro da própria `divmod`, que é
+/// onde a execução os alcança hoje, e o que o chamador confere é que o `.0`
+/// da tupla chega correto do outro lado da fronteira de função. Que a tupla
+/// transporta o segundo valor com o mesmo rigor está no texto emitido, aqui
+/// e no teste de `Extra` no codegen.
+#[test]
+fn compila_e_executa_retornos_multiplos_como_tupla() {
+    let out_dir = temp_dir("retornos-multiplos-execucao-real");
+
+    let source = concat!(
+        "function divmod(a: integer, b: integer): integer, integer\n",
+        "    local q: integer = a // b\n",
+        "    local r: integer = a % b\n",
+        "    print(\"divmod-\" .. a .. \"-\" .. b .. \"=\" .. q .. \",\" .. r)\n",
+        "    return q, r\n",
+        "end\n",
+        // Dois retornos de tipos **diferentes**, com um composto e uma
+        // `string` na mesma tupla: o componente composto sai por valor e
+        // cada um segue a regra de slot do ADR 0006 (`.clone()` no que
+        // sobrevive ao `return`).
+        "function rotula(n: integer): {integer}, string\n",
+        "    local v: {integer} = {n, n + 1}\n",
+        "    local s: string = \"rot\"\n",
+        "    return v, s\n",
+        "end\n",
+        "function main(args: {string}): integer\n",
+        // O ajuste para o primeiro valor atravessa a fronteira de função: o
+        // `.0` da tupla é o quociente, não o resto.
+        "    local q: integer = divmod(7, 2)\n",
+        "    print(\"q-\" .. q)\n",
+        // Negativo, onde `//` diverge do `/` do Rust (T61): a tupla não
+        // muda essa conta, e o teste garante que não passou a mudar.
+        "    local qn: integer = divmod(-7, 2)\n",
+        "    print(\"qn-\" .. qn)\n",
+        "    local v: {integer} = rotula(10)\n",
+        "    print(\"v-\" .. #v .. \"-\" .. v[1])\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "retornos_multiplos.titan", source);
+
+    // 1. `--emit-rust`: a tupla aparece na assinatura e no `return`, e o
+    //    retorno único continua sem tupla de um elemento.
+    let emit_output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&emit_output);
+    assert!(
+        emit_output.status.success(),
+        "titanc --emit-rust falhou para retornos múltiplos: {}",
+        String::from_utf8_lossy(&emit_output.stderr)
+    );
+    let rust = String::from_utf8_lossy(&emit_output.stdout);
+    assert!(
+        rust.contains("pub fn titan_divmod(a: i64, b: i64) -> (i64, i64) {"),
+        "assinatura sem tupla:\n{rust}"
+    );
+    assert!(rust.contains("return (q, r);"), "return sem tupla:\n{rust}");
+    assert!(
+        rust.contains("pub fn titan_rotula(n: i64) -> (Vec<i64>, String) {"),
+        "composto e string na tupla saem por valor:\n{rust}"
+    );
+    assert!(
+        rust.contains("pub fn titan_main(_args: &mut Vec<String>) -> i64 {"),
+        "retorno único não deveria virar tupla:\n{rust}"
+    );
+    assert!(
+        rust.contains("titan_divmod(7, 2).0"),
+        "ajuste não indexou a tupla:\n{rust}"
+    );
+
+    // 2. Execução real do mesmo programa.
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de retornos múltiplos: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("retornos_multiplos");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./retornos_multiplos");
+    let esperado = concat!(
+        "divmod-7-2=3,1\n",
+        "q-3\n",
+        // `-7 // 2` é -4 (piso, via `idiv` — o `/` do Rust daria -3),
+        // enquanto `%` sai como o resto do Rust, -1. Os dois valores
+        // atravessam a tupla sem serem tocados por ela.
+        "divmod--7-2=-4,-1\n",
+        "qn--4\n",
+        "v-2-10\n",
     );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));

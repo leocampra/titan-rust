@@ -16,6 +16,7 @@
 //! | `boolean` | `bool` |
 //! | `string` (qualquer posição) | `String` |
 //! | `nil` (retorno) | `()` |
+//! | N>1 retornos (T66) | `(T1, T2, ...)` ([`rust_rettype_name`]) |
 //! | `{T}` | `Vec<T>` (`&mut Vec<T>` em posição de parâmetro) |
 //! | `{K: V}` | `HashMap<K, V>` (`&mut HashMap<K, V>` em posição de parâmetro) |
 //! | `record Nome` | `struct Nome` (`&mut Nome` em posição de parâmetro) |
@@ -181,10 +182,9 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel) {
     out.push_str(&param_list.join(", "));
     out.push(')');
 
-    let ret = rettypes.first().unwrap_or(&Type::Nil);
-    if !matches!(ret, Type::Nil) {
+    if let Some(ret) = rust_rettype_name(rettypes) {
         out.push_str(" -> ");
-        out.push_str(&rust_type_name(ret));
+        out.push_str(&ret);
     }
 
     // Parâmetros compostos já chegam como `&mut T` (`rust_param_type_name`)
@@ -402,9 +402,29 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
         TypedStat::Return { exps, .. } => {
             indent(out, depth);
             out.push_str("return");
-            if let Some(value) = exps.first() {
-                out.push(' ');
-                out.push_str(&emit_slot_value(&value.ty, value, ctx));
+            // Retorno múltiplo (T66): N>1 valores viram **uma** tupla Rust,
+            // o par da tupla que `rust_rettype_name` pôs na assinatura. Cada
+            // componente passa por `emit_slot_value` com o **seu** tipo, do
+            // mesmo jeito que o retorno único sempre passou — é o que faz
+            // `string` sair dona e composto ganhar `.clone()` quando a fonte
+            // é um lugar que sobrevive à chamada (ADR 0006/0007). Nenhum
+            // valor e um valor só continuam exatamente como antes da T66:
+            // `return;` e `return x;`, nunca `(x,)`.
+            match exps.as_slice() {
+                [] => {}
+                [value] => {
+                    out.push(' ');
+                    out.push_str(&emit_slot_value(&value.ty, value, ctx));
+                }
+                vários => {
+                    let componentes: Vec<String> = vários
+                        .iter()
+                        .map(|value| emit_slot_value(&value.ty, value, ctx))
+                        .collect();
+                    out.push_str(" (");
+                    out.push_str(&componentes.join(", "));
+                    out.push(')');
+                }
             }
             out.push_str(";\n");
         }
@@ -689,10 +709,10 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::RecordLit { type_name, fields } => emit_record_lit(type_name, fields, ctx),
         TypedExpKind::MapLit(entries) => emit_map_lit(entries, ctx),
         // Retorno múltiplo (T65): a chamada devolve uma tupla Rust e o
-        // ajuste é um acesso posicional. A **assinatura** e o `return` que
-        // produzem essa tupla são trabalho da T66 — até lá, um programa que
-        // use retorno múltiplo passa pelo checker e sai em `--emit-rust`,
-        // mas o Rust emitido só compila quando a T66 fechar o par.
+        // ajuste é um acesso posicional. A T66 fechou o par — a tupla que
+        // esse `.0`/`.n` indexa é a que `rust_rettype_name` declara na
+        // assinatura e o braço `Return` monta —, então o Rust emitido aqui
+        // compila.
         TypedExpKind::Adjust(inner) => format!("{}.0", emit_exp(inner, ctx)),
         TypedExpKind::Extra { exp: inner, index } => {
             format!("{}.{index}", emit_exp(inner, ctx))
@@ -1343,6 +1363,39 @@ fn rust_type_name(ty: &Type) -> String {
         other => unreachable!(
             "tipo '{other:?}' fora do subconjunto de codegen suportado — checker deveria ter rejeitado antes"
         ),
+    }
+}
+
+/// Tipo Rust da **lista de retornos** de uma função (T66). `None` quer dizer
+/// "sem `->` na assinatura": ou a lista é vazia, ou é o único retorno `nil`
+/// — os dois são `()` em Rust, e escrever `-> ()` seria ruído que o lint
+/// `unused_unit` do rustc ainda por cima reclamaria.
+///
+/// Com N>1 retornos a assinatura vira uma **tupla** — `-> (i64, i64)` — e
+/// esse é o único ponto do backend que monta a tupla: [`rust_type_name`] não
+/// muda, cada componente passa por ela sozinho. Um retorno só continua
+/// exatamente como antes da T66, sem tupla de um elemento: `-> i64`, e não
+/// `-> (i64,)`.
+///
+/// Composto dentro da tupla segue por **valor** (`Vec<i64>`, não
+/// `&mut Vec<i64>`): o `&mut` do ADR 0007 é regra de **parâmetro**, e
+/// devolver uma referência daria um valor emprestado de algo que morre com a
+/// função. Quem recebe fica dono, como no retorno composto único que já
+/// existia — por isso aqui é [`rust_type_name`] e nunca
+/// [`rust_param_type_name`].
+fn rust_rettype_name(rettypes: &[Type]) -> Option<String> {
+    match rettypes {
+        [] => None,
+        [Type::Nil] => None,
+        [único] => Some(rust_type_name(único)),
+        vários => Some(format!(
+            "({})",
+            vários
+                .iter()
+                .map(rust_type_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -2474,5 +2527,191 @@ end"#;
         let rust = generate_source(source);
         assert!(rust.contains("continue;"), "{rust}");
         assert!(!rust.contains("'titan"), "sem label:\n{rust}");
+    }
+
+    /// Critério de aceite da T66 no nível do texto emitido: a assinatura com
+    /// dois retornos vira `-> (i64, i64)` e o `return a, b` vira uma tupla
+    /// só. Os dois lados têm que casar — é justamente o par que a T65 deixou
+    /// aberto, com o `.0` do ajuste apontando para uma tupla que ninguém
+    /// produzia.
+    #[test]
+    fn dois_retornos_viram_tupla_na_assinatura_e_no_return() {
+        let source = r#"function divmod(a: integer, b: integer): integer, integer
+    return a // b, a % b
+end
+function main(args: {string}): integer
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("pub fn titan_divmod(a: i64, b: i64) -> (i64, i64) {"),
+            "assinatura sem tupla:\n{rust}"
+        );
+        assert!(
+            rust.contains("return (titan_runtime::idiv(a, b), a % b);"),
+            "return sem tupla:\n{rust}"
+        );
+    }
+
+    /// O outro lado da regra: **um** retorno continua exatamente como antes
+    /// da T66. Rust tem tupla de um elemento (`(i64,)`), e emiti-la aqui
+    /// seria uma mudança silenciosa em todo programa já existente — todo o
+    /// resto da suíte de codegen depende de `-> i64` e `return 0;` crus.
+    #[test]
+    fn um_retorno_so_nao_vira_tupla_de_um() {
+        let source = r#"function dobro(a: integer): integer
+    return a * 2
+end
+function main(args: {string}): integer
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("pub fn titan_dobro(a: i64) -> i64 {"),
+            "{rust}"
+        );
+        assert!(rust.contains("return a * 2;"), "{rust}");
+        assert!(!rust.contains("(i64,)"), "tupla de um elemento:\n{rust}");
+    }
+
+    /// `nil` continua `()`: sem `->` na assinatura (escrevê-lo faria o lint
+    /// `unused_unit` do rustc reclamar) e `return ();` no corpo, o mesmo de
+    /// antes da T66.
+    #[test]
+    fn retorno_nil_continua_sem_seta_na_assinatura() {
+        let source = r#"function nada(a: integer): nil
+    print("x" .. a)
+    return nil
+end
+function main(args: {string}): integer
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("pub fn titan_nada(a: i64) {"), "{rust}");
+        assert!(!rust.contains("-> ()"), "seta para unit:\n{rust}");
+        assert!(rust.contains("return ();"), "{rust}");
+    }
+
+    /// Composto dentro da tupla segue as regras do ADR 0006/0007: por
+    /// **valor** na assinatura (`Vec<i64>`, nunca `&mut Vec<i64>` — o `&mut`
+    /// é regra de parâmetro, e devolver referência a um local não
+    /// compilaria) e com `.clone()` no componente cuja fonte é um lugar que
+    /// sobrevive ao `return`. `string` na tupla sai dona, pela mesma regra
+    /// de slot do retorno único (T24).
+    #[test]
+    fn composto_e_string_na_tupla_seguem_as_regras_de_slot() {
+        let source = r#"function par(): {integer}, string
+    local v: {integer} = {1, 2}
+    local s: string = "a"
+    return v, s
+end
+function main(args: {string}): integer
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("pub fn titan_par() -> (Vec<i64>, String) {"),
+            "composto na tupla deveria sair por valor:\n{rust}"
+        );
+        assert!(
+            !rust.contains("&mut Vec<i64>)"),
+            "`&mut` é regra de parâmetro, não de retorno:\n{rust}"
+        );
+        assert!(
+            rust.contains("return (v.clone(), s.clone());"),
+            "componentes sem a regra de clone:\n{rust}"
+        );
+    }
+
+    /// O canto do ADR 0007 dentro da tupla: devolver um **parâmetro**
+    /// composto. No corpo, `xs` é `&mut Vec<i64>`; como componente de um
+    /// retorno por valor ele precisa virar dono, e é `precisa_clone` (ADR
+    /// 0006) que já cuida disso — sem o `.clone()`, o rustc recusaria
+    /// devolver um `&mut` emprestado como `Vec<i64>`.
+    #[test]
+    fn parametro_composto_devolvido_na_tupla_vira_dono() {
+        let source = r#"function eco(xs: {integer}): {integer}, integer
+    return xs, #xs
+end
+function main(args: {string}): integer
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("pub fn titan_eco(xs: &mut Vec<i64>) -> (Vec<i64>, i64) {"),
+            "parâmetro por `&mut`, retorno por valor:\n{rust}"
+        );
+        assert!(
+            rust.contains("return (xs.clone(), titan_runtime::array_len(xs));"),
+            "parâmetro composto na tupla sem `.clone()`:\n{rust}"
+        );
+    }
+
+    /// `nil` **dentro** da tupla é o único ponto onde os dois braços de
+    /// `rust_rettype_name` se encostam: `: nil` sozinho apaga a seta da
+    /// assinatura, mas `: integer, nil` é uma lista de dois, e o `nil` vira
+    /// um componente `()` como qualquer outro tipo. O rustc aceita `(i64,
+    /// ())` sem reclamar — é `-> ()` sozinho que dispararia `unused_unit`.
+    #[test]
+    fn nil_dentro_da_tupla_vira_componente_unit() {
+        let source = r#"function f(): integer, nil
+    return 1, nil
+end
+function main(args: {string}): integer
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("pub fn titan_f() -> (i64, ()) {"), "{rust}");
+        assert!(rust.contains("return (1, ());"), "{rust}");
+    }
+
+    /// O ajuste da T65 (`Adjust`) e o enésimo valor (`Extra`) indexam a
+    /// tupla que a T66 passou a produzir. `Extra` ainda não tem sintaxe de
+    /// fonte — só a multi-atribuição da T67 o produzirá —, então o nó é
+    /// trocado à mão sobre a árvore já tipada, o mesmo recurso que o teste
+    /// de `ExpExtra` no checker (T65) usa.
+    #[test]
+    fn ajuste_e_extra_indexam_a_tupla_do_retorno() {
+        let source = r#"function divmod(a: integer, b: integer): integer, integer
+    return a // b, a % b
+end
+function main(args: {string}): integer
+    local q: integer = divmod(7, 2)
+    return q
+end"#;
+        let tokens = lex(source).expect("erro léxico inesperado");
+        let program = parse(&tokens).expect("erro sintático inesperado");
+        let mut typed = check(&program).expect("erro de tipo inesperado");
+
+        let rust = generate(&typed.program).expect("erro de geração inesperado");
+        assert!(
+            rust.contains("let q: i64 = titan_divmod(7, 2).0;"),
+            "ajuste não indexou a tupla:\n{rust}"
+        );
+
+        // Troca o `Adjust` do inicializador de `q` por um `Extra` de índice
+        // 1: o segundo valor de retorno, o que a T67 vai desestruturar.
+        let TypedTopLevel::Func { body, .. } = &mut typed.program[1] else {
+            panic!("esperava `main` como segunda declaração");
+        };
+        let TypedStat::Block { stats, .. } = body.as_mut() else {
+            panic!("esperava bloco no corpo de `main`");
+        };
+        let TypedStat::Decl { value, .. } = &mut stats[0] else {
+            panic!("esperava a declaração de `q` como primeiro comando");
+        };
+        let TypedExpKind::Adjust(chamada) = &value.kind else {
+            panic!("esperava `Adjust`, obteve {:?}", value.kind);
+        };
+        value.kind = TypedExpKind::Extra {
+            exp: chamada.clone(),
+            index: 1,
+        };
+
+        let rust = generate(&typed.program).expect("erro de geração inesperado");
+        assert!(
+            rust.contains("let q: i64 = titan_divmod(7, 2).1;"),
+            "`Extra` não indexou o segundo valor da tupla:\n{rust}"
+        );
     }
 }
