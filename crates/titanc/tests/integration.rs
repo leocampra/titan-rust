@@ -19,13 +19,14 @@
 //!   'main' panicked");
 //! - suíte consolidada da Fase 2 (PRD.md, T31): tudo que **segue** fora de
 //!   escopo após arrays/records/maps serem aceitos — métodos, `import`,
-//!   `break`, bitwise, `//`, `Option`, `as`, multi-assign e as regras de
-//!   tipos de record/map — continua rejeitado com erro claro. `v[i]`,
+//!   `break`, bitwise, `//`, `Option`, `as` e as regras de tipos de
+//!   record/map — continua rejeitado com erro claro. `v[i]`,
 //!   `{...}` e `#` saíram desta lista: têm suporte real no codegen desde a
-//!   T30; bitwise e `//` saíram na T61, `repeat`/`until` na T64 e os
-//!   retornos múltiplos na T65 (tipagem) e T66 (a tupla emitida), e o que
-//!   resta deles é o negativo de tipo (`1.5 & 2`, condição do `until`
-//!   não-boolean, aridade de `return`);
+//!   T30; bitwise e `//` saíram na T61, `repeat`/`until` na T64, os
+//!   retornos múltiplos na T65 (tipagem) e T66 (a tupla emitida) e o
+//!   multi-assign na T67, e o que resta deles é o negativo de tipo
+//!   (`1.5 & 2`, condição do `until` não-boolean, aridade de `return` e de
+//!   multi-assign);
 //! - arquivos `.titan` reais do Titan original nunca panicam ao serem
 //!   processados (compilam ou falham com erro claro), e os que usam somente
 //!   o idioma de arrays já suportado (`sieve.titan`, `selection_sort.titan`)
@@ -859,10 +860,14 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    args:foo()\n    return 0\nend",
         trecho_esperado: "Esperava um comando",
     },
+    // `multi_assign` saiu desta tabela na T67: `a, b = b, a` é caminho
+    // feliz, provado por execução real em
+    // `compila_e_executa_multi_assign_e_declaracao_multipla`. O que resta
+    // do assunto é a aridade — abaixo.
     CasoNegativo {
-        nome: "multi_assign",
-        fonte: "function main(args: {string}): integer\n    local a: integer = 1\n    local b: integer = 2\n    a, b = b, a\n    return 0\nend",
-        trecho_esperado: "Esperava um comando",
+        nome: "multi_assign_aridade",
+        fonte: "function main(args: {string}): integer\n    local a: integer = 1\n    local b: integer = 2\n    a, b = 1\n    return 0\nend",
+        trecho_esperado: "atribuição múltipla com 2 alvo(s), mas 1 valor(es)",
     },
     CasoNegativo {
         nome: "nome_de_record_reservado",
@@ -1504,6 +1509,166 @@ fn compila_e_executa_retornos_multiplos_como_tupla() {
     );
     assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
     assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T67, pelo pipeline completo e em **execução real**,
+/// nos três pontos que a tarefa pede: o swap `a, b = b, a` troca de verdade,
+/// `local q, r = divmod(7, 2)` dá 3 e 1, e a aridade errada dá erro claro.
+///
+/// O swap é o ponto central. A semântica do Lua — herdada pelo Titan — avalia
+/// **todo** o lado direito antes de escrever em qualquer alvo; emitir as
+/// atribuições em sequência (`a = b; b = a;`) daria `a == b`, um bug
+/// silencioso que nenhum teste de tipo pegaria. Por isso o teste confere o
+/// texto emitido (os temporários aparecem antes das escritas) **e** o valor
+/// impresso pelo binário.
+#[test]
+fn compila_e_executa_multi_assign_e_declaracao_multipla() {
+    let out_dir = temp_dir("multi-assign-execucao-real");
+
+    let source = concat!(
+        "record Ponto\n",
+        "    x: integer\n",
+        "    y: integer\n",
+        "end\n",
+        "function divmod(a: integer, b: integer): integer, integer\n",
+        "    return a // b, a % b\n",
+        "end\n",
+        // Dois retornos de tipos diferentes, com um composto e uma `string`:
+        // a desestruturação segue as mesmas regras de slot do ADR 0006/0007
+        // que o `return` da T66 segue.
+        "function rotula(n: integer): string, {integer}\n",
+        "    return \"rot\", {n, n + 1}\n",
+        "end\n",
+        "function main(args: {string}): integer\n",
+        // 1. O swap de escalares.
+        "    local a: integer = 1\n",
+        "    local b: integer = 2\n",
+        "    a, b = b, a\n",
+        "    print(\"swap-\" .. a .. \"-\" .. b)\n",
+        // 2. A desestruturação da tupla da T66.
+        "    local q, r = divmod(7, 2)\n",
+        "    print(\"divmod-\" .. q .. \"-\" .. r)\n",
+        // 3. Declaração múltipla por lista, com anotação de tipo em cada
+        //    nome.
+        "    local x: integer, y: integer = 10, 20\n",
+        "    print(\"lista-\" .. x .. \"-\" .. y)\n",
+        // 4. O swap alcança lugares compostos, não só nomes: `v[i]` passa
+        //    por `array_set` e `p.campo` por escrita direta, cada um pelo
+        //    mesmo caminho do single-target.
+        "    local v: {integer} = {10, 20}\n",
+        "    v[1], v[2] = v[2], v[1]\n",
+        "    print(\"vetor-\" .. v[1] .. \"-\" .. v[2])\n",
+        "    local p: Ponto = {x = 1, y = 2}\n",
+        "    p.x, p.y = p.y, p.x\n",
+        "    print(\"ponto-\" .. p.x .. \"-\" .. p.y)\n",
+        // 5. `string` e composto desestruturados da mesma chamada.
+        "    local s, w = rotula(5)\n",
+        "    print(\"rot-\" .. s .. \"-\" .. #w .. \"-\" .. w[2])\n",
+        // 6. Um alvo que nunca mais é atribuído sai imutável, e um que é
+        //    sai `mut` — o fix-up marca **todos** os alvos, não só o
+        //    primeiro (armadilha explícita da tarefa).
+        "    local m: integer, n: integer = 1, 2\n",
+        "    m = m + n\n",
+        "    print(\"mut-\" .. m .. \"-\" .. n)\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "multi_assign.titan", source);
+
+    // 1. `--emit-rust`: os temporários vêm **antes** de qualquer escrita, e
+    //    a desestruturação é um `let` de tupla só.
+    let emit_output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&emit_output);
+    assert!(
+        emit_output.status.success(),
+        "titanc --emit-rust falhou para multi-assign: {}",
+        String::from_utf8_lossy(&emit_output.stderr)
+    );
+    let rust = String::from_utf8_lossy(&emit_output.stdout);
+    assert!(
+        rust.contains("let titan_multi_0 = b;\n    let titan_multi_1 = a;\n    a = titan_multi_0;\n    b = titan_multi_1;"),
+        "o swap não passou por temporários — atribuição em sequência daria a == b:\n{rust}"
+    );
+    assert!(
+        rust.contains("let (titan_multi_0, titan_multi_1) = titan_divmod(7, 2);"),
+        "a chamada não foi desestruturada da tupla:\n{rust}"
+    );
+    // O alvo atribuído depois sai `mut`; o que não é, não sai — e um não
+    // contamina o outro.
+    assert!(
+        rust.contains("let mut m: i64 = titan_multi_0;"),
+        "alvo reatribuído devia sair `mut`:\n{rust}"
+    );
+    assert!(
+        rust.contains("let n: i64 = titan_multi_1;"),
+        "alvo nunca reatribuído não devia sair `mut`:\n{rust}"
+    );
+
+    // 2. Execução real: os valores, que é onde a ordem de avaliação aparece.
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de multi-assign: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("multi_assign");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./multi_assign");
+    let esperado = concat!(
+        "swap-2-1\n",
+        "divmod-3-1\n",
+        "lista-10-20\n",
+        "vetor-20-10\n",
+        "ponto-2-1\n",
+        "rot-rot-2-6\n",
+        "mut-3-2\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    // 3. Aridade errada, nas duas formas, com erro claro e sem panic.
+    for (nome, fonte, trecho) in [
+        (
+            "aridade_chamada",
+            "function divmod(a: integer, b: integer): integer, integer\n    return a // b, a % b\nend\nfunction main(args: {string}): integer\n    local a, b, c = divmod(7, 2)\n    return 0\nend",
+            "declaração múltipla com 3 alvo(s), mas a chamada produz 2 valor(es)",
+        ),
+        (
+            "aridade_lista",
+            "function main(args: {string}): integer\n    local a: integer = 1\n    local b: integer = 2\n    a, b = 1\n    return 0\nend",
+            "atribuição múltipla com 2 alvo(s), mas 1 valor(es)",
+        ),
+    ] {
+        let caminho = write_source(&out_dir, &format!("{nome}.titan"), fonte);
+        let saida = Command::new(titanc_bin())
+            .arg("--emit-rust")
+            .arg(&caminho)
+            .output()
+            .expect("invoca titanc --emit-rust");
+        assert_never_panics(&saida);
+        assert!(!saida.status.success(), "{nome} devia falhar");
+        let stderr = String::from_utf8_lossy(&saida.stderr);
+        assert!(
+            stderr.contains(trecho),
+            "{nome}: erro pouco claro:\n{stderr}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }

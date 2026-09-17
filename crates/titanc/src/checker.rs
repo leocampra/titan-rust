@@ -46,7 +46,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, Args, Exp, Loc, Program, Stat, TopLevel, Var};
+use crate::ast::{self, Args, Decl, Exp, Loc, Program, Stat, TopLevel, Var};
 use crate::types::Type;
 
 /// Erro semântico com posição (no espírito de `checker.typeerror`).
@@ -221,6 +221,24 @@ pub enum TypedStat {
         /// codegen (T14) emite `let mut` somente nesse caso.
         mutable: bool,
     },
+    /// `local a, b = ...` (T67) — N>1 declarações de uma vez. Cada alvo é
+    /// uma `Decl` completa (nome, tipo, `decl_id`, mutabilidade), então o
+    /// fix-up de mutabilidade alcança **todos** eles, e `values` já vem no
+    /// formato que o codegen precisa emitir (ver [`TypedMultiValues`]).
+    DeclMulti {
+        loc: Loc,
+        targets: Vec<TypedDeclTarget>,
+        values: TypedMultiValues,
+    },
+    /// `a, b = ...` (T67) — N>1 alvos de uma vez. A semântica do Lua exige
+    /// que **todo** o lado direito seja avaliado antes de qualquer escrita
+    /// (`a, b = b, a` troca de verdade), o que o codegen resolve com `let`
+    /// temporários; ver [`TypedMultiValues`].
+    AssignMulti {
+        loc: Loc,
+        targets: Vec<TypedLValue>,
+        values: TypedMultiValues,
+    },
     Call {
         loc: Loc,
         call: TypedExp,
@@ -295,6 +313,51 @@ pub enum TypedLValue {
         base: Box<TypedExp>,
         name: String,
     },
+}
+
+/// Um alvo de `local a, b = ...` (T67), já verificado. É o mesmo conteúdo
+/// que `TypedStat::Decl` carrega para uma declaração simples — menos o
+/// valor, que na forma múltipla é comum a todos os alvos.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedDeclTarget {
+    pub loc: Loc,
+    pub name: String,
+    pub ty: Type,
+    /// Ver `TypedStat::Decl::decl_id`.
+    pub decl_id: usize,
+    /// Ver `TypedStat::Decl::mutable`; preenchido por `fixup_mutability`.
+    pub mutable: bool,
+}
+
+/// O lado direito de uma declaração/atribuição múltipla (T67), nas duas
+/// formas que a fonte permite — a distinção é do checker, não do codegen,
+/// porque é ela que decide a aridade.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedMultiValues {
+    /// `local a, b = f()` / `a, b = f()`: **uma** chamada cuja assinatura
+    /// declara exatamente tantos retornos quantos são os alvos. O codegen
+    /// desestrutura a tupla da T66 num único `let`.
+    Call(TypedExp),
+    /// `a, b = b, a`: uma expressão por alvo, na ordem. O codegen avalia
+    /// **todas** em `let` temporários antes de escrever em qualquer alvo —
+    /// é o que faz o swap trocar de verdade (armadilha da T67).
+    List(Vec<TypedExp>),
+}
+
+/// Lado esquerdo de uma atribuição já resolvido (T67): o que
+/// `check_assign_target` apurou sobre um alvo antes de o valor ser tipado.
+/// Existe para a atribuição múltipla poder validar **todos** os alvos com a
+/// mesma máquina que a single-target sempre usou.
+struct AssignTarget {
+    lvalue: TypedLValue,
+    /// Tipo que o alvo aceita — também o contexto passado a `check_exp`.
+    ty: Type,
+    /// `Some` quando o alvo (ou a raiz da cadeia) é uma local; é este id
+    /// que `fixup_mutability` procura para emitir `let mut`.
+    decl_id: Option<DeclId>,
+    /// `Some` só para o alvo que é um nome simples — a mensagem de tipo
+    /// incompatível o cita, e a de `v[i]`/`p.campo` não.
+    name: Option<String>,
 }
 
 /// Ramo `then` já verificado de um `TypedStat::If`.
@@ -1226,12 +1289,11 @@ impl Checker {
                 }
             }
             Stat::StatDecl { loc, decls, exps } => {
+                // `local a, b = ...` (T67) tem caminho próprio: a aridade
+                // entre alvos e valores é sua, e a declaração simples —
+                // o caso comum de todo programa — segue exatamente como era.
                 if decls.len() != 1 || exps.len() != 1 {
-                    self.error(
-                        *loc,
-                        "declaração múltipla (`local a, b = ...`) não é suportada nesta fase.",
-                    );
-                    return None;
+                    return self.check_decl_multi(*loc, decls, exps);
                 }
                 let decl = &decls[0];
                 // Resolvido antes de tipar o valor (T29): `{...}` precisa do
@@ -1407,13 +1469,9 @@ impl Checker {
                 block,
             } => self.check_for(*loc, decl, start, finish, inc.as_deref(), block, rettypes),
             Stat::StatAssign { loc, vars, exps } => {
+                // `a, b = ...` (T67), pelo mesmo motivo de `StatDecl`.
                 if vars.len() != 1 || exps.len() != 1 {
-                    // Defensivo: o parser (T11) só produz single-target.
-                    self.error(
-                        *loc,
-                        "atribuição múltipla (`a, b = ...`) não é suportada nesta fase.",
-                    );
-                    return None;
+                    return self.check_assign_multi(*loc, vars, exps);
                 }
                 self.check_assign(*loc, &vars[0], &exps[0])
             }
@@ -1615,7 +1673,27 @@ impl Checker {
 
     /// Atribuição single-target `nome = exp` | `v[i] = exp` | `p.campo = exp`
     /// (`checker.lua:378-410`, estendido na T29 para `Index`/`Field`).
+    ///
+    /// A resolução do **alvo** — quem pode receber e com que tipo — mora em
+    /// [`Self::check_assign_target`] desde a T67, porque a atribuição
+    /// múltipla precisa exatamente dela, alvo por alvo.
     fn check_assign(&mut self, loc: Loc, var: &Var, exp: &Exp) -> Option<TypedStat> {
+        let alvo = self.check_assign_target(loc, var)?;
+        let value = self.check_exp(exp, Some(&alvo.ty))?;
+        let value = self.coerce_assign_value(&alvo, value)?;
+        self.mark_assigned(&alvo);
+        Some(TypedStat::Assign {
+            loc,
+            target: alvo.lvalue,
+            value,
+        })
+    }
+
+    /// Resolve o lado esquerdo de uma atribuição: valida que o alvo pode
+    /// receber (função/módulo/parâmetro são rejeitados, cada um com sua
+    /// mensagem), devolve o `TypedLValue`, o tipo esperado do valor e o
+    /// `DeclId` da local a marcar como mutável.
+    fn check_assign_target(&mut self, loc: Loc, var: &Var) -> Option<AssignTarget> {
         match var {
             Var::VarName {
                 loc: var_loc, name, ..
@@ -1669,27 +1747,15 @@ impl Checker {
                     SymbolKind::ForVar | SymbolKind::Local { .. } => {}
                 }
 
-                let value = self.check_exp(exp, Some(&symbol.ty))?;
-                if !symbol.ty.compatible(&value.ty) {
-                    self.error(
-                        value.loc,
-                        format!(
-                            "atribuição incompatível para '{name}': esperado {}, encontrado {}.",
-                            type_name(&symbol.ty),
-                            type_name(&value.ty)
-                        ),
-                    );
-                    return None;
-                }
-
-                if let SymbolKind::Local { decl_id } = symbol.kind {
-                    self.assigned.insert(decl_id);
-                }
-
-                Some(TypedStat::Assign {
-                    loc,
-                    target: TypedLValue::Name(name.clone()),
-                    value,
+                let decl_id = match symbol.kind {
+                    SymbolKind::Local { decl_id } => Some(decl_id),
+                    _ => None,
+                };
+                Some(AssignTarget {
+                    lvalue: TypedLValue::Name(name.clone()),
+                    ty: symbol.ty,
+                    decl_id,
+                    name: Some(name.clone()),
                 })
             }
             Var::VarBracket { .. } | Var::VarDot { .. } => {
@@ -1733,38 +1799,252 @@ impl Checker {
 
                 let target = self.check_var(&loc, var)?;
                 let target_ty = target.ty.clone();
-                let value = self.check_exp(exp, Some(&target_ty))?;
-                if !target_ty.compatible(&value.ty) {
-                    self.error(
-                        value.loc,
-                        format!(
-                            "atribuição incompatível: esperado {}, encontrado {}.",
-                            type_name(&target_ty),
-                            type_name(&value.ty)
-                        ),
-                    );
-                    return None;
-                }
-
-                if let SymbolKind::Local { decl_id } = root_symbol.kind {
-                    self.assigned.insert(decl_id);
-                }
-
-                let target_lvalue = match target.kind {
+                let lvalue = match target.kind {
                     TypedExpKind::Index { base, index } => TypedLValue::Index { base, index },
                     TypedExpKind::Field { base, name } => TypedLValue::Field { base, name },
                     // Inatingível: `check_var` só produz `Index`/`Field` para
                     // `VarBracket`/`VarDot`, os únicos braços deste `match`.
                     _ => unreachable!("check_var produziu um TypedExpKind inesperado"),
                 };
-
-                Some(TypedStat::Assign {
-                    loc,
-                    target: target_lvalue,
-                    value,
+                let decl_id = match root_symbol.kind {
+                    SymbolKind::Local { decl_id } => Some(decl_id),
+                    _ => None,
+                };
+                Some(AssignTarget {
+                    lvalue,
+                    ty: target_ty,
+                    decl_id,
+                    name: None,
                 })
             }
         }
+    }
+
+    /// Confere a compatibilidade do valor com o alvo já resolvido. A
+    /// mensagem nomeia a variável quando o alvo é um nome — as duas grafias
+    /// que existiam antes da T67, preservadas palavra por palavra.
+    fn coerce_assign_value(&mut self, alvo: &AssignTarget, value: TypedExp) -> Option<TypedExp> {
+        if alvo.ty.compatible(&value.ty) {
+            return Some(value);
+        }
+        let mensagem = match &alvo.name {
+            Some(name) => format!(
+                "atribuição incompatível para '{name}': esperado {}, encontrado {}.",
+                type_name(&alvo.ty),
+                type_name(&value.ty)
+            ),
+            None => format!(
+                "atribuição incompatível: esperado {}, encontrado {}.",
+                type_name(&alvo.ty),
+                type_name(&value.ty)
+            ),
+        };
+        self.error(value.loc, mensagem);
+        None
+    }
+
+    /// Registra o `DeclId` do alvo em `self.assigned` — é o que faz
+    /// `fixup_mutability` emitir `let mut` na declaração correspondente.
+    fn mark_assigned(&mut self, alvo: &AssignTarget) {
+        if let Some(decl_id) = alvo.decl_id {
+            self.assigned.insert(decl_id);
+        }
+    }
+
+    /// `local a, b = ...` (T67). Duas formas, e só duas: **uma** chamada que
+    /// devolve tantos valores quantos são os alvos (`local q, r =
+    /// divmod(7, 2)` — a desestruturação da tupla da T66), ou **uma
+    /// expressão por alvo** (`local a, b = 1, 2`). Qualquer outra combinação
+    /// de aridade é erro claro — Titan não tem o preenchimento silencioso
+    /// com `nil` do Lua.
+    fn check_decl_multi(&mut self, loc: Loc, decls: &[Decl], exps: &[Exp]) -> Option<TypedStat> {
+        // Os tipos anotados valem de contexto para os valores (mesma razão
+        // da T29 na declaração simples), então são resolvidos antes.
+        let mut anotados = Vec::with_capacity(decls.len());
+        for decl in decls {
+            let anotado = match &decl.r#type {
+                Some(annotated) => Some(self.resolve_type(annotated)?),
+                None => None,
+            };
+            anotados.push(anotado);
+        }
+
+        let (values, tipos): (TypedMultiValues, Vec<Type>) =
+            self.check_multi_values(loc, &anotados, exps, "declaração")?;
+
+        // Só depois de tudo tipado os nomes entram no escopo: em Titan,
+        // como em Lua, o lado direito de um `local` enxerga o escopo de
+        // **fora** da declaração (`local x = x` lê o `x` externo).
+        let mut targets = Vec::with_capacity(decls.len());
+        for (i, decl) in decls.iter().enumerate() {
+            let ty = tipos[i].clone();
+            let decl_id = self.next_decl_id;
+            self.next_decl_id += 1;
+            self.st.add_symbol(
+                &decl.name,
+                ty.clone(),
+                SymbolKind::Local { decl_id },
+                decl.loc,
+            );
+            // Hover sobre o próprio nome declarado (T49), como na simples.
+            self.record_use(decl.loc, decl.loc, &decl.name, &ty);
+            targets.push(TypedDeclTarget {
+                loc: decl.loc,
+                name: decl.name.clone(),
+                ty,
+                decl_id,
+                mutable: false,
+            });
+        }
+
+        Some(TypedStat::DeclMulti {
+            loc,
+            targets,
+            values,
+        })
+    }
+
+    /// `a, b = ...` (T67). Mesmas duas formas de aridade da declaração
+    /// múltipla; a diferença é que os alvos já existem, então cada um passa
+    /// por [`Self::check_assign_target`] — o que mantém intactas as
+    /// rejeições de atribuir a função, módulo ou parâmetro — e **todos**
+    /// entram em `self.assigned`, para o fix-up marcar cada declaração
+    /// correspondente como `mut` (exigência explícita da tarefa).
+    fn check_assign_multi(&mut self, loc: Loc, vars: &[Var], exps: &[Exp]) -> Option<TypedStat> {
+        let mut alvos = Vec::with_capacity(vars.len());
+        let mut ok = true;
+        for var in vars {
+            match self.check_assign_target(loc, var) {
+                Some(alvo) => alvos.push(alvo),
+                None => ok = false,
+            }
+        }
+        if !ok {
+            return None;
+        }
+
+        let esperados: Vec<Option<Type>> = alvos.iter().map(|a| Some(a.ty.clone())).collect();
+        let (values, _) = self.check_multi_values(loc, &esperados, exps, "atribuição")?;
+
+        // A compatibilidade de cada valor com o seu alvo já foi conferida
+        // dentro de `check_multi_values` (que recebeu os tipos esperados);
+        // aqui só resta registrar a mutabilidade — de todos.
+        for alvo in &alvos {
+            self.mark_assigned(alvo);
+        }
+
+        Some(TypedStat::AssignMulti {
+            loc,
+            targets: alvos.into_iter().map(|a| a.lvalue).collect(),
+            values,
+        })
+    }
+
+    /// O lado direito comum a `local a, b = ...` e a `a, b = ...` (T67).
+    ///
+    /// `esperados` traz, por posição, o tipo que aquele alvo exige (o
+    /// anotado da declaração ou o da variável já existente) ou `None`
+    /// quando o tipo vem do próprio valor. Devolve os valores tipados e o
+    /// tipo final de cada posição.
+    ///
+    /// `contexto` só nomeia a construção nas mensagens de erro
+    /// ("declaração"/"atribuição").
+    fn check_multi_values(
+        &mut self,
+        loc: Loc,
+        esperados: &[Option<Type>],
+        exps: &[Exp],
+        contexto: &str,
+    ) -> Option<(TypedMultiValues, Vec<Type>)> {
+        let alvos = esperados.len();
+
+        // Forma 1: uma chamada só, desestruturada. Reconhecida pela forma
+        // do fonte (`ExpCall` sozinho), e é a aridade **declarada** da
+        // função que precisa bater com a dos alvos.
+        if exps.len() == 1
+            && alvos > 1
+            && let Exp::ExpCall {
+                loc: call_loc,
+                exp,
+                args,
+            } = &exps[0]
+        {
+            // Chamada crua, sem `adjust_to_one`: é a aridade completa
+            // que interessa, como em `check_extra` (T65).
+            let (call, rettypes) = self.check_call(call_loc, exp, args)?;
+            if rettypes.len() != alvos {
+                self.error(
+                    loc,
+                    format!(
+                        "{contexto} múltipla com {alvos} alvo(s), mas a chamada produz {} valor(es) de retorno.",
+                        rettypes.len()
+                    ),
+                );
+                return None;
+            }
+            // Cada componente da tupla precisa caber no seu alvo.
+            let mut tipos = Vec::with_capacity(alvos);
+            for (i, rettype) in rettypes.iter().enumerate() {
+                match &esperados[i] {
+                    Some(esperado) => {
+                        if !esperado.compatible(rettype) {
+                            self.error(
+                                loc,
+                                format!(
+                                    "tipos incompatíveis no {}º alvo da {contexto} múltipla: esperado {}, encontrado {}.",
+                                    i + 1,
+                                    type_name(esperado),
+                                    type_name(rettype)
+                                ),
+                            );
+                            return None;
+                        }
+                        tipos.push(esperado.clone());
+                    }
+                    None => tipos.push(rettype.clone()),
+                }
+            }
+            return Some((TypedMultiValues::Call(call), tipos));
+        }
+
+        // Forma 2: uma expressão por alvo.
+        if exps.len() != alvos {
+            self.error(
+                loc,
+                format!(
+                    "{contexto} múltipla com {alvos} alvo(s), mas {} valor(es) à direita.",
+                    exps.len()
+                ),
+            );
+            return None;
+        }
+
+        let mut typed = Vec::with_capacity(alvos);
+        let mut tipos = Vec::with_capacity(alvos);
+        for (i, exp) in exps.iter().enumerate() {
+            let esperado = esperados[i].as_ref();
+            let value = self.check_exp(exp, esperado)?;
+            match esperado {
+                Some(esperado) => {
+                    if !esperado.compatible(&value.ty) {
+                        self.error(
+                            value.loc,
+                            format!(
+                                "tipos incompatíveis no {}º alvo da {contexto} múltipla: esperado {}, encontrado {}.",
+                                i + 1,
+                                type_name(esperado),
+                                type_name(&value.ty)
+                            ),
+                        );
+                        return None;
+                    }
+                    tipos.push(esperado.clone());
+                }
+                None => tipos.push(value.ty.clone()),
+            }
+            typed.push(value);
+        }
+        Some((TypedMultiValues::List(typed), tipos))
     }
 
     /// Tipa uma expressão. `context`, acrescentado na T29 (PRD.md), é o tipo
@@ -2905,6 +3185,14 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
         } => {
             *mutable = assigned.contains(decl_id);
         }
+        // T67: **todos** os alvos da declaração múltipla são marcados, não
+        // só o primeiro — `local a, b = f()` seguido de `a = 1` precisa
+        // sair com `a` mutável e `b` não.
+        TypedStat::DeclMulti { targets, .. } => {
+            for target in targets {
+                target.mutable = assigned.contains(&target.decl_id);
+            }
+        }
         TypedStat::If {
             thens, elsestat, ..
         } => {
@@ -2923,6 +3211,7 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
         TypedStat::Call { .. }
         | TypedStat::Return { .. }
         | TypedStat::Assign { .. }
+        | TypedStat::AssignMulti { .. }
         | TypedStat::Break { .. }
         | TypedStat::Continue { .. } => {}
     }
@@ -3256,10 +3545,24 @@ mod tests {
     }
 
     #[test]
-    fn atribuicao_multipla_montada_a_mao_produz_erro_defensivo() {
-        // O parser (T11) nunca produz multi-assign — AST montada à mão para
-        // exercitar a rejeição defensiva do checker (PRD.md, T12).
+    fn atribuicao_multipla_montada_a_mao_tipa_desde_a_t67() {
+        // Este teste nasceu (T12) como prova da rejeição defensiva de
+        // multi-assign, montando a AST à mão porque o parser de então nunca
+        // a produzia. Na T67 o parser passou a produzi-la e o checker a
+        // aceitá-la — a AST montada à mão continua útil como prova de que a
+        // aceitação vale para o **nó**, não só para a grafia que o parser
+        // gera. `a` e `b` são declarados antes, como o fonte exigiria.
         let loc = Loc { line: 1, col: 1 };
+        let decl = |nome: &str, valor: i64| Stat::StatDecl {
+            loc,
+            decls: vec![Decl {
+                loc,
+                name: nome.to_string(),
+                r#type: Some(ast::Type::TypeInteger { loc }),
+                option: false,
+            }],
+            exps: vec![Exp::ExpInteger { loc, value: valor }],
+        };
         let program: Program = vec![TopLevel::TopLevelFunc {
             loc,
             islocal: false,
@@ -3276,31 +3579,49 @@ mod tests {
             rettypes: vec![ast::Type::TypeInteger { loc }],
             block: Stat::StatBlock {
                 loc,
-                stats: vec![Stat::StatAssign {
-                    loc,
-                    vars: vec![
-                        Var::VarName {
-                            loc,
-                            name: "a".to_string(),
-                        },
-                        Var::VarName {
-                            loc,
-                            name: "b".to_string(),
-                        },
-                    ],
-                    exps: vec![
-                        Exp::ExpInteger { loc, value: 1 },
-                        Exp::ExpInteger { loc, value: 2 },
-                    ],
-                }],
+                stats: vec![
+                    decl("a", 0),
+                    decl("b", 0),
+                    Stat::StatAssign {
+                        loc,
+                        vars: vec![
+                            Var::VarName {
+                                loc,
+                                name: "a".to_string(),
+                            },
+                            Var::VarName {
+                                loc,
+                                name: "b".to_string(),
+                            },
+                        ],
+                        exps: vec![
+                            Exp::ExpInteger { loc, value: 1 },
+                            Exp::ExpInteger { loc, value: 2 },
+                        ],
+                    },
+                    Stat::StatReturn {
+                        loc,
+                        exps: vec![Exp::ExpInteger { loc, value: 0 }],
+                    },
+                ],
             },
         }];
 
-        let errs = check(&program).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| e.message.contains("atribuição múltipla"))
-        );
+        let typed = check(&program).expect("multi-assign tipa desde a T67");
+        let TypedTopLevel::Func { body, .. } = &typed.program[0] else {
+            panic!("esperava a função `main`");
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava um bloco");
+        };
+        assert!(matches!(stats[2], TypedStat::AssignMulti { .. }));
+        // As duas declarações atingidas pela atribuição saem mutáveis.
+        for (i, stat) in stats.iter().take(2).enumerate() {
+            let TypedStat::Decl { mutable, .. } = stat else {
+                panic!("esperava uma declaração");
+            };
+            assert!(mutable, "a declaração {i} devia sair mutável");
+        }
     }
 
     #[test]
@@ -5403,6 +5724,275 @@ end"#;
                 .any(|e| e.to_string().contains("valor(es) de retorno")),
             "{:?}",
             checker.errors
+        );
+    }
+    // ---- T67: multi-assign e declaração múltipla -----------------------
+
+    /// O caso central da tarefa: `local q, r = divmod(7, 2)` desestrutura a
+    /// tupla da T66 — dois alvos, tipados pelos dois retornos da assinatura.
+    #[test]
+    fn declaracao_multipla_desestrutura_chamada_de_dois_retornos() {
+        let source = format!(
+            "{DIVMOD}\
+             function main(args: {{string}}): integer\n\
+             \x20   local q, r = divmod(7, 2)\n\
+             \x20   return q + r\n\
+             end"
+        );
+        let stats = typed_stats_da_funcao(&source, "main");
+        let TypedStat::DeclMulti {
+            targets, values, ..
+        } = &stats[0]
+        else {
+            panic!("esperava DeclMulti, obteve {:?}", stats[0]);
+        };
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "q");
+        assert_eq!(targets[0].ty, Type::Integer);
+        assert_eq!(targets[1].name, "r");
+        assert_eq!(targets[1].ty, Type::Integer);
+        // Os dois alvos ganham `decl_id` distintos — é o que permite o
+        // fix-up marcar um como `mut` sem marcar o outro.
+        assert_ne!(targets[0].decl_id, targets[1].decl_id);
+        // A chamada entra crua, sem `Adjust`: é a tupla inteira que é
+        // desestruturada, não o primeiro valor.
+        let TypedMultiValues::Call(call) = values else {
+            panic!("esperava desestruturação de chamada, obteve {values:?}");
+        };
+        assert!(matches!(call.kind, TypedExpKind::Call { .. }));
+    }
+
+    /// A outra forma: uma expressão por alvo.
+    #[test]
+    fn declaracao_multipla_por_lista_de_valores() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer, b: string = 1, \"x\"\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::DeclMulti {
+            targets, values, ..
+        } = &stats[0]
+        else {
+            panic!("esperava DeclMulti, obteve {:?}", stats[0]);
+        };
+        assert_eq!(targets[0].ty, Type::Integer);
+        assert_eq!(targets[1].ty, Type::String);
+        let TypedMultiValues::List(exps) = values else {
+            panic!("esperava lista de valores, obteve {values:?}");
+        };
+        assert_eq!(exps.len(), 2);
+    }
+
+    /// Sem anotação, o tipo de cada alvo vem do valor correspondente — não
+    /// do primeiro nem de uma unificação entre eles.
+    #[test]
+    fn declaracao_multipla_sem_anotacao_infere_cada_alvo_do_seu_valor() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local a, b = 1, \"x\"\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::DeclMulti { targets, .. } = &stats[0] else {
+            panic!("esperava DeclMulti, obteve {:?}", stats[0]);
+        };
+        assert_eq!(targets[0].ty, Type::Integer);
+        assert_eq!(targets[1].ty, Type::String);
+    }
+
+    /// `a, b = b, a` tipa e produz dois alvos. A ordem de avaliação é
+    /// responsabilidade do codegen; aqui o que importa é o nó.
+    #[test]
+    fn atribuicao_multipla_tipa_o_swap() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer = 1\n\
+             \x20   local b: integer = 2\n\
+             \x20   a, b = b, a\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::AssignMulti { targets, .. } = &stats[2] else {
+            panic!("esperava AssignMulti, obteve {:?}", stats[2]);
+        };
+        assert_eq!(
+            targets,
+            &vec![
+                TypedLValue::Name("a".to_string()),
+                TypedLValue::Name("b".to_string())
+            ]
+        );
+    }
+
+    /// A exigência explícita da tarefa: o fix-up marca **todos** os alvos
+    /// da atribuição múltipla, não só o primeiro.
+    #[test]
+    fn atribuicao_multipla_marca_todos_os_alvos_como_mutaveis() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer = 1\n\
+             \x20   local b: integer = 2\n\
+             \x20   local c: integer = 3\n\
+             \x20   a, b = b, a\n\
+             \x20   return 0\n\
+             end",
+        );
+        for (i, esperado) in [true, true, false].iter().enumerate() {
+            let TypedStat::Decl { mutable, name, .. } = &stats[i] else {
+                panic!("esperava Decl, obteve {:?}", stats[i]);
+            };
+            assert_eq!(mutable, esperado, "mutabilidade errada em '{name}'");
+        }
+    }
+
+    /// O mesmo para os alvos de uma **declaração** múltipla: quem é
+    /// reatribuído depois sai mutável, quem não é não sai.
+    #[test]
+    fn declaracao_multipla_marca_so_o_alvo_reatribuido() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer, b: integer = 1, 2\n\
+             \x20   a = 3\n\
+             \x20   return b\n\
+             end",
+        );
+        let TypedStat::DeclMulti { targets, .. } = &stats[0] else {
+            panic!("esperava DeclMulti, obteve {:?}", stats[0]);
+        };
+        assert!(targets[0].mutable, "'a' é reatribuído e devia sair mutável");
+        assert!(!targets[1].mutable, "'b' nunca é reatribuído");
+    }
+
+    /// Aridade incompatível entre alvos e a chamada dá erro claro — Titan
+    /// não preenche o que falta com `nil` como o Lua faz.
+    #[test]
+    fn aridade_incompativel_com_a_chamada_produz_erro_claro() {
+        let source = format!(
+            "{DIVMOD}\
+             function main(args: {{string}}): integer\n\
+             \x20   local a, b, c = divmod(7, 2)\n\
+             \x20   return 0\n\
+             end"
+        );
+        let errs = check_source(&source).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e
+                .message
+                .contains("3 alvo(s), mas a chamada produz 2 valor(es)")),
+            "{errs:?}"
+        );
+    }
+
+    /// Aridade incompatível na forma de lista, nos dois sentidos.
+    #[test]
+    fn aridade_incompativel_na_lista_produz_erro_claro() {
+        for (fonte, trecho) in [
+            (
+                "function main(args: {string}): integer\n\
+                 \x20   local a: integer = 1\n\
+                 \x20   local b: integer = 2\n\
+                 \x20   a, b = 1\n\
+                 \x20   return 0\n\
+                 end",
+                "2 alvo(s), mas 1 valor(es)",
+            ),
+            (
+                "function main(args: {string}): integer\n\
+                 \x20   local a, b = 1, 2, 3\n\
+                 \x20   return 0\n\
+                 end",
+                "2 alvo(s), mas 3 valor(es)",
+            ),
+        ] {
+            let errs = check_source(fonte).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.message.contains(trecho)),
+                "esperava '{trecho}', obteve {errs:?}"
+            );
+        }
+    }
+
+    /// Tipo incompatível num alvo específico nomeia **qual** alvo é.
+    #[test]
+    fn tipo_incompativel_em_alvo_da_declaracao_multipla_nomeia_a_posicao() {
+        let errs = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer, b: string = 1, 2\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("2º alvo") && e.message.contains("esperado string")),
+            "{errs:?}"
+        );
+    }
+
+    /// As rejeições de alvo do single-target continuam valendo para cada
+    /// alvo da lista — atribuir a uma função não passa a ser permitido por
+    /// estar acompanhado.
+    #[test]
+    fn alvo_invalido_na_atribuicao_multipla_continua_rejeitado() {
+        let errs = check_source(
+            "function f(): integer\n\
+             \x20   return 1\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local a: integer = 1\n\
+             \x20   a, f = 1, 2\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("atribuir a uma função")),
+            "{errs:?}"
+        );
+    }
+
+    /// O lado direito de um `local` múltiplo enxerga o escopo de **fora**
+    /// da declaração, como em Lua: `local x, y = y, x` lê os homônimos
+    /// externos, não os que estão sendo declarados.
+    #[test]
+    fn lado_direito_do_local_multiplo_enxerga_o_escopo_externo() {
+        let stats = typed_body_stats(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer = 1\n\
+             \x20   local y: string = \"s\"\n\
+             \x20   local x: string, y: integer = y, x\n\
+             \x20   return 0\n\
+             end",
+        );
+        let TypedStat::DeclMulti { targets, .. } = &stats[2] else {
+            panic!("esperava DeclMulti, obteve {:?}", stats[2]);
+        };
+        assert_eq!(targets[0].ty, Type::String);
+        assert_eq!(targets[1].ty, Type::Integer);
+    }
+
+    /// Uma chamada de retorno **único** não vira desestruturação: com dois
+    /// alvos, a aridade não bate e o erro é claro.
+    #[test]
+    fn chamada_de_retorno_unico_nao_preenche_dois_alvos() {
+        let errs = check_source(
+            "function f(): integer\n\
+             \x20   return 1\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local a, b = f()\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e
+                .message
+                .contains("2 alvo(s), mas a chamada produz 1 valor(es)")),
+            "{errs:?}"
         );
     }
 }

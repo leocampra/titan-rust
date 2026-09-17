@@ -11,7 +11,8 @@
 //!
 //! Statements: `StatCall`, `StatReturn` (lista de valores desde a T65),
 //! `StatDecl`, `StatIf`, `StatWhile`, `StatRepeat` (T64), `StatFor`
-//! (numérico), `StatAssign` (single-target).
+//! (numérico), `StatAssign`. `StatDecl` e `StatAssign` aceitam lista de
+//! alvos desde a T67 (`local a, b = f()`, `a, b = b, a`).
 //! Expressões: literais, `ExpVar`, `ExpCall`, `ExpConcat` (`..`) e
 //! `ExpBinop`/`ExpUnop` numa cascata de precedência que espelha
 //! `parser.lua:369-395` **por completo**, incluindo os níveis bitwise
@@ -445,8 +446,12 @@ impl<'a> Parser<'a> {
         // Chamada ou atribuição — desambiguadas sem backtracking, como no
         // original (`suffixedexp` + checar `ASSIGN`, `parser.lua:354-358`):
         // parseia a expressão sufixada e o token seguinte decide.
+        // A vírgula entra na desambiguação com a T67: `a, b = ...` é a
+        // única forma que continua depois de uma expressão sufixada sem
+        // um `=` logo a seguir, então ela decide tão cedo quanto o `=`
+        // decidia sozinho — e segue sem backtracking.
         let exp = self.parse_suffixed_exp()?;
-        if self.check(&TokenKind::Assign) {
+        if self.check(&TokenKind::Assign) || self.check(&TokenKind::Comma) {
             return self.parse_stat_assign(loc, exp);
         }
         if !matches!(exp, Exp::ExpCall { .. }) {
@@ -561,39 +566,58 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `nome = exp` — atribuição single-target. `target` é a expressão
-    /// sufixada já parseada pelo chamador; o `=` ainda não foi consumido.
+    /// `var {, var} = exp {, exp}` — a atribuição, single-target ou múltipla
+    /// (T67). `target` é a primeira expressão sufixada, já parseada pelo
+    /// chamador; nem a vírgula nem o `=` foram consumidos.
     fn parse_stat_assign(&mut self, loc: Loc, target: Exp) -> Result<Stat, ParseError> {
-        let var = match target {
-            Exp::ExpVar { var, .. } => *var,
-            Exp::ExpCall { .. } => {
-                return Err(self.erro("Não é possível atribuir a uma chamada de função."));
-            }
-            _ => return Err(self.erro("Esperava uma variável do lado esquerdo de '='.")),
-        };
+        let mut vars = vec![self.exp_para_var(target)?];
+        while self.eat(&TokenKind::Comma) {
+            let alvo = self.parse_suffixed_exp()?;
+            vars.push(self.exp_para_var(alvo)?);
+        }
         self.expect(&TokenKind::Assign, "Esperava '=' na atribuição.")?;
-        let value = self.parse_exp()?;
+        let exps = self.parse_exp_list()?;
         self.eat(&TokenKind::Semicolon);
-        Ok(Stat::StatAssign {
-            loc,
-            vars: vec![var],
-            exps: vec![value],
-        })
+        Ok(Stat::StatAssign { loc, vars, exps })
+    }
+
+    /// Converte uma expressão sufixada já parseada em alvo de atribuição.
+    /// Os dois erros são os mesmos de sempre — só passaram a valer para
+    /// cada alvo da lista, não só para o primeiro.
+    fn exp_para_var(&self, exp: Exp) -> Result<Var, ParseError> {
+        match exp {
+            Exp::ExpVar { var, .. } => Ok(*var),
+            Exp::ExpCall { .. } => {
+                Err(self.erro("Não é possível atribuir a uma chamada de função."))
+            }
+            _ => Err(self.erro("Esperava uma variável do lado esquerdo de '='.")),
+        }
     }
 
     fn parse_stat_decl(&mut self, loc: Loc) -> Result<Stat, ParseError> {
-        let decl = self.parse_decl_opt_type("Esperava um nome de variável após 'local'.")?;
+        let mut decls =
+            vec![self.parse_decl_opt_type("Esperava um nome de variável após 'local'.")?];
+        // `local a, b = ...` (T67): cada nome pode trazer sua própria
+        // anotação de tipo (`local q: integer, r: integer = divmod(...)`).
+        while self.eat(&TokenKind::Comma) {
+            decls.push(self.parse_decl_opt_type("Esperava um nome de variável após ','.")?);
+        }
         self.expect(
             &TokenKind::Assign,
             "Esperava '=' após a declaração da variável.",
         )?;
-        let value = self.parse_exp()?;
+        let exps = self.parse_exp_list()?;
         self.eat(&TokenKind::Semicolon);
-        Ok(Stat::StatDecl {
-            loc,
-            decls: vec![decl],
-            exps: vec![value],
-        })
+        Ok(Stat::StatDecl { loc, decls, exps })
+    }
+
+    /// `exp {, exp}` — o lado direito de uma declaração ou atribuição.
+    fn parse_exp_list(&mut self) -> Result<Vec<Exp>, ParseError> {
+        let mut exps = vec![self.parse_exp()?];
+        while self.eat(&TokenKind::Comma) {
+            exps.push(self.parse_exp()?);
+        }
+        Ok(exps)
     }
 
     fn parse_stat_return(&mut self, loc: Loc) -> Result<Stat, ParseError> {
@@ -2406,5 +2430,133 @@ end"#;
         )
         .unwrap_err();
         assert!(err.message.contains("tipo"), "{}", err.message);
+    }
+    // ---- T67: multi-assign e declaração múltipla na sintaxe ------------
+
+    /// `local a, b = f()` produz um `StatDecl` com dois `Decl` e uma
+    /// expressão — a desestruturação é do checker, não do parser.
+    #[test]
+    fn local_aceita_lista_de_nomes() {
+        let program = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   local q, r = divmod(7, 2)\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatDecl { decls, exps, .. } = &stats[0] else {
+            panic!("esperava StatDecl");
+        };
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].name, "q");
+        assert_eq!(decls[1].name, "r");
+        assert_eq!(exps.len(), 1);
+    }
+
+    /// Cada nome da lista pode trazer sua própria anotação de tipo.
+    #[test]
+    fn local_multiplo_aceita_anotacao_em_cada_nome() {
+        let program = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   local a: integer, b: string = 1, \"x\"\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatDecl { decls, exps, .. } = &stats[0] else {
+            panic!("esperava StatDecl");
+        };
+        assert!(matches!(decls[0].r#type, Some(Type::TypeInteger { .. })));
+        assert!(matches!(decls[1].r#type, Some(Type::TypeString { .. })));
+        assert_eq!(exps.len(), 2);
+    }
+
+    /// `a, b = b, a` produz dois alvos e dois valores. A vírgula entra na
+    /// desambiguação com a chamada — sem backtracking, como o `=` sempre
+    /// fez.
+    #[test]
+    fn atribuicao_aceita_lista_de_alvos() {
+        let program = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   a, b = b, a\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatAssign { vars, exps, .. } = &stats[0] else {
+            panic!("esperava StatAssign");
+        };
+        assert_eq!(vars.len(), 2);
+        assert_eq!(exps.len(), 2);
+    }
+
+    /// Alvos compostos (`v[i]`, `p.campo`) entram na lista como qualquer
+    /// outro — cada um passa pela mesma conversão de expressão para `Var`.
+    #[test]
+    fn atribuicao_multipla_aceita_alvos_compostos() {
+        let program = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   v[1], p.x = p.x, v[1]\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatAssign { vars, .. } = &stats[0] else {
+            panic!("esperava StatAssign");
+        };
+        assert!(matches!(vars[0], Var::VarBracket { .. }));
+        assert!(matches!(vars[1], Var::VarDot { .. }));
+    }
+
+    /// Uma chamada no meio da lista de alvos é erro claro — e a mensagem é
+    /// a mesma que o single-target sempre deu.
+    #[test]
+    fn chamada_como_alvo_da_lista_produz_erro() {
+        let err = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   a, f() = 1, 2\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("chamada de função"), "{}", err.message);
+    }
+
+    /// Uma chamada seguida de vírgula, sem `=`, continua sendo erro — a
+    /// vírgula abre a lista de alvos, não uma lista de chamadas.
+    #[test]
+    fn chamadas_separadas_por_virgula_produzem_erro() {
+        let err = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   f(), g()\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("chamada de função"), "{}", err.message);
     }
 }
