@@ -86,6 +86,8 @@ impl std::error::Error for CodegenError {}
 /// antes de todos estarem declarados, mas manter a ordem "tipos antes de
 /// funções" é convenção usual do Rust gerado.
 pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
+    reject_option_ainda_sem_emissao(program)?;
+
     let mut out = String::new();
 
     for top in program {
@@ -104,6 +106,161 @@ pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
 
     out.push_str(ENTRY_SHIM);
     Ok(out)
+}
+
+/// Recusa, com erro claro em português, um programa que o checker aceitou
+/// mas o backend ainda não sabe emitir: os tipos opcionais da T68.
+///
+/// Existe por causa da convenção mais antiga do projeto — **nunca panic**.
+/// A T68 abriu `T?` no checker e a T69 é que abre a emissão
+/// (`Option<T>`/`Some`/`None`/`if let Some(x)`); entre as duas,
+/// [`rust_type_name`] cairia no seu `unreachable!` e o compilador morreria
+/// de panic em vez de dizer o que houve. Uma varredura do programa tipado
+/// antes de qualquer emissão troca esse panic por uma mensagem.
+///
+/// **A T69 apaga esta função inteira**, junto com a chamada em
+/// [`generate`]: quando a emissão existir, não há nada a recusar.
+fn reject_option_ainda_sem_emissao(program: &TypedProgram) -> Result<(), CodegenError> {
+    fn erro(ty: &Type) -> CodegenError {
+        CodegenError(format!(
+            "tipo opcional ({}) ainda não tem emissão de código nesta fase: \
+             o programa tipa, mas o backend só passa a gerar `Option` na T69.",
+            crate::checker::type_name(ty)
+        ))
+    }
+
+    fn ty_ok(ty: &Type) -> Result<(), CodegenError> {
+        match ty {
+            Type::Option { .. } => Err(erro(ty)),
+            Type::Array { elem } => ty_ok(elem),
+            Type::Map { keys, values } => ty_ok(keys).and_then(|()| ty_ok(values)),
+            Type::Record { fields, .. } => fields.iter().try_for_each(|(_, f)| ty_ok(f)),
+            _ => Ok(()),
+        }
+    }
+
+    fn exp_ok(exp: &TypedExp) -> Result<(), CodegenError> {
+        ty_ok(&exp.ty)?;
+        match &exp.kind {
+            TypedExpKind::Nil
+            | TypedExpKind::Bool(_)
+            | TypedExpKind::Integer(_)
+            | TypedExpKind::Float(_)
+            | TypedExpKind::String(_)
+            | TypedExpKind::Var(_) => Ok(()),
+            TypedExpKind::Call { callee, args } => {
+                if let Callee::Method { recv, .. } = callee {
+                    exp_ok(recv)?;
+                }
+                args.iter().try_for_each(exp_ok)
+            }
+            TypedExpKind::Concat(exps) | TypedExpKind::ArrayLit(exps) => {
+                exps.iter().try_for_each(exp_ok)
+            }
+            TypedExpKind::Binop { lhs, rhs, .. } => exp_ok(lhs).and_then(|()| exp_ok(rhs)),
+            TypedExpKind::Unop { exp, .. }
+            | TypedExpKind::Adjust(exp)
+            | TypedExpKind::Extra { exp, .. }
+            | TypedExpKind::SomeOf(exp) => exp_ok(exp),
+            TypedExpKind::Index { base, index } => exp_ok(base).and_then(|()| exp_ok(index)),
+            TypedExpKind::Field { base, .. } => exp_ok(base),
+            TypedExpKind::RecordLit { fields, .. } => {
+                fields.iter().try_for_each(|(_, e)| exp_ok(e))
+            }
+            TypedExpKind::MapLit(entries) => entries
+                .iter()
+                .try_for_each(|(k, v)| exp_ok(k).and_then(|()| exp_ok(v))),
+        }
+    }
+
+    fn multi_ok(values: &TypedMultiValues) -> Result<(), CodegenError> {
+        match values {
+            TypedMultiValues::Call(call) => exp_ok(call),
+            TypedMultiValues::List(exps) => exps.iter().try_for_each(exp_ok),
+        }
+    }
+
+    fn lvalue_ok(lvalue: &TypedLValue) -> Result<(), CodegenError> {
+        match lvalue {
+            TypedLValue::Name(_) => Ok(()),
+            TypedLValue::Index { base, index } => exp_ok(base).and_then(|()| exp_ok(index)),
+            TypedLValue::Field { base, .. } => exp_ok(base),
+        }
+    }
+
+    fn stat_ok(stat: &TypedStat) -> Result<(), CodegenError> {
+        match stat {
+            TypedStat::Block { stats, .. } => stats.iter().try_for_each(stat_ok),
+            TypedStat::Decl { ty, value, .. } => ty_ok(ty).and_then(|()| exp_ok(value)),
+            TypedStat::DeclMulti {
+                targets, values, ..
+            } => targets
+                .iter()
+                .try_for_each(|t| ty_ok(&t.ty))
+                .and_then(|()| multi_ok(values)),
+            TypedStat::AssignMulti {
+                targets, values, ..
+            } => targets
+                .iter()
+                .try_for_each(lvalue_ok)
+                .and_then(|()| multi_ok(values)),
+            TypedStat::Call { call, .. } => exp_ok(call),
+            TypedStat::Return { exps, .. } => exps.iter().try_for_each(exp_ok),
+            TypedStat::If {
+                thens, elsestat, ..
+            } => {
+                for then in thens {
+                    exp_ok(&then.condition)?;
+                    stat_ok(&then.block)?;
+                }
+                match elsestat {
+                    Some(elsestat) => stat_ok(elsestat),
+                    None => Ok(()),
+                }
+            }
+            TypedStat::While {
+                condition, block, ..
+            }
+            | TypedStat::Repeat {
+                condition, block, ..
+            } => exp_ok(condition).and_then(|()| stat_ok(block)),
+            TypedStat::For {
+                ty,
+                start,
+                finish,
+                inc,
+                block,
+                ..
+            } => ty_ok(ty)
+                .and_then(|()| exp_ok(start))
+                .and_then(|()| exp_ok(finish))
+                .and_then(|()| exp_ok(inc))
+                .and_then(|()| stat_ok(block)),
+            TypedStat::Assign { target, value, .. } => {
+                lvalue_ok(target).and_then(|()| exp_ok(value))
+            }
+            TypedStat::Break { .. } | TypedStat::Continue { .. } => Ok(()),
+        }
+    }
+
+    for top in program {
+        match top {
+            TypedTopLevel::Func {
+                params,
+                rettypes,
+                body,
+                ..
+            } => {
+                params.iter().try_for_each(|(_, t)| ty_ok(t))?;
+                rettypes.iter().try_for_each(ty_ok)?;
+                stat_ok(body)?;
+            }
+            TypedTopLevel::Record { fields, .. } => {
+                fields.iter().try_for_each(|(_, t)| ty_ok(t))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `struct Nome { pub campo: Tipo, .. }` — `Clone` é obrigatório (decisão 1
@@ -367,9 +524,10 @@ fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::Ha
         }
         // Ajuste de retorno múltiplo (T65): os nomes lidos são os da
         // chamada envolvida.
-        TypedExpKind::Adjust(inner) | TypedExpKind::Extra { exp: inner, .. } => {
-            collect_referenced_names_exp(inner, names)
-        }
+        TypedExpKind::Adjust(inner)
+        | TypedExpKind::Extra { exp: inner, .. }
+        // `SomeOf` (T68) é um invólucro: quem é lido é o valor dentro dele.
+        | TypedExpKind::SomeOf(inner) => collect_referenced_names_exp(inner, names),
         TypedExpKind::Nil
         | TypedExpKind::Bool(_)
         | TypedExpKind::Integer(_)
@@ -845,6 +1003,14 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::Extra { exp: inner, index } => {
             format!("{}.{index}", emit_exp(inner, ctx))
         }
+        // `Option` (T68/T69): o checker já produz `SomeOf` e tipos
+        // opcionais, mas a emissão (`Option<T>`, `Some(v)`, `None`,
+        // `if let Some(x)`) é a T69. Até lá `generate` recusa o programa
+        // inteiro em `reject_option_ainda_sem_emissao`, antes de qualquer
+        // expressão chegar aqui — este braço existe só para o `match`
+        // continuar exaustivo, e some quando a T69 puser a emissão de
+        // verdade no lugar dele.
+        TypedExpKind::SomeOf(inner) => emit_exp(inner, ctx),
     }
 }
 
@@ -2992,5 +3158,24 @@ end"#;
             "swap-2-1\ndivmod-3-1\nstr-dois-um\nvetor-20-10\n"
         );
         assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// T68/T69: enquanto a emissão de `Option` não existe, um programa que
+    /// **tipa** com `T?` sai daqui com erro claro em português — nunca com
+    /// o panic do `unreachable!` de `rust_type_name`. Este teste some junto
+    /// com a guarda, quando a T69 puser a emissão de verdade.
+    #[test]
+    fn t68_tipo_opcional_e_recusado_com_erro_claro_em_vez_de_panic() {
+        let source = "function main(args: {string}): integer\n\
+             \x20   local x: integer? = nil\n\
+             \x20   return 0\n\
+             end";
+        let tokens = lex(source).expect("fonte válida");
+        let program = parse(&tokens).expect("fonte válida");
+        let typed = check(&program).expect("o checker (T68) aceita `integer?`");
+        let err = generate(&typed.program)
+            .expect_err("a emissão de `Option` só chega na T69");
+        assert!(err.0.contains("tipo opcional"), "{}", err.0);
+        assert!(err.0.contains("T69"), "{}", err.0);
     }
 }

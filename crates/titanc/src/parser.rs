@@ -17,8 +17,10 @@
 //! `ExpBinop`/`ExpUnop` numa cascata de precedência que espelha
 //! `parser.lua:369-395` **por completo**, incluindo os níveis bitwise
 //! (`|`, `~`, `&`, `<<`, `>>`) e a divisão inteira `//` (T60).
-//! Tipos: `integer`, `float`, `boolean`, `string`, `nil`, `{T}`, e a lista
-//! de tipos de retorno da assinatura (`: integer, integer`, T65).
+//! Tipos: `integer`, `float`, `boolean`, `string`, `nil`, `{T}`, a lista
+//! de tipos de retorno da assinatura (`: integer, integer`, T65) e o sufixo
+//! `?` de tipo opcional (`integer?`, T68) — que tem par no `?` depois do
+//! nome numa declaração (`local x? = 10`, `Decl.option`).
 //!
 //! Tudo fora desse subconjunto (records, maps, arrays manipuláveis,
 //! `import`, ...) produz um erro sintático claro — nunca panic.
@@ -282,11 +284,24 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `nome [: Tipo]` — usado em `local` e no `for`, onde a anotação é
+    /// `nome[?] [: Tipo]` — usado em `local` e no `for`, onde a anotação é
     /// opcional. `mensagem_nome` é o erro caso o nome não esteja presente.
+    ///
+    /// O `?` depois do **nome** (T68, `Decl.option`) é a forma inferida do
+    /// tipo opcional: `local x? = 10` declara `x: integer?` sem repetir o
+    /// `integer`. Escrever as duas coisas (`local x?: integer`) seria
+    /// ambíguo — o `?` está do lado do nome, mas o tipo está escrito por
+    /// extenso —, então é erro claro que aponta a grafia canônica.
     fn parse_decl_opt_type(&mut self, mensagem_nome: &str) -> Result<Decl, ParseError> {
         let (name, loc) = self.expect_name(mensagem_nome)?;
+        let option = self.eat(&TokenKind::Question);
         let r#type = if self.eat(&TokenKind::Colon) {
+            if option {
+                return Err(self.erro(
+                    "`?` depois do nome e anotação de tipo na mesma declaração: escreva \
+                     `local nome: T?` (tipo explícito) ou `local nome? = valor` (tipo inferido).",
+                ));
+            }
             Some(self.parse_type()?)
         } else {
             None
@@ -295,7 +310,7 @@ impl<'a> Parser<'a> {
             loc,
             name,
             r#type,
-            option: false,
+            option,
         })
     }
 
@@ -314,7 +329,36 @@ impl<'a> Parser<'a> {
         Ok(types)
     }
 
+    /// Um tipo, com o sufixo `?` opcional (T68): `integer?` é
+    /// `TypeOption { basetype: TypeInteger }`.
+    ///
+    /// O `?` é sufixo de **todo** o tipo à esquerda, então `{integer}?` é um
+    /// array opcional e `{integer?}` é um array de inteiros opcionais — a
+    /// diferença sai de graça, porque quem lê o `{...}` chama este método de
+    /// volta para o elemento.
+    ///
+    /// `T??` é recusado **aqui**, e não no checker: um segundo `?` nunca tem
+    /// leitura útil (`Option<Option<T>>` não acrescenta estado nenhum sobre
+    /// `Option<T>`), e o erro sintático aponta exatamente o `?` sobrando.
     fn parse_type(&mut self) -> Result<Type, ParseError> {
+        let loc = self.loc();
+        let base = self.parse_type_base()?;
+        if !self.eat(&TokenKind::Question) {
+            return Ok(base);
+        }
+        if self.check(&TokenKind::Question) {
+            return Err(self.erro(
+                "`?` duplicado no tipo: `T??` não existe — um tipo opcional já cobre a ausência de valor.",
+            ));
+        }
+        Ok(Type::TypeOption {
+            loc,
+            basetype: Box::new(base),
+        })
+    }
+
+    /// O tipo sem o sufixo `?` — a parte que [`Parser::parse_type`] envolve.
+    fn parse_type_base(&mut self) -> Result<Type, ParseError> {
         let loc = self.loc();
         match &self.peek().kind {
             TokenKind::Nil => {
@@ -375,7 +419,7 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.erro(
                 "Esperava um tipo (`integer`, `float`, `boolean`, `string`, `value`, `nil`, \
-                 um nome de record, `{T}` ou `{K: V}`).",
+                 um nome de record, `{T}`, `{K: V}` ou qualquer um deles seguido de `?`).",
             )),
         }
     }
@@ -2558,5 +2602,103 @@ end"#;
         )
         .unwrap_err();
         assert!(err.message.contains("chamada de função"), "{}", err.message);
+    }
+
+    // ---- T68: o `?` sufixo de tipo e o `?` do nome ----------------------
+
+    #[test]
+    fn parse_type_aceita_sufixo_de_interrogacao() {
+        let ty = parse_type_source("integer?").expect("`integer?` deveria parsear");
+        let Type::TypeOption { basetype, .. } = ty else {
+            panic!("esperava TypeOption, obteve {ty:?}");
+        };
+        assert!(matches!(*basetype, Type::TypeInteger { .. }));
+    }
+
+    /// O `?` é sufixo de **todo** o tipo à esquerda: `{integer}?` é um array
+    /// opcional, e `{integer?}` é um array de inteiros opcionais.
+    #[test]
+    fn parse_type_distingue_array_opcional_de_array_de_opcionais() {
+        let ty = parse_type_source("{integer}?").expect("`{integer}?` deveria parsear");
+        let Type::TypeOption { basetype, .. } = ty else {
+            panic!("esperava TypeOption, obteve {ty:?}");
+        };
+        assert!(matches!(*basetype, Type::TypeArray { .. }));
+
+        let ty = parse_type_source("{integer?}").expect("`{integer?}` deveria parsear");
+        let Type::TypeArray { subtype, .. } = ty else {
+            panic!("esperava TypeArray, obteve {ty:?}");
+        };
+        assert!(matches!(*subtype, Type::TypeOption { .. }));
+    }
+
+    #[test]
+    fn parse_type_aceita_interrogacao_em_nome_de_record() {
+        let ty = parse_type_source("Ponto?").expect("`Ponto?` deveria parsear");
+        let Type::TypeOption { basetype, .. } = ty else {
+            panic!("esperava TypeOption, obteve {ty:?}");
+        };
+        assert!(matches!(*basetype, Type::TypeName { ref name, .. } if name == "Ponto"));
+    }
+
+    #[test]
+    fn parse_type_recusa_interrogacao_dupla() {
+        let err = parse_type_source("integer??").unwrap_err();
+        assert!(err.message.contains("`?` duplicado"), "{}", err.message);
+    }
+
+    #[test]
+    fn parse_aceita_interrogacao_depois_do_nome_no_local() {
+        let program = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x? = 10\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("`local x? = 10` deveria parsear");
+        let TopLevel::TopLevelFunc { block, .. } = &program[0] else {
+            panic!("esperava TopLevelFunc");
+        };
+        let Stat::StatBlock { stats, .. } = block else {
+            panic!("esperava StatBlock");
+        };
+        let Stat::StatDecl { decls, .. } = &stats[0] else {
+            panic!("esperava StatDecl");
+        };
+        assert!(decls[0].option);
+        assert!(decls[0].r#type.is_none());
+    }
+
+    /// `?` no nome **e** anotação de tipo na mesma declaração é ambíguo:
+    /// erro claro apontando as duas grafias canônicas.
+    #[test]
+    fn parse_recusa_interrogacao_no_nome_junto_com_anotacao() {
+        let err = parse_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x?: integer = 10\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("local nome: T?"), "{}", err.message);
+    }
+
+    /// O `?` de tipo vale também na assinatura — parâmetro e retorno.
+    #[test]
+    fn parse_aceita_interrogacao_em_parametro_e_retorno() {
+        let program = parse_source(
+            "function f(x: integer?): string?\n\
+             \x20   return nil\n\
+             end",
+        )
+        .expect("assinatura com `?` deveria parsear");
+        let TopLevel::TopLevelFunc {
+            params, rettypes, ..
+        } = &program[0]
+        else {
+            panic!("esperava TopLevelFunc");
+        };
+        assert!(matches!(params[0].r#type, Some(Type::TypeOption { .. })));
+        assert!(matches!(rettypes[0], Type::TypeOption { .. }));
     }
 }

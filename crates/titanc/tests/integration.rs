@@ -50,9 +50,12 @@
 //!   risco 5 (Cargo.toml gerado nunca depender do LSP) é conferido dentro do
 //!   build de `hello.titan` já pago pelo caminho feliz, sem custo extra.
 //! - abertura da Fase 5 (PRD.md, T59): as tabelas de fora-de-escopo mudam de
-//!   camada onde o léxico abriu (`?` agora é token, então a rejeição de
-//!   `tipo_option` virou sintática) e `KEYWORDS_NOVAS_DA_T59` registra a quebra compatível das
-//!   sete palavras-chave novas;
+//!   camada onde o léxico abriu e `KEYWORDS_NOVAS_DA_T59` registra a quebra
+//!   compatível das sete palavras-chave novas;
+//! - tipos opcionais (PRD.md, T68): `integer?` saiu de
+//!   `CASOS_FORA_DE_ESCOPO_FASE_2` — parser e checker o aceitam, e o que
+//!   resta é a emissão, coberta por
+//!   `tipo_option_tipa_mas_ainda_nao_emite` até a T69;
 //! - bitwise e `//` completos (PRD.md, T61): `& | ~ << >> //` percorreram
 //!   lexer (T59), parser (T60) e agora checker/codegen — o caminho feliz é
 //!   provado por execução real em
@@ -804,11 +807,11 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// `indexacao_de_array`, `construtor_de_array`, `operador_length` (T30/T31)
 /// e os seis de bitwise/`//` (T61) saíram desta tabela por terem virado
 /// caminho feliz — arrays e operadores têm suporte real no codegen.
-/// `chamada_de_metodo` e `tipo_option` continuam rejeitados,
-/// mas por outra camada: com `.` e `[` lexados e o parser sabendo indexação,
-/// a rejeição de `chamada_de_metodo` já não vem do lexer, e sim do parser não
-/// reconhecer `:` como início de chamada de método. `break_fora_de_escopo`
-/// saiu desta tabela na T55 (Fase 4): `break` é keyword e vira caso positivo
+/// `chamada_de_metodo` continua rejeitado, mas por outra camada: com `.` e
+/// `[` lexados e o parser sabendo indexação, a rejeição já não vem do lexer,
+/// e sim do parser não reconhecer `:` como início de chamada de método.
+/// `tipo_option` saiu na T68 (ver o comentário no lugar dele).
+/// `break_fora_de_escopo` saiu desta tabela na T55 (Fase 4): `break` é keyword e vira caso positivo
 /// dentro de laço — os negativos de `break`/`continue` da T55 têm tabela
 /// própria, [`CASOS_FORA_DE_ESCOPO_FASE_4`].
 ///
@@ -843,13 +846,13 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         fonte: "function main(args: {string}): integer\n    local a = 1.5 & 2\n    return 0\nend",
         trecho_esperado: "operando de `&` precisa ser integer",
     },
-    CasoNegativo {
-        nome: "tipo_option",
-        // `?` virou token na T59: o parser lê o tipo `integer` e para no `?`,
-        // que ainda não é sufixo de tipo (T72).
-        fonte: "function main(args: {string}): integer\n    local a: integer? = nil\n    return 0\nend",
-        trecho_esperado: "Esperava '=' após a declaração da variável",
-    },
+    // `tipo_option` saiu desta tabela na T68, pelo mesmo movimento que
+    // `indexacao_de_array` fez na T30: `integer?` deixou de ser rejeitado
+    // em qualquer camada de front-end — o parser lê o sufixo `?`, o checker
+    // tipa o `Option` e estreita `if x ~= nil then`. O que continua faltando
+    // é a **emissão** (T69), e por isso o caso virou
+    // `tipo_option_tipa_mas_ainda_nao_emite`, logo abaixo desta tabela: o
+    // erro que resta é de codegen, não de sintaxe nem de tipos.
     CasoNegativo {
         nome: "cast_as",
         fonte: "function main(args: {string}): integer\n    local a = 1 as float\n    return 0\nend",
@@ -911,6 +914,53 @@ fn construcoes_fora_de_escopo_da_fase_2_produzem_erro_claro_sem_panic() {
     for caso in CASOS_FORA_DE_ESCOPO_FASE_2 {
         verifica_caso_negativo(caso, "fora-de-escopo");
     }
+}
+
+/// T68: um programa com `integer?` atravessa parser e checker — inclusive o
+/// estreitamento de `if x ~= nil then`, cujo corpo usa `x` como `integer` —
+/// e só para na emissão, com erro claro e **sem panic**, até a T69.
+///
+/// Este teste é o que substitui o antigo caso negativo `tipo_option`, e a
+/// T69 o converte em caminho feliz (compila e executa), do mesmo jeito que
+/// a T30 fez com `indexacao_de_array`.
+#[test]
+fn tipo_option_tipa_mas_ainda_nao_emite() {
+    verifica_caso_negativo(
+        &CasoNegativo {
+            nome: "tipo_option",
+            fonte: "function main(args: {string}): integer\n\
+                 \x20   local x: integer? = 10\n\
+                 \x20   if x ~= nil then\n\
+                 \x20       print(\"presente\")\n\
+                 \x20   end\n\
+                 \x20   return 0\n\
+                 end",
+            // Erro de **codegen**: o front-end inteiro aceitou o programa.
+            trecho_esperado: "tipo opcional (integer?) ainda não tem emissão",
+        },
+        "t68-option",
+    );
+}
+
+/// T68, o outro lado: usar um `T?` sem testar para no **checker**, com a
+/// mensagem que ensina o teste — e o estreitamento não vale depois do `if`.
+#[test]
+fn usar_tipo_option_sem_testar_produz_erro_claro() {
+    verifica_caso_negativo(
+        &CasoNegativo {
+            nome: "option_sem_testar",
+            fonte: "function main(args: {string}): integer\n\
+                 \x20   local x: integer? = 10\n\
+                 \x20   if x ~= nil then\n\
+                 \x20       print(\"dentro\")\n\
+                 \x20   end\n\
+                 \x20   local fora: integer = x\n\
+                 \x20   return 0\n\
+                 end",
+            trecho_esperado: "pode ser nil",
+        },
+        "t68-option-sem-testar",
+    );
 }
 
 /// Fora de escopo da Fase 3 (PRD.md, T44): a Fase 3 ensinou o pipeline a
