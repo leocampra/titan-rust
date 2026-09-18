@@ -211,7 +211,16 @@ como lib para o LSP reusar o pipeline
 com deps isoladas do `Cargo.toml` gerado
 ([ADR 0019](docs/adr/0019-lsp-tower-lsp-deps-isoladas.md)) e self-hosting
 entregue por etapas, só o lexer nesta fase
-([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)).
+([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)). A Fase 5 soma mais
+quatro: bitwise exigindo `integer` estrito, sem coagir `float`
+([ADR 0021](docs/adr/0021-bitwise-exige-integer-sem-coercao.md)), o `for`
+numérico como `loop` com o incremento no topo — que supera o ADR 0004
+([ADR 0022](docs/adr/0022-for-como-loop-com-incremento-no-topo.md)) —,
+`continue` entrando na linguagem com o mesmo desenho de `break`
+([ADR 0023](docs/adr/0023-continue-entra-com-o-incremento-no-topo.md)) e o
+`for`-in como `for` nativo do Rust, com mutação do container durante a
+iteração recusada pelo checker
+([ADR 0024](docs/adr/0024-for-in-nativo-sem-mutacao-do-container.md)).
 
 `titan/` e `lua/` (usado para checar comportamento de referência do Lua) são
 **somente leitura** neste repositório — repositórios de terceiros, nunca
@@ -226,9 +235,11 @@ compostos) + Fase 3 (capability runtimes) + Fase 4 (self-hosting / LSP):
 - Operadores aritméticos `+ - * / % ^`, relacionais `== ~= < > <= >=`,
   lógicos `and or not`, unário `-`/`not`; `..` (concatenação, coage
   número→string).
-- Controle de fluxo: `if`/`elseif`/`else`, `while`, `for` numérico
-  (`for x = start, finish[, inc] do ... end`), `break`
-  ([ADR 0017](docs/adr/0017-break-sim-continue-nao.md)) e `continue`
+- Controle de fluxo: `if`/`elseif`/`else`, `while`, `repeat`/`until`,
+  `for` numérico (`for x = start, finish[, inc] do ... end`), `for`-in sobre
+  array e map (`for x in v do ... end`, `for k, v in m do ... end` — Fase 5,
+  T71, [ADR 0024](docs/adr/0024-for-in-nativo-sem-mutacao-do-container.md)),
+  `break` ([ADR 0017](docs/adr/0017-break-sim-continue-nao.md)) e `continue`
   (Fase 5, T63 — o `for` passou a ser emitido como `loop` com o incremento no
   topo, [ADR 0022](docs/adr/0022-for-como-loop-com-incremento-no-topo.md) e
   [ADR 0023](docs/adr/0023-continue-entra-com-o-incremento-no-topo.md)).
@@ -297,13 +308,56 @@ Rust. Ela também **não converte nem formata** — um `integer` guardado não
 desce como `float` nem como `"42"`; para isso, escreva os dois passos
 (`v as integer as float`), e aí a conversão fica visível no fonte.
 
+### `for`-in sobre array e map
+
+`for x in v do ... end` percorre um `{T}`; `for k, v in m do ... end` percorre
+um `{K: V}`, ligando chave e valor. `break` e `continue` valem lá dentro como
+em qualquer outro laço.
+
+```lua
+local notas: {integer} = {7, 9, 10}
+local soma: integer = 0
+for n in notas do
+    soma = soma + n
+end
+
+local idades: {string: integer} = {["ana"] = 30, ["bia"] = 25}
+for nome, idade in idades do
+    print(nome .. " tem " .. idade)
+end
+```
+
+A variável do laço é uma **cópia** do elemento, coerente com a semântica de
+valor do [ADR 0006](docs/adr/0006-semantica-de-valor-clone-na-atribuicao.md):
+escrever nela não alcança o container.
+
+> **A ordem de iteração de um map é não especificada.** `{K: V}` é um
+> `HashMap` do Rust, que não garante ordem nenhuma — nem a de inserção, nem a
+> das chaves, e nem a mesma ordem entre duas execuções do mesmo binário. Quem
+> espera ordem de inserção (o reflexo de quem vem do Lua com tabelas
+> pequenas) precisa ordenar as chaves antes de iterar. É a diferença
+> observável que mais morde nesta construção.
+
+**Mutar o container durante a iteração é erro de compilação**, em português,
+antes de o `rustc` ver o programa
+([ADR 0024](docs/adr/0024-for-in-nativo-sem-mutacao-do-container.md)). Contam
+como mutação escrever no container (`v = ...`, `v[i] = ...`, `v.campo = ...`)
+e passá-lo como argumento de função — porque parâmetro composto é `&mut`
+([ADR 0007](docs/adr/0007-parametros-compostos-por-mut.md)).
+
+```lua
+for x in v do
+    v[1] = 0   -- erro: não é possível modificar 'v' dentro do `for`-in
+end            --       que itera sobre ele
+```
+
+Quem precisa mutar enquanto percorre escreve um `for` numérico sobre os
+índices, que não passa por essa restrição.
+
 ## O que não está implementado ainda
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
-- `repeat`/`until`, `for`-in.
-- Retornos múltiplos, multi-assign (`a, b = ...`).
-- Bitwise (`& | ~ << >>`), `//`.
 - `foreign import`, `import` com alias (`import data as d`),
   `local m = import "data"` (a forma do original), módulos definidos pelo
   usuário (um `.titan` importando outro `.titan`).

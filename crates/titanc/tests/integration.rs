@@ -852,10 +852,15 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
     // tipa o `Option` e estreita `if x ~= nil then`. A T69 fechou a
     // **emissão**, e o caso virou caminho feliz em
     // `compila_e_executa_tipos_opcionais`: compila e executa de verdade.
+    // `cast_as` saiu desta tabela na T70, pelo mesmo movimento que
+    // `indexacao_de_array` fez na T30 e `bitwise` na T61: `1 as float` deixou
+    // de ser erro de sintaxe e virou caminho feliz. O que sobrou da família é
+    // o negativo abaixo — cast **não é parsing**, e é essa fronteira que
+    // continua valendo.
     CasoNegativo {
-        nome: "cast_as",
-        fonte: "function main(args: {string}): integer\n    local a = 1 as float\n    return 0\nend",
-        trecho_esperado: "erro de sintaxe",
+        nome: "cast_de_string_para_numero",
+        fonte: "function main(args: {string}): integer\n    local a = \"3\" as integer\n    return 0\nend",
+        trecho_esperado: "não existe cast de string para integer",
     },
     CasoNegativo {
         nome: "metodo_com_dois_pontos",
@@ -1448,6 +1453,230 @@ fn compila_e_executa_continue_em_for_e_em_while() {
     assert_eq!(run_output.status.code(), Some(0));
 
     let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Critério de aceite da T71 (execução real, os quatro pontos da tarefa):
+/// soma dos elementos de um `{integer}`, iteração de um `{string: integer}`,
+/// `break`/`continue` dentro, e mutar o container durante a iteração dando
+/// erro claro em português (este último no teste seguinte, porque é um caso
+/// negativo).
+///
+/// A iteração do map é conferida por **agregação**, nunca por ordem de
+/// saída: `{K: V}` é `HashMap`, cuja ordem é não especificada (ADR 0024) —
+/// um teste que fixasse a ordem passaria hoje e falharia amanhã sem nenhuma
+/// mudança no compilador.
+#[test]
+fn compila_e_executa_for_in_sobre_array_e_map() {
+    let out_dir = temp_dir("for-in-execucao-real");
+
+    let source = concat!(
+        "function soma_param(xs: {integer}): integer\n",
+        // O container é um **parâmetro** composto, isto é, um `&mut Vec<i64>`
+        // no Rust gerado: `.iter()` precisa atravessar a referência.
+        "    local s: integer = 0\n",
+        "    for x in xs do\n",
+        "        s = s + x\n",
+        "    end\n",
+        "    return s\n",
+        "end\n",
+        "\n",
+        "function nomes(): {string}\n",
+        "    return {\"ana\", \"bia\"}\n",
+        "end\n",
+        "\n",
+        "function main(args: {string}): integer\n",
+        // 1. Soma dos elementos de um `{integer}`.
+        "    local v: {integer} = {10, 20, 30}\n",
+        "    local soma: integer = 0\n",
+        "    for x in v do\n",
+        "        soma = soma + x\n",
+        "    end\n",
+        "    print(\"soma: \" .. soma)\n",
+        "    print(\"param: \" .. soma_param(v))\n",
+        // 2. Iteração de um `{string: integer}`: as duas variáveis ligadas,
+        //    agregadas em somas que independem da ordem.
+        "    local m: {string: integer} = {[\"ana\"] = 30, [\"bia\"] = 25}\n",
+        "    local idades: integer = 0\n",
+        "    local letras: integer = 0\n",
+        "    for nome, idade in m do\n",
+        "        idades = idades + idade\n",
+        "        letras = letras + #nome\n",
+        "    end\n",
+        "    print(\"idades: \" .. idades)\n",
+        "    print(\"letras: \" .. letras)\n",
+        // Só o valor usado: a chave sai como `_` no padrão do iterador, e o
+        // Rust gerado precisa compilar **sem warning** de variável não usada.
+        "    local so_valores: integer = 0\n",
+        "    for chave, idade in m do\n",
+        "        so_valores = so_valores + idade\n",
+        "    end\n",
+        "    print(\"so-valores: \" .. so_valores)\n",
+        // 3. `break` e `continue` (T63) dentro do `for`-in.
+        "    for y in v do\n",
+        "        if y == 20 then\n",
+        "            continue\n",
+        "        end\n",
+        "        if y == 30 then\n",
+        "            break\n",
+        "        end\n",
+        "        print(\"bc: \" .. y)\n",
+        "    end\n",
+        // Container que é uma **chamada**, não um nome: itera um temporário.
+        "    for nome in nomes() do\n",
+        "        print(\"nome: \" .. nome)\n",
+        "    end\n",
+        // Aninhado, sobre `{{integer}}`: a variável do laço externo é ela
+        // própria um container, e vira o container do laço interno.
+        "    local matriz: {{integer}} = {{1, 2}, {3, 4}}\n",
+        "    for linha in matriz do\n",
+        "        local parcial: integer = 0\n",
+        "        for c in linha do\n",
+        "            parcial = parcial + c\n",
+        "        end\n",
+        "        print(\"linha: \" .. parcial)\n",
+        "    end\n",
+        // A variável do laço é uma **cópia** (ADR 0006/0024): escrever nela
+        // não alcança o container.
+        "    print(\"intacto: \" .. v[1])\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "for_in_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de for-in: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+    // Critério herdado da T69: Rust gerado **sem warnings**. O `cargo` do
+    // titanc escreve os avisos do rustc no stderr do próprio titanc.
+    let compile_stderr = String::from_utf8_lossy(&compile_output.stderr);
+    assert!(
+        !compile_stderr.contains("warning:"),
+        "o Rust gerado para o for-in saiu com warning: {compile_stderr}"
+    );
+
+    let binary = out_dir.join("for_in_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./for_in_exec");
+    let esperado = concat!(
+        "soma: 60\n",
+        "param: 60\n",
+        "idades: 55\n",
+        "letras: 6\n",
+        "so-valores: 55\n",
+        "bc: 10\n",
+        "nome: ana\n",
+        "nome: bia\n",
+        "linha: 3\n",
+        "linha: 7\n",
+        "intacto: 10\n",
+    );
+    assert_eq!(String::from_utf8_lossy(&run_output.stdout), esperado);
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// O quarto ponto do critério de aceite da T71: mutar o container durante a
+/// iteração dá erro **claro, em português, do checker** — e não `cannot
+/// borrow as mutable` do `rustc`, que é o que sairia sem esta checagem
+/// (ADR 0024).
+///
+/// As três formas de mutação são conferidas separadamente porque cada uma
+/// chega ao detector por um caminho diferente da AST: alvo de atribuição
+/// simples, alvo dentro de uma cadeia de índice, e argumento de chamada (que
+/// é uso mutável porque parâmetro composto é `&mut`, ADR 0007).
+#[test]
+fn mutar_o_container_durante_o_for_in_produz_erro_claro_em_portugues() {
+    let casos: &[(&str, &str)] = &[
+        (
+            "atribuicao_ao_container",
+            "function main(args: {string}): integer\n\
+             \x20   local v: {integer} = {1, 2}\n\
+             \x20   for x in v do\n\
+             \x20       v = {3}\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        ),
+        (
+            "escrita_em_elemento",
+            "function main(args: {string}): integer\n\
+             \x20   local v: {integer} = {1, 2}\n\
+             \x20   for x in v do\n\
+             \x20       v[1] = 99\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        ),
+        (
+            "passado_como_argumento",
+            "function zera(xs: {integer}): integer\n\
+             \x20   xs[1] = 0\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local v: {integer} = {1, 2}\n\
+             \x20   for x in v do\n\
+             \x20       zera(v)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        ),
+        // Aninhado: mutar o container do laço **externo** de dentro do
+        // interno é a mesma ofensa, e a varredura tem de alcançá-la.
+        (
+            "mutacao_em_laco_aninhado",
+            "function main(args: {string}): integer\n\
+             \x20   local v: {integer} = {1, 2}\n\
+             \x20   local w: {integer} = {3}\n\
+             \x20   for x in v do\n\
+             \x20       for y in w do\n\
+             \x20           v[1] = 0\n\
+             \x20       end\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        ),
+    ];
+
+    for (nome, fonte) in casos {
+        let out_dir = temp_dir(&format!("for-in-mutacao-{nome}"));
+        let source_path = write_source(&out_dir, "mutacao.titan", fonte);
+        let output = Command::new(titanc_bin())
+            .arg("--out")
+            .arg(&out_dir)
+            .arg(&source_path)
+            .output()
+            .expect("invoca titanc");
+        assert_never_panics(&output);
+        assert!(
+            !output.status.success(),
+            "[{nome}] esperava falha, titanc reportou sucesso"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("não é possível modificar 'v' dentro do `for`-in"),
+            "[{nome}] mensagem inesperada: {stderr}"
+        );
+        // A convenção do projeto: nunca o erro do rustc em inglês.
+        assert!(
+            !stderr.contains("cannot borrow"),
+            "[{nome}] vazou erro do rustc: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
 }
 
 /// Critério de aceite da T64 (execução real, os três pontos da tarefa): o
