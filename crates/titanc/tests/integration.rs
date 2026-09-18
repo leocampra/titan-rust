@@ -52,10 +52,10 @@
 //! - abertura da Fase 5 (PRD.md, T59): as tabelas de fora-de-escopo mudam de
 //!   camada onde o léxico abriu e `KEYWORDS_NOVAS_DA_T59` registra a quebra
 //!   compatível das sete palavras-chave novas;
-//! - tipos opcionais (PRD.md, T68): `integer?` saiu de
-//!   `CASOS_FORA_DE_ESCOPO_FASE_2` — parser e checker o aceitam, e o que
-//!   resta é a emissão, coberta por
-//!   `tipo_option_tipa_mas_ainda_nao_emite` até a T69;
+//! - tipos opcionais (PRD.md, T68/T69): `integer?` saiu de
+//!   `CASOS_FORA_DE_ESCOPO_FASE_2` — parser e checker o aceitam, e a T69
+//!   fechou a emissão, então o caso virou caminho feliz em
+//!   `compila_e_executa_tipos_opcionais`;
 //! - bitwise e `//` completos (PRD.md, T61): `& | ~ << >> //` percorreram
 //!   lexer (T59), parser (T60) e agora checker/codegen — o caminho feliz é
 //!   provado por execução real em
@@ -849,10 +849,9 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
     // `tipo_option` saiu desta tabela na T68, pelo mesmo movimento que
     // `indexacao_de_array` fez na T30: `integer?` deixou de ser rejeitado
     // em qualquer camada de front-end — o parser lê o sufixo `?`, o checker
-    // tipa o `Option` e estreita `if x ~= nil then`. O que continua faltando
-    // é a **emissão** (T69), e por isso o caso virou
-    // `tipo_option_tipa_mas_ainda_nao_emite`, logo abaixo desta tabela: o
-    // erro que resta é de codegen, não de sintaxe nem de tipos.
+    // tipa o `Option` e estreita `if x ~= nil then`. A T69 fechou a
+    // **emissão**, e o caso virou caminho feliz em
+    // `compila_e_executa_tipos_opcionais`: compila e executa de verdade.
     CasoNegativo {
         nome: "cast_as",
         fonte: "function main(args: {string}): integer\n    local a = 1 as float\n    return 0\nend",
@@ -916,30 +915,131 @@ fn construcoes_fora_de_escopo_da_fase_2_produzem_erro_claro_sem_panic() {
     }
 }
 
-/// T68: um programa com `integer?` atravessa parser e checker — inclusive o
-/// estreitamento de `if x ~= nil then`, cujo corpo usa `x` como `integer` —
-/// e só para na emissão, com erro claro e **sem panic**, até a T69.
+/// Critério de aceite da T69, pelo pipeline completo e em **execução real**:
+/// uma função que devolve `integer?`, um chamador que testa, e Rust gerado
+/// **sem warnings**.
 ///
-/// Este teste é o que substitui o antigo caso negativo `tipo_option`, e a
-/// T69 o converte em caminho feliz (compila e executa), do mesmo jeito que
-/// a T30 fez com `indexacao_de_array`.
+/// Este teste é a conversão para caminho feliz do antigo
+/// `tipo_option_tipa_mas_ainda_nao_emite` (T68) — o mesmo movimento que a
+/// T30 fez com `indexacao_de_array`: o que era rejeição de codegen virou
+/// programa que compila e roda.
+///
+/// Os três pontos conferidos no texto emitido são os que a T69 introduz e
+/// que nenhum teste de valor pegaria sozinho: `T?` vira `Option<T>`, o teste
+/// de presença vira `is_some()`/`is_none()` (o mapeamento direto sairia
+/// `x != ()`, que nem compila) e o ramo estreitado abre a ligação que
+/// desembrulha o nome. O acumulador `acc` cobre a armadilha que a T68
+/// registrou — atribuir dentro do ramo estreitado tem de alcançar a
+/// variável de fora, e não a ligação nova —, e só a execução a prova: se o
+/// write-back sumisse, `acc` sairia 3 em vez de 6, calado.
 #[test]
-fn tipo_option_tipa_mas_ainda_nao_emite() {
-    verifica_caso_negativo(
-        &CasoNegativo {
-            nome: "tipo_option",
-            fonte: "function main(args: {string}): integer\n\
-                 \x20   local x: integer? = 10\n\
-                 \x20   if x ~= nil then\n\
-                 \x20       print(\"presente\")\n\
-                 \x20   end\n\
-                 \x20   return 0\n\
-                 end",
-            // Erro de **codegen**: o front-end inteiro aceitou o programa.
-            trecho_esperado: "tipo opcional (integer?) ainda não tem emissão",
-        },
-        "t68-option",
+fn compila_e_executa_tipos_opcionais() {
+    let out_dir = temp_dir("tipos-opcionais-execucao-real");
+
+    let source = concat!(
+        "function busca(v: {integer}, alvo: integer): integer?\n",
+        "    local i: integer = 1\n",
+        "    while i <= #v do\n",
+        "        if v[i] == alvo then\n",
+        "            return i\n",
+        "        end\n",
+        "        i = i + 1\n",
+        "    end\n",
+        "    return nil\n",
+        "end\n",
+        "function main(args: {string}): integer\n",
+        "    local v: {integer} = {10, 20, 30}\n",
+        "    local achou: integer? = busca(v, 20)\n",
+        "    if achou ~= nil then\n",
+        "        print(\"achou-\" .. achou)\n",
+        "    end\n",
+        "    local nao: integer? = busca(v, 99)\n",
+        "    if nao == nil then\n",
+        "        print(\"nao-achou\")\n",
+        "    end\n",
+        // `string` dentro de `Option`: o valor de dentro sai dono, senão o
+        // de fora sairia movido.
+        "    local s: string? = \"oi\"\n",
+        "    if s ~= nil then\n",
+        "        print(\"str-\" .. s)\n",
+        "    end\n",
+        // Atribuição dentro do ramo estreitado, repetida num laço: cada
+        // iteração precisa enxergar o que a anterior escreveu.
+        "    local acc: integer? = 0\n",
+        "    local i: integer = 1\n",
+        "    while i <= 3 do\n",
+        "        if acc ~= nil then\n",
+        "            acc = acc + i\n",
+        "        end\n",
+        "        i = i + 1\n",
+        "    end\n",
+        "    if acc ~= nil then\n",
+        "        print(\"acc-\" .. acc)\n",
+        "    end\n",
+        "    return 0\n",
+        "end",
     );
+    let source_path = write_source(&out_dir, "opcionais.titan", source);
+
+    // 1. `--emit-rust`: `Option<T>`, o teste de presença e o desembrulho.
+    let emit_output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&emit_output);
+    assert!(
+        emit_output.status.success(),
+        "titanc --emit-rust falhou para tipos opcionais: {}",
+        String::from_utf8_lossy(&emit_output.stderr)
+    );
+    let rust = String::from_utf8_lossy(&emit_output.stdout);
+    assert!(
+        rust.contains("pub fn titan_busca(v: &mut Vec<i64>, alvo: i64) -> Option<i64> {"),
+        "`integer?` não virou `Option<i64>` na assinatura:\n{rust}"
+    );
+    assert!(
+        rust.contains("return Some(i);") && rust.contains("return None;"),
+        "valor e `nil` não viraram `Some`/`None`:\n{rust}"
+    );
+    assert!(
+        rust.contains("if achou.is_some() {") && rust.contains("if nao.is_none() {"),
+        "teste de presença não virou `is_some`/`is_none`:\n{rust}"
+    );
+    assert!(
+        rust.contains("let achou: i64 = achou.clone().unwrap();"),
+        "ramo estreitado não desembrulhou o nome:\n{rust}"
+    );
+    assert!(
+        rust.contains("*titan_opt_acc = Some(acc);"),
+        "atribuição no ramo estreitado não volta para a variável externa:\n{rust}"
+    );
+
+    // 2. Execução real do mesmo programa.
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar o caso de tipos opcionais: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("opcionais");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary).output().expect("executa ./opcionais");
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "achou-2\nnao-achou\nstr-oi\nacc-6\n"
+    );
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
 }
 
 /// T68, o outro lado: usar um `T?` sem testar para no **checker**, com a
