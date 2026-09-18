@@ -46,14 +46,16 @@
 //!   `examples/dados.titan` — único caminho feliz desta suíte que paga o
 //!   build do Polars de propósito — conferindo stdout completo e exit code.
 //! - curadoria da Fase 4 (PRD.md, T57): `CASOS_FORA_DE_ESCOPO_FASE_4` fecha
-//!   com tipos soma (`enum`/`match`, sem sintaxe própria até a Fase 5),
+//!   com tipos soma (`enum`/`match`, que ganharam sintaxe na T75 e agora são
+//!   rejeitados pelo **checker**, à espera da tipagem da T76),
 //!   `.titan` importando `.titan` (mesma rejeição de `import` com string da
 //!   T35) e `s[i]` (indexação de string, branch própria no checker); e o
 //!   risco 5 (Cargo.toml gerado nunca depender do LSP) é conferido dentro do
 //!   build de `hello.titan` já pago pelo caminho feliz, sem custo extra.
 //! - abertura da Fase 5 (PRD.md, T59): as tabelas de fora-de-escopo mudam de
 //!   camada onde o léxico abriu e `KEYWORDS_NOVAS_DA_T59` registra a quebra
-//!   compatível das sete palavras-chave novas;
+//!   compatível das palavras-chave novas — as sete da T59 mais `with`, que
+//!   a sintaxe do `match` exigiu na T75;
 //! - tipos opcionais (PRD.md, T68/T69): `integer?` saiu de
 //!   `CASOS_FORA_DE_ESCOPO_FASE_2` — parser e checker o aceitam, e a T69
 //!   fechou a emissão, então o caso virou caminho feliz em
@@ -1228,20 +1230,21 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         trecho_esperado: "'x' não foi declarado",
     },
     CasoNegativo {
-        // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria: a
-        // T59 as tornou keywords, mas a declaração só chega na T62 — `enum`
-        // segue não sendo declaração de topo reconhecida.
-        nome: "tipo_soma_enum",
-        fonte: "enum Cor\n    Vermelho\n    Verde\n    Azul\nend\n\nfunction main(args: {string}): integer\n    return 0\nend",
-        trecho_esperado: "Esperava uma declaração de topo",
+        // `match` (PRD.md: "tipos soma") ganhou sintaxe na T75 — `enum` é
+        // declaração de topo reconhecida e o `match` parseia —, mas a
+        // tipagem e a exaustividade são da T76: quem rejeita agora é o
+        // checker, não o parser. A mensagem nomeia a tarefa em que a
+        // construção entra, em vez de dizer só que a sintaxe não existe.
+        nome: "tipo_soma_match_ainda_nao_tipado",
+        fonte: "enum Cor\n    Vermelho\n    Verde\nend\n\nfunction main(args: {string}): integer\n    local x: integer = 1\n    match x with\n        Vermelho then\n            return 0\n    end\n    return 0\nend",
+        trecho_esperado: "`match` não é suportado nesta fase",
     },
     CasoNegativo {
-        nome: "tipo_soma_match",
-        // `match` virou keyword na T59 mas ainda não tem comando próprio
-        // (T62): dentro de um corpo de função, o parser não reconhece o
-        // início de comando nem de expressão.
+        // A sintaxe do `match` é a do PRD.md (`with` + braços `padrão then`),
+        // não a de seta do Rust/ML: `1 -> ...` é erro de sintaxe claro.
+        nome: "tipo_soma_match_com_seta",
         fonte: "function main(args: {string}): integer\n    local x: integer = 1\n    match x\n        1 -> print(\"um\")\n    end\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        trecho_esperado: "Esperava 'with' após a expressão do 'match'",
     },
     CasoNegativo {
         // `.titan` importando `.titan` cairia exatamente na forma `import`
@@ -1271,10 +1274,11 @@ fn construcoes_fora_de_escopo_da_fase_4_produzem_erro_claro_sem_panic() {
 /// Quebra compatível registrada pela T59 (Fase 5): `enum`, `match`,
 /// `continue`, `repeat`, `until`, `in` e `foreign` viraram palavras-chave e
 /// deixaram de ser identificadores válidos — mesma mudança de `as` (T20),
-/// `import` (T34) e `break` (T55). Um programa que usava qualquer uma delas
+/// `import` (T34) e `break` (T55). `with` entrou depois, na T75, quando a
+/// sintaxe do `match` a exigiu. Um programa que usava qualquer uma delas
 /// como nome de variável passa a ser erro de sintaxe claro, nunca panic.
 const KEYWORDS_NOVAS_DA_T59: &[&str] = &[
-    "enum", "match", "continue", "repeat", "until", "in", "foreign",
+    "enum", "match", "continue", "repeat", "until", "in", "foreign", "with",
 ];
 
 #[test]

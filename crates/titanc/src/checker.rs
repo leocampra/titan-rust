@@ -1141,12 +1141,12 @@ impl Checker {
             // Já processado por `collect_records`, que roda antes (T29 —
             // duas sub-passadas: records primeiro, funções depois).
             TopLevel::TopLevelRecord { .. } => {}
-            // `enum` (T74): a AST e o `Type::Sum` já existem, mas a coleta
+            // `enum` (T74/T75): a AST, o `Type::Sum` e a sintaxe já existem —
+            // desde a T75 o parser produz este nó de verdade —, mas a coleta
             // (`self.enums`), a desambiguação de construção de variante e a
-            // exaustividade do `match` são da T76. Até lá nada chega aqui: o
-            // parser ainda não produz este nó (T75). Braço explícito, e não
-            // um `_`, para que a próxima variante de `TopLevel` volte a dar
-            // erro de compilação em vez de passar em silêncio.
+            // exaustividade do `match` são da T76. Até lá a declaração é
+            // aceita sem virar tipo, e é o `match` sobre ela que recusa, com
+            // a mensagem que diz em que tarefa isso entra.
             TopLevel::TopLevelEnum { .. } => {}
             // `import data` e `import data as d` (T72). O nome que colide,
             // que vira símbolo e que chaveia `self.modules` é sempre o
@@ -1891,6 +1891,19 @@ impl Checker {
                     return None;
                 }
                 Some(TypedStat::Continue { loc: *loc })
+            }
+            // `match` (T75): a sintaxe existe, a tipagem — escrutinado
+            // `Sum`, campos ligados no bloco do braço e **exaustividade em
+            // português** — é a T76. Recusar aqui, com a razão, é o que
+            // impede um `match` de compilar sem checagem nenhuma no
+            // intervalo entre as duas tarefas.
+            Stat::StatMatch { loc, .. } => {
+                self.error(
+                    *loc,
+                    "`match` não é suportado nesta fase (a tipagem e a checagem de \
+                     exaustividade entram na T76).",
+                );
+                None
             }
         }
     }
@@ -3040,6 +3053,18 @@ valor precisam de nomes diferentes.",
             Exp::ExpExtra {
                 loc, exp, index, ..
             } => self.check_extra(*loc, exp, *index),
+            // `match` como expressão (T75) — mesma razão do braço de
+            // `Stat::StatMatch` em `check_stat`: a tipagem é a T76, e ela
+            // tem uma exigência a mais aqui, a de todos os braços terem o
+            // mesmo tipo.
+            Exp::ExpMatch { loc, .. } => {
+                self.error(
+                    *loc,
+                    "`match` não é suportado nesta fase (a tipagem e a checagem de \
+                     exaustividade entram na T76).",
+                );
+                None
+            }
         }
     }
 
@@ -4453,6 +4478,14 @@ fn coleta_mutacoes(stat: &Stat, container: &str, ofensas: &mut Vec<Loc>) {
             }
         }
         Stat::StatBreak { .. } | Stat::StatContinue { .. } => {}
+        // `match` (T75): o escrutinado e o bloco de cada braço são código
+        // como qualquer outro, e podem muito bem mutar o container.
+        Stat::StatMatch { exp, arms, .. } => {
+            coleta_mutacoes_exp(exp, container, ofensas);
+            for arm in arms {
+                coleta_mutacoes(&arm.body, container, ofensas);
+            }
+        }
     }
 }
 
@@ -4479,6 +4512,12 @@ fn coleta_mutacoes_exp(exp: &Exp, container: &str, ofensas: &mut Vec<Loc>) {
         | Exp::ExpCast { exp, .. }
         | Exp::ExpAdjust { exp, .. }
         | Exp::ExpExtra { exp, .. } => coleta_mutacoes_exp(exp, container, ofensas),
+        Exp::ExpMatch { exp, arms, .. } => {
+            coleta_mutacoes_exp(exp, container, ofensas);
+            for arm in arms {
+                coleta_mutacoes_exp(&arm.body, container, ofensas);
+            }
+        }
         Exp::ExpBinop { lhs, rhs, .. } => {
             coleta_mutacoes_exp(lhs, container, ofensas);
             coleta_mutacoes_exp(rhs, container, ofensas);
@@ -4544,7 +4583,8 @@ fn stat_loc(stat: &Stat) -> Loc {
         | Stat::StatCall { loc, .. }
         | Stat::StatReturn { loc, .. }
         | Stat::StatBreak { loc, .. }
-        | Stat::StatContinue { loc, .. } => *loc,
+        | Stat::StatContinue { loc, .. }
+        | Stat::StatMatch { loc, .. } => *loc,
     }
 }
 
@@ -4572,7 +4612,8 @@ fn exp_loc(exp: &Exp) -> Loc {
         | Exp::ExpBinop { loc, .. }
         | Exp::ExpCast { loc, .. }
         | Exp::ExpAdjust { loc, .. }
-        | Exp::ExpExtra { loc, .. } => *loc,
+        | Exp::ExpExtra { loc, .. }
+        | Exp::ExpMatch { loc, .. } => *loc,
     }
 }
 
@@ -8695,5 +8736,49 @@ end"#;
     fn t70_value_opcional_continua_recusado() {
         let errs = check_source(&em_main("    local x: value? = nil")).unwrap_err();
         assert!(errs[0].to_string().contains("`value?` não faz sentido"), "{}", errs[0]);
+    }
+
+    // ---- T75: `enum` e `match` chegam do parser -------------------------
+
+    /// A declaração de `enum` já atravessa o checker sem erro desde a T74 —
+    /// a diferença da T75 é que agora ela chega mesmo, escrita pelo usuário.
+    /// Virar `Type::Sum` coletado em `self.enums` é a T76.
+    #[test]
+    fn t75_declaracao_de_enum_nao_produz_erro() {
+        check_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("declarar um `enum` não deveria ser erro de checagem");
+    }
+
+    /// `match` já parseia (T75), mas ainda não tipa: a recusa é clara e
+    /// nomeia a tarefa, em vez de o programa compilar sem checagem nenhuma.
+    #[test]
+    fn t75_match_e_recusado_com_mensagem_que_nomeia_a_tarefa() {
+        let errs = check_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: integer = 0\n\
+             \x20   match e with\n\
+             \x20       ExpNil then\n\
+             \x20           return 0\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("`match` não é suportado nesta fase")),
+            "erros: {errs:?}"
+        );
     }
 }

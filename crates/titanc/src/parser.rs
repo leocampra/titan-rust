@@ -11,12 +11,14 @@
 //!
 //! Statements: `StatCall`, `StatReturn` (lista de valores desde a T65),
 //! `StatDecl`, `StatIf`, `StatWhile`, `StatRepeat` (T64), `StatFor`
-//! (numérico), `StatAssign`. `StatDecl` e `StatAssign` aceitam lista de
-//! alvos desde a T67 (`local a, b = f()`, `a, b = b, a`).
-//! Expressões: literais, `ExpVar`, `ExpCall`, `ExpConcat` (`..`) e
-//! `ExpBinop`/`ExpUnop` numa cascata de precedência que espelha
-//! `parser.lua:369-395` **por completo**, incluindo os níveis bitwise
-//! (`|`, `~`, `&`, `<<`, `>>`) e a divisão inteira `//` (T60).
+//! (numérico), `StatAssign`, `StatMatch` (T75). `StatDecl` e `StatAssign`
+//! aceitam lista de alvos desde a T67 (`local a, b = f()`, `a, b = b, a`).
+//! Expressões: literais, `ExpVar`, `ExpCall`, `ExpConcat` (`..`),
+//! `ExpMatch` (T75) e `ExpBinop`/`ExpUnop` numa cascata de precedência que
+//! espelha `parser.lua:369-395` **por completo**, incluindo os níveis
+//! bitwise (`|`, `~`, `&`, `<<`, `>>`) e a divisão inteira `//` (T60).
+//! Declarações de topo: `record`, `enum` (T75), `import`,
+//! `foreign function` (T73).
 //! Tipos: `integer`, `float`, `boolean`, `string`, `nil`, `{T}`, a lista
 //! de tipos de retorno da assinatura (`: integer, integer`, T65) e o sufixo
 //! `?` de tipo opcional (`integer?`, T68) — que tem par no `?` depois do
@@ -26,7 +28,8 @@
 //! `import`, ...) produz um erro sintático claro — nunca panic.
 
 use crate::ast::{
-    Args, Decl, Exp, Field, FieldName, Loc, Program, Stat, Then, TopLevel, Type, Var,
+    Args, Decl, Exp, Field, FieldName, Loc, MatchArm, Pattern, Program, Stat, Then, TopLevel, Type,
+    Var,
 };
 use crate::lexer::{Token, TokenKind};
 
@@ -144,6 +147,10 @@ impl<'a> Parser<'a> {
             return self.parse_toplevel_record(loc);
         }
 
+        if self.eat(&TokenKind::KwEnum) {
+            return self.parse_toplevel_enum(loc);
+        }
+
         if self.eat(&TokenKind::KwImport) {
             return self.parse_toplevel_import(loc);
         }
@@ -164,7 +171,7 @@ impl<'a> Parser<'a> {
 
         Err(self.erro(
             "Esperava uma declaração de topo (`function`, `foreign function`, `import`, \
-             `local` ou `record`) em vez disso.",
+             `local`, `record` ou `enum`) em vez disso.",
         ))
     }
 
@@ -276,6 +283,69 @@ impl<'a> Parser<'a> {
         }
 
         Ok(TopLevel::TopLevelRecord { loc, name, fields })
+    }
+
+    /// `enum Nome Variante Variante(T, ...) ... end` (T75), no molde de
+    /// [`Parser::parse_toplevel_record`].
+    ///
+    /// A diferença de forma com o `record` é que os campos de uma variante
+    /// são **posicionais** — só tipos, sem nome (`ast::Variant::fields` é
+    /// `Vec<Type>`): o nome de cada campo aparece no braço do `match` que o
+    /// liga, não aqui. Variante sem payload se escreve **sem parênteses**;
+    /// `ExpNil()` é erro, não sinônimo, porque parênteses vazios sugeririam
+    /// uma variante de aridade zero distinta da sem payload — e ela não
+    /// existe.
+    ///
+    /// Recursão (`ExpBinop(string, Exp, Exp)`) é só uma `Type::TypeName`
+    /// como outra qualquer para o parser: quem a permite de propósito é o
+    /// checker (decisão técnica 6 do PRD.md).
+    fn parse_toplevel_enum(&mut self, loc: Loc) -> Result<TopLevel, ParseError> {
+        let (name, _) = self.expect_name("Esperava um nome de enum após 'enum'.")?;
+
+        let mut variants = Vec::new();
+        while !self.check(&TokenKind::End) && !self.check(&TokenKind::Eof) {
+            variants.push(self.parse_variant()?);
+            self.eat(&TokenKind::Semicolon);
+        }
+        self.expect(&TokenKind::End, "Esperava 'end' para fechar o 'enum'.")?;
+
+        if variants.is_empty() {
+            return Err(ParseError {
+                message: "Um 'enum' precisa de pelo menos uma variante.".to_string(),
+                loc,
+            });
+        }
+
+        Ok(TopLevel::TopLevelEnum {
+            loc,
+            name,
+            variants,
+        })
+    }
+
+    /// Uma variante de `enum`: `Nome` ou `Nome(T1, T2, ...)`.
+    fn parse_variant(&mut self) -> Result<crate::ast::Variant, ParseError> {
+        let (name, loc) = self.expect_name("Esperava um nome de variante.")?;
+
+        let mut fields = Vec::new();
+        if self.eat(&TokenKind::LParen) {
+            if self.check(&TokenKind::RParen) {
+                return Err(self.erro(
+                    "Variante sem payload se escreve sem parênteses: remova o '()' — \
+                     parênteses vazios não são sinônimo de variante sem campos.",
+                ));
+            }
+            fields.push(self.parse_type()?);
+            while self.eat(&TokenKind::Comma) {
+                fields.push(self.parse_type()?);
+            }
+            self.expect(
+                &TokenKind::RParen,
+                "Esperava ')' para fechar os campos da variante.",
+            )?;
+        }
+
+        Ok(crate::ast::Variant { loc, name, fields })
     }
 
     fn parse_toplevel_func(&mut self, _loc: Loc, islocal: bool) -> Result<TopLevel, ParseError> {
@@ -553,6 +623,10 @@ impl<'a> Parser<'a> {
             return Ok(Stat::StatContinue { loc });
         }
 
+        if self.eat(&TokenKind::KwMatch) {
+            return self.parse_stat_match(loc);
+        }
+
         // Chamada ou atribuição — desambiguadas sem backtracking, como no
         // original (`suffixedexp` + checar `ASSIGN`, `parser.lua:354-358`):
         // parseia a expressão sufixada e o token seguinte decide.
@@ -567,8 +641,8 @@ impl<'a> Parser<'a> {
         if !matches!(exp, Exp::ExpCall { .. }) {
             return Err(ParseError {
                 message: "Esperava um comando (`local`, `return`, `if`, `while`, `repeat`, \
-                          `for`, `break`, `continue`, uma atribuição ou uma chamada de \
-                          função)."
+                          `for`, `break`, `continue`, `match`, uma atribuição ou uma \
+                          chamada de função)."
                     .to_string(),
                 loc,
             });
@@ -607,6 +681,204 @@ impl<'a> Parser<'a> {
             thens,
             elsestat,
         })
+    }
+
+    /// `match exp with (padrão then block)+ end` em posição de comando (T75).
+    fn parse_stat_match(&mut self, loc: Loc) -> Result<Stat, ParseError> {
+        let (exp, arms) = self.parse_match_corpo(loc, Parser::parse_match_arm_block)?;
+        Ok(Stat::StatMatch {
+            loc,
+            exp: Box::new(exp),
+            arms,
+        })
+    }
+
+    /// `match exp with (padrão then exp)+ end` em posição de expressão (T75).
+    ///
+    /// O corpo de cada braço é uma **expressão**, o que torna a fronteira
+    /// entre braços exata sem lookahead nenhum: a expressão acaba, e o que
+    /// vier depois ou é `end` ou é o próximo padrão. É a diferença que faz
+    /// [`Parser::parse_match_arm_block`] existir só do lado do comando.
+    fn parse_exp_match(&mut self, loc: Loc) -> Result<Exp, ParseError> {
+        self.advance(); // consome 'match'
+        let (exp, arms) = self.parse_match_corpo(loc, Parser::parse_exp)?;
+        Ok(Exp::ExpMatch {
+            loc,
+            exp: Box::new(exp),
+            arms,
+        })
+    }
+
+    /// O que as duas formas de `match` têm em comum — tudo menos o corpo do
+    /// braço, que `parse_body` fornece: um bloco no comando, uma expressão
+    /// na expressão.
+    ///
+    /// A exaustividade dos braços — e até se o escrutinado é mesmo um tipo
+    /// soma — é assunto do checker (T76): aqui só se exige que exista ao
+    /// menos um braço, porque um `match` sem braço nenhum é erro de escrita,
+    /// não programa vazio.
+    fn parse_match_corpo<T>(
+        &mut self,
+        loc: Loc,
+        parse_body: fn(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<(Exp, Vec<MatchArm<T>>), ParseError> {
+        let exp = self.parse_exp()?;
+        self.expect(
+            &TokenKind::KwWith,
+            "Esperava 'with' após a expressão do 'match'.",
+        )?;
+
+        let mut arms = Vec::new();
+        while !self.check(&TokenKind::End) && !self.check(&TokenKind::Eof) {
+            let arm_loc = self.loc();
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::Then, "Esperava 'then' após o padrão do braço.")?;
+            let body = parse_body(self)?;
+            self.eat(&TokenKind::Semicolon);
+            arms.push(MatchArm {
+                loc: arm_loc,
+                pattern,
+                body,
+            });
+        }
+        self.expect(&TokenKind::End, "Esperava 'end' para fechar o 'match'.")?;
+
+        if arms.is_empty() {
+            return Err(ParseError {
+                message: "Um 'match' precisa de pelo menos um braço.".to_string(),
+                loc,
+            });
+        }
+
+        Ok((exp, arms))
+    }
+
+    /// O padrão de um braço: `_`, `Variante` ou `Variante(a, b, ...)`.
+    ///
+    /// Os campos ligam nomes locais **posicionalmente** — o tipo de cada um
+    /// vem da declaração do `enum`, então escrevê-lo aqui seria repetição
+    /// que poderia divergir. Por isso são `Decl` com `type: None`, e um
+    /// `Variante(n: integer)` é recusado com a razão, não só com "esperava
+    /// ')'".
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        let loc = self.loc();
+
+        // `_` chega como `Name("_")`: é identificador para o léxico, e só o
+        // parser de padrão lhe dá o sentido de curinga.
+        if matches!(&self.peek().kind, TokenKind::Name(n) if n == "_") {
+            self.advance();
+            return Ok(Pattern::Wildcard { loc });
+        }
+
+        let (name, _) = self.expect_name(
+            "Esperava um padrão de braço: um nome de variante ou '_' (o braço curinga).",
+        )?;
+
+        let mut fields = Vec::new();
+        if self.eat(&TokenKind::LParen) {
+            if self.check(&TokenKind::RParen) {
+                return Err(self.erro(
+                    "Variante sem payload se escreve sem parênteses no braço: remova o '()'.",
+                ));
+            }
+            fields.push(self.parse_pattern_field()?);
+            while self.eat(&TokenKind::Comma) {
+                fields.push(self.parse_pattern_field()?);
+            }
+            self.expect(
+                &TokenKind::RParen,
+                "Esperava ')' para fechar os campos do padrão.",
+            )?;
+        }
+
+        Ok(Pattern::Variant { loc, name, fields })
+    }
+
+    /// Um nome ligado por um padrão. Sem anotação de tipo — ela vem do
+    /// `enum`.
+    fn parse_pattern_field(&mut self) -> Result<Decl, ParseError> {
+        let (name, loc) = self.expect_name("Esperava um nome para ligar o campo da variante.")?;
+
+        if self.check(&TokenKind::Colon) {
+            return Err(self.erro(
+                "O campo de um padrão não leva anotação de tipo: o tipo vem da declaração \
+                 do 'enum'.",
+            ));
+        }
+
+        Ok(Decl {
+            loc,
+            name,
+            r#type: None,
+            option: false,
+        })
+    }
+
+    /// O bloco de um braço de `match` em posição de comando, que termina no
+    /// `end` do `match` ou no início do braço seguinte.
+    ///
+    /// A fronteira entre braços não tem token próprio (não há `elseif` do
+    /// `match`), e um padrão começa com um `Name` — exatamente como uma
+    /// chamada ou uma atribuição. Daí [`Parser::inicia_braco_de_match`]:
+    /// uma varredura à frente, sem consumir token nem desfazer parse —
+    /// olhar não é backtracking.
+    fn parse_match_arm_block(&mut self) -> Result<Stat, ParseError> {
+        let loc = self.loc();
+        let mut stats = Vec::new();
+        while !self.check(&TokenKind::End)
+            && !self.check(&TokenKind::Eof)
+            && !self.inicia_braco_de_match()
+        {
+            stats.push(self.parse_stat()?);
+        }
+        Ok(Stat::StatBlock { loc, stats })
+    }
+
+    /// Decide, olhando à frente sem consumir, se a posição atual começa um
+    /// braço de `match` — isto é, se é `_ then`, `Nome then` ou
+    /// `Nome ( ... ) then`.
+    ///
+    /// O caso com parênteses é o único que exige varrer mais de dois tokens,
+    /// e o faz contando profundidade até o `)` que fecha: a lista de campos
+    /// de um padrão é plana (só nomes e vírgulas), mas contar é mais barato
+    /// que provar que é plana, e não depende dessa garantia continuar
+    /// valendo.
+    fn inicia_braco_de_match(&self) -> bool {
+        if !matches!(self.peek().kind, TokenKind::Name(_)) {
+            return false;
+        }
+
+        if matches!(self.peek2().kind, TokenKind::Then) {
+            return true;
+        }
+
+        if !matches!(self.peek2().kind, TokenKind::LParen) {
+            return false;
+        }
+
+        let mut i = self.pos + 2;
+        let mut profundidade = 1usize;
+        while i < self.tokens.len() {
+            match self.tokens[i].kind {
+                TokenKind::LParen => profundidade += 1,
+                TokenKind::RParen => {
+                    profundidade -= 1;
+                    if profundidade == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1).map(|t| &t.kind),
+                            Some(TokenKind::Then)
+                        );
+                    }
+                }
+                // Um `end` ou um `then` solto antes do fecha-parênteses quer
+                // dizer que os parênteses não fecham: não é braço, e o erro
+                // de sintaxe aparece onde ele realmente está.
+                TokenKind::End | TokenKind::Then | TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     /// `while exp do block end`
@@ -1073,6 +1345,10 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Name(_) | TokenKind::LParen => self.parse_suffixed_exp(),
             TokenKind::LCurly => self.parse_init_list(),
+            // `match` também é expressão (T75): `local r = match e with ... end`.
+            // Não há ambiguidade com o comando — `parse_stat` consome o
+            // `match` antes de chegar aqui.
+            TokenKind::KwMatch => self.parse_exp_match(loc),
             _ => Err(self.erro("Esperava uma expressão.")),
         }
     }
@@ -3202,5 +3478,393 @@ end"#;
     fn parse_cast_sem_tipo_erra() {
         let err = parse_exp_source("x as").unwrap_err();
         assert!(!err.message.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // T75: `enum` e `match`.
+    // ------------------------------------------------------------------
+
+    fn enum_da_fonte(source: &str) -> (String, Vec<crate::ast::Variant>) {
+        let program = parse_source(source).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelEnum { name, variants, .. } = &program[0] else {
+            panic!("esperava TopLevelEnum, obteve {:?}", program[0]);
+        };
+        (name.clone(), variants.clone())
+    }
+
+    /// A declaração central da fase: variante sem payload, com um campo e
+    /// com três — a última **recursiva**, que é o motivo de ser do `enum`.
+    #[test]
+    fn enum_com_e_sem_payload_produz_variantes_posicionais() {
+        let (name, variants) = enum_da_fonte(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             \x20   ExpBinop(string, Exp, Exp)\n\
+             end",
+        );
+
+        assert_eq!(name, "Exp");
+        assert_eq!(variants.len(), 3);
+
+        assert_eq!(variants[0].name, "ExpNil");
+        assert!(
+            variants[0].fields.is_empty(),
+            "variante sem parênteses não tem campo"
+        );
+
+        assert_eq!(variants[1].name, "ExpInteger");
+        assert!(matches!(
+            variants[1].fields.as_slice(),
+            [Type::TypeInteger { .. }]
+        ));
+
+        assert_eq!(variants[2].name, "ExpBinop");
+        assert_eq!(variants[2].fields.len(), 3);
+        assert!(matches!(variants[2].fields[0], Type::TypeString { .. }));
+        // A recursão é só um `TypeName` para o parser: quem a permite de
+        // propósito é o checker (decisão técnica 6 do PRD.md).
+        assert!(
+            matches!(&variants[2].fields[1], Type::TypeName { name, .. } if name == "Exp"),
+            "campo recursivo deveria ser TypeName(\"Exp\"), obteve {:?}",
+            variants[2].fields[1]
+        );
+    }
+
+    /// Campos de variante são posicionais — só tipos compostos também valem,
+    /// pelo mesmo `parse_type` de sempre.
+    #[test]
+    fn variante_aceita_tipo_composto_no_campo() {
+        let (_, variants) = enum_da_fonte("enum Lista\n    Cheia({integer})\nend");
+        assert!(matches!(
+            variants[0].fields.as_slice(),
+            [Type::TypeArray { .. }]
+        ));
+    }
+
+    #[test]
+    fn enum_sem_variante_produz_erro_claro() {
+        let err = parse_source("enum Vazio\nend").unwrap_err();
+        assert!(
+            err.message.contains("pelo menos uma variante"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    /// Parênteses vazios não são sinônimo de variante sem payload: a
+    /// mensagem diz o que fazer, não só que está errado.
+    #[test]
+    fn variante_com_parenteses_vazios_produz_erro_claro() {
+        let err = parse_source("enum Exp\n    ExpNil()\nend").unwrap_err();
+        assert!(
+            err.message.contains("sem parênteses"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn enum_sem_end_produz_erro_sem_panic() {
+        let err = parse_source("enum Exp\n    ExpNil\n").unwrap_err();
+        assert!(
+            err.message.contains("'end'"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    /// A decisão de design mais consequente da T75: `ExpInteger(42)` colide
+    /// sintaticamente com uma chamada de função, e o parser **não** tenta
+    /// desambiguar — produz `ExpCall` e deixa a decisão para o checker
+    /// (T76), como `{...}` já é desambiguado por contexto em
+    /// `check_init_list`. É o que evita backtracking.
+    #[test]
+    fn construcao_de_variante_produz_expcall_como_qualquer_chamada() {
+        let exp =
+            parse_exp_source("ExpInteger(42)").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+
+        let Exp::ExpCall {
+            exp: callee, args, ..
+        } = &exp
+        else {
+            panic!("esperava ExpCall, obteve {exp:?}");
+        };
+        assert!(
+            matches!(&**callee, Exp::ExpVar { var, .. }
+                if matches!(&**var, Var::VarName { name, .. } if name == "ExpInteger")),
+            "chamado inesperado: {callee:?}"
+        );
+        let Args::ArgsFunc { args, .. } = args else {
+            panic!("esperava ArgsFunc");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [Exp::ExpInteger { value: 42, .. }]
+        ));
+    }
+
+    fn match_stat_da_fonte(source: &str) -> (Exp, Vec<MatchArm<Stat>>) {
+        let stats = stats_da_primeira_funcao(source);
+        let Stat::StatMatch { exp, arms, .. } = &stats[0] else {
+            panic!("esperava StatMatch, obteve {:?}", stats[0]);
+        };
+        ((**exp).clone(), arms.clone())
+    }
+
+    /// `match` como comando, com os campos ligados a nomes locais e sem
+    /// braço curinga.
+    #[test]
+    fn match_statement_liga_campos_e_dispensa_curinga() {
+        let (escrutinado, arms) = match_stat_da_fonte(
+            "function f(e: Exp): integer\n\
+             \x20   match e with\n\
+             \x20       ExpNil then\n\
+             \x20           imprima(0)\n\
+             \x20       ExpBinop(op, l, r) then\n\
+             \x20           imprima(1)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(
+            matches!(&escrutinado, Exp::ExpVar { var, .. }
+                if matches!(&**var, Var::VarName { name, .. } if name == "e")),
+            "escrutinado inesperado: {escrutinado:?}"
+        );
+        assert_eq!(arms.len(), 2);
+
+        let Pattern::Variant { name, fields, .. } = &arms[0].pattern else {
+            panic!("esperava Pattern::Variant, obteve {:?}", arms[0].pattern);
+        };
+        assert_eq!(name, "ExpNil");
+        assert!(fields.is_empty());
+
+        let Pattern::Variant { name, fields, .. } = &arms[1].pattern else {
+            panic!("esperava Pattern::Variant, obteve {:?}", arms[1].pattern);
+        };
+        assert_eq!(name, "ExpBinop");
+        let ligados: Vec<&str> = fields.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(ligados, vec!["op", "l", "r"]);
+        // O tipo do campo vem da declaração do `enum`, nunca do padrão.
+        assert!(fields.iter().all(|d| d.r#type.is_none()));
+
+        // O corpo de cada braço é um bloco, e a fronteira entre eles caiu
+        // no lugar certo: um comando em cada.
+        for arm in &arms {
+            let Stat::StatBlock { stats, .. } = &arm.body else {
+                panic!("esperava StatBlock no corpo do braço");
+            };
+            assert_eq!(stats.len(), 1);
+        }
+    }
+
+    /// O braço curinga `_` chega ao lexer como `Name("_")` e só o parser de
+    /// padrão lhe dá o sentido de curinga.
+    #[test]
+    fn match_com_curinga_produz_pattern_wildcard() {
+        let (_, arms) = match_stat_da_fonte(
+            "function f(e: Exp): integer\n\
+             \x20   match e with\n\
+             \x20       ExpNil then\n\
+             \x20           imprima(0)\n\
+             \x20       _ then\n\
+             \x20           imprima(1)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert_eq!(arms.len(), 2);
+        assert!(matches!(arms[1].pattern, Pattern::Wildcard { .. }));
+    }
+
+    /// A armadilha do corpo de braço: um padrão começa com `Name`, como uma
+    /// chamada de função. `g(x)` na última linha do braço é comando, e
+    /// `ExpBinop(op, l, r) then` é braço novo — o lookahead de
+    /// `inicia_braco_de_match` é o que separa os dois.
+    #[test]
+    fn chamada_no_fim_do_braco_nao_vira_braco_novo() {
+        let (_, arms) = match_stat_da_fonte(
+            "function f(e: Exp): integer\n\
+             \x20   match e with\n\
+             \x20       ExpNil then\n\
+             \x20           g(x)\n\
+             \x20           h(y)\n\
+             \x20       ExpBinop(op, l, r) then\n\
+             \x20           g(x)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert_eq!(arms.len(), 2, "braços: {arms:?}");
+        let Stat::StatBlock { stats, .. } = &arms[0].body else {
+            panic!("esperava StatBlock");
+        };
+        assert_eq!(stats.len(), 2, "as duas chamadas ficam no primeiro braço");
+        assert!(stats.iter().all(|s| matches!(s, Stat::StatCall { .. })));
+    }
+
+    /// A vizinhança da armadilha anterior: uma **atribuição** no fim do
+    /// braço também começa com `Name`, e o token seguinte (`=`, `[`, `.`)
+    /// é o que a separa de um padrão — sem precisar da varredura.
+    #[test]
+    fn atribuicao_no_fim_do_braco_nao_vira_braco_novo() {
+        let (_, arms) = match_stat_da_fonte(
+            "function f(e: Exp, v: {integer}): integer\n\
+             \x20   match e with\n\
+             \x20       ExpNil then\n\
+             \x20           v[1] = 0\n\
+             \x20       ExpInteger(n) then\n\
+             \x20           imprima(1)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert_eq!(arms.len(), 2, "braços: {arms:?}");
+        let Stat::StatBlock { stats, .. } = &arms[0].body else {
+            panic!("esperava StatBlock");
+        };
+        assert!(
+            matches!(stats.as_slice(), [Stat::StatAssign { .. }]),
+            "a atribuição fica no primeiro braço: {stats:?}"
+        );
+    }
+
+    /// `match` como expressão: o corpo de cada braço é uma expressão, e a
+    /// fronteira entre braços não precisa de lookahead nenhum.
+    #[test]
+    fn match_como_expressao_produz_expmatch_com_corpo_de_expressao() {
+        let exp = parse_exp_source(
+            "match e with\n\
+             \x20   ExpInteger(n) then n\n\
+             \x20   _ then 0\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+
+        let Exp::ExpMatch { arms, .. } = &exp else {
+            panic!("esperava ExpMatch, obteve {exp:?}");
+        };
+        assert_eq!(arms.len(), 2);
+
+        let Pattern::Variant { name, fields, .. } = &arms[0].pattern else {
+            panic!("esperava Pattern::Variant");
+        };
+        assert_eq!(name, "ExpInteger");
+        assert_eq!(fields.len(), 1);
+        assert!(
+            matches!(&arms[0].body, Exp::ExpVar { var, .. }
+                if matches!(&**var, Var::VarName { name, .. } if name == "n")),
+            "corpo inesperado: {:?}",
+            arms[0].body
+        );
+
+        assert!(matches!(arms[1].pattern, Pattern::Wildcard { .. }));
+        assert!(matches!(arms[1].body, Exp::ExpInteger { value: 0, .. }));
+    }
+
+    #[test]
+    fn match_sem_with_produz_erro_claro() {
+        let err = parse_source(
+            "function f(e: Exp): integer\n\
+             \x20   match e\n\
+             \x20       ExpNil then\n\
+             \x20           imprima(0)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("'with'"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn braco_sem_then_produz_erro_claro() {
+        let err = parse_source(
+            "function f(e: Exp): integer\n\
+             \x20   match e with\n\
+             \x20       ExpNil\n\
+             \x20           imprima(0)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("'then'"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn match_sem_braco_produz_erro_claro() {
+        let err = parse_source(
+            "function f(e: Exp): integer\n    match e with\n    end\n    return 0\nend",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("pelo menos um braço"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    /// O tipo de um campo ligado vem do `enum`; escrevê-lo no padrão seria
+    /// repetição que poderia divergir — e a mensagem diz a razão.
+    #[test]
+    fn campo_de_padrao_com_anotacao_de_tipo_produz_erro_claro() {
+        let err = parse_source(
+            "function f(e: Exp): integer\n\
+             \x20   match e with\n\
+             \x20       ExpInteger(n: integer) then\n\
+             \x20           imprima(0)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("não leva anotação de tipo"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    /// `match` aninhado dentro de um braço: o `end` interno fecha o `match`
+    /// de dentro, não o de fora.
+    #[test]
+    fn match_aninhado_em_braco_fecha_no_end_certo() {
+        let (_, arms) = match_stat_da_fonte(
+            "function f(e: Exp, o: Exp): integer\n\
+             \x20   match e with\n\
+             \x20       ExpBinop(op, l, r) then\n\
+             \x20           match o with\n\
+             \x20               ExpNil then\n\
+             \x20                   imprima(0)\n\
+             \x20           end\n\
+             \x20       _ then\n\
+             \x20           imprima(1)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert_eq!(arms.len(), 2);
+        let Stat::StatBlock { stats, .. } = &arms[0].body else {
+            panic!("esperava StatBlock");
+        };
+        assert!(
+            matches!(stats.as_slice(), [Stat::StatMatch { .. }]),
+            "o braço externo contém só o `match` interno: {stats:?}"
+        );
     }
 }
