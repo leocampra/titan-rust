@@ -435,6 +435,63 @@ fn completar_data_ponto_lista_funcoes_do_modulo() {
     client.shutdown_and_exit();
 }
 
+/// T72: o autocomplete de módulo resolve pelo nome **real** do módulo, não
+/// pelo nome escrito antes do `.` — sob alias (`import data as d`),
+/// completar `d.` lista as mesmas funções que `data.` listaria.
+#[test]
+fn completar_alias_de_modulo_lista_as_mesmas_funcoes() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    // Linha 2: `    d.` — cursor logo após o `.`, coluna 6 (0-idx).
+    let source = "import data as d
+\
+                  function main(args: {string}): integer
+\
+                  \x20   d.
+\
+                  \x20   return 0
+\
+                  end";
+    let uri = "file:///teste_completar_alias.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    client.wait_for_publish_diagnostics();
+
+    let response = client.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": 2, "character": 6},
+        }),
+    );
+
+    let labels = completion_labels(&response);
+    for esperado in ["read_csv", "soma", "media", "minimo", "maximo"] {
+        assert!(
+            labels.contains(&esperado.to_string()),
+            "completar 'd.' (alias de data) deveria listar '{esperado}', obteve: {labels:?}"
+        );
+    }
+
+    client.shutdown_and_exit();
+}
+
 /// Segundo contexto da T50: completar `df.` onde `df: data.DataFrame` lista
 /// os métodos do tipo opaco, não as funções de módulo.
 #[test]
@@ -547,6 +604,84 @@ fn completar_em_posicao_de_expressao_lista_escopo_builtins_e_keywords() {
             "completar em posição de expressão deveria listar '{esperado}', obteve: {labels:?}"
         );
     }
+
+    client.shutdown_and_exit();
+}
+
+/// T73: um `.titan` com `foreign function` não gera diagnóstico nenhum — o
+/// LSP reusa o mesmo pipeline do `titanc`
+/// ([ADR 0018](../../../docs/adr/0018-titanc-lib-lsp-reusa-pipeline.md)),
+/// então a construção nova chega ao editor sem trabalho no servidor.
+#[test]
+fn foreign_function_valida_nao_gera_diagnostico() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    let source = "foreign function abs(n: integer): integer\n\nfunction main(args: {string}): integer\n    return abs(-7)\nend";
+    let uri = "file:///teste_foreign_ok.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publish = client.wait_for_publish_diagnostics();
+    let diagnostics = publish["params"]["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics.is_empty(),
+        "`foreign function` válida não deveria gerar diagnósticos: {diagnostics:?}"
+    );
+
+    client.shutdown_and_exit();
+}
+
+/// T73: tipo composto na fronteira de FFI aparece como diagnóstico no editor,
+/// em português — o mesmo erro que o `titanc` dá na linha de comando.
+#[test]
+fn foreign_function_com_tipo_composto_na_fronteira_gera_diagnostico() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    let source = "foreign function soma(xs: {integer}): integer\n\nfunction main(args: {string}): integer\n    return 0\nend";
+    let uri = "file:///teste_foreign_erro.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publish = client.wait_for_publish_diagnostics();
+    let diagnostics = publish["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "obteve: {diagnostics:?}");
+    let message = diagnostics[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("fronteira de FFI"),
+        "diagnóstico devia citar a fronteira: {message}"
+    );
 
     client.shutdown_and_exit();
 }

@@ -48,7 +48,14 @@
 //!   dentro do ramo. `T?` é invariante em `compatible` (ADR 0008) e
 //!   continua sendo: o que a T68 acrescenta é injeção, não variância.
 //!
-//! Tudo fora do subconjunto (`foreign import`, métodos com `:`, cast `as`)
+//! A T73 acrescenta `foreign function`: a assinatura de uma função externa é
+//! resolvida como a de qualquer função top-level, e o que é próprio dela é a
+//! **fronteira** — só escalares e `string` atravessam
+//! ([`Checker::check_foreign_boundary_type`]), e o nome vai para
+//! `Checker::foreigns`, de onde `resolve_callee` o converte em
+//! [`Callee::Foreign`] para o codegen emitir `unsafe extern "C"` (ADR 0025).
+//!
+//! Tudo fora do subconjunto (métodos de `record`, módulos de usuário)
 //! produz um erro semântico claro — nunca panic.
 
 use std::collections::{HashMap, HashSet};
@@ -206,6 +213,15 @@ pub enum TypedTopLevel {
         loc: Loc,
         name: String,
         fields: Vec<(String, Type)>,
+    },
+    /// `foreign function abs(n: integer): integer` (T73) — vira um bloco
+    /// `unsafe extern "C"` no Rust gerado. Não tem corpo, e por isso não
+    /// carrega `body` nem `islocal`: o símbolo vem do linker.
+    ForeignFunc {
+        loc: Loc,
+        name: String,
+        params: Vec<(String, Type)>,
+        rettypes: Vec<Type>,
     },
 }
 
@@ -439,6 +455,12 @@ pub struct TypedExp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Callee {
     Direct(String),
+    /// Chamada a uma função declarada por `foreign function` (T73). Só o
+    /// codegen diferencia de [`Callee::Direct`] — a tipagem dos argumentos é
+    /// a mesma —, e a diferença é toda de emissão: sem mangling (o nome é do
+    /// símbolo do linker), envolta em `unsafe`, e com `string` convertida
+    /// para `CString` na chamada.
+    Foreign(String),
     Module {
         module: String,
         name: String,
@@ -639,13 +661,19 @@ pub struct SymbolUse {
 }
 
 /// Um símbolo em escopo — o que o autocomplete de posição de expressão
-/// oferece (T50): nome, tipo formatado (para o `detail` do item) e se é
-/// módulo (`import data`, sem membro `.` de valor — completado à parte).
+/// oferece (T50): nome, tipo formatado (para o `detail` do item) e, quando
+/// é módulo (`import data`, sem membro `.` de valor — completado à parte),
+/// o **nome real** do módulo.
+///
+/// `module` guarda esse nome real em vez de um simples `is_module: bool`
+/// porque desde a T72 o nome do símbolo pode ser um alias (`d` em `import
+/// data as d`) — e é o nome real que resolve contra
+/// `capabilities::lookup_module`. `None` para tudo que não é módulo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopedSymbol {
     pub name: String,
     pub type_name: String,
-    pub is_module: bool,
+    pub module: Option<String>,
 }
 
 /// Todos os símbolos visíveis num ponto do programa — snapshot tirado ao
@@ -703,9 +731,15 @@ struct Checker {
     /// `resolve_type`.
     records: HashMap<String, Type>,
     /// Módulos importados (`import data`, T38), no molde de `records`:
-    /// nome Titan → entrada da tabela de capabilities (`capabilities.rs`,
-    /// T37), consultada por `resolve_type` (`data.DataFrame`) e por
-    /// `check_call`/`check_var` (T39/T40) para membros do módulo.
+    /// **nome local** → entrada da tabela de capabilities
+    /// (`capabilities.rs`, T37), consultada por `resolve_type`
+    /// (`data.DataFrame`) e por `check_call`/`check_var` (T39/T40) para
+    /// membros do módulo.
+    ///
+    /// A chave é o nome *local* porque é ele que o programa escreve à
+    /// esquerda do `.` — com `import data as d` (T72) a chave é `d`. O nome
+    /// real do módulo, que o codegen precisa para achar o caminho Rust, sai
+    /// de `Capability::titan_name`, nunca desta chave.
     modules: HashMap<String, &'static crate::capabilities::Capability>,
     /// Índice colateral de usos resolvidos, para hover e go-to-definition
     /// (T49) — ver [`SymbolUse`].
@@ -728,6 +762,16 @@ struct Checker {
     /// checagem. Incrementada/decrementada em `check_stat` ao entrar/sair do
     /// bloco do laço.
     loop_depth: usize,
+    /// Nomes declarados por `foreign function` (T73), no molde de `modules`.
+    ///
+    /// Um símbolo externo é, para escopo e atribuição, idêntico a uma função
+    /// top-level — daí continuar sendo [`SymbolKind::Global`] em vez de
+    /// ganhar uma variante que forçaria um braço a mais em todo `match` de
+    /// `SymbolKind` sem dizer nada de novo. O que **é** diferente é só a
+    /// emissão (`unsafe`, `extern "C"`, `CString`), e é isso que este
+    /// conjunto carrega até `resolve_callee`, que o converte em
+    /// [`Callee::Foreign`].
+    foreigns: HashSet<String>,
 }
 
 /// Loc sentinela para símbolos sem declaração em arquivo Titan (builtins da
@@ -759,6 +803,7 @@ impl Checker {
             assigned: HashSet::new(),
             records: HashMap::new(),
             modules: HashMap::new(),
+            foreigns: HashSet::new(),
             uses: Vec::new(),
             scopes: Vec::new(),
             last_loc: Loc { line: 0, col: 0 },
@@ -786,7 +831,10 @@ impl Checker {
             .visible_symbols()
             .into_iter()
             .map(|(name, symbol)| ScopedSymbol {
-                is_module: matches!(symbol.kind, SymbolKind::Module { .. }),
+                module: match &symbol.kind {
+                    SymbolKind::Module { name } => Some(name.clone()),
+                    _ => None,
+                },
                 type_name: type_name(&symbol.ty),
                 name,
             })
@@ -1093,18 +1141,27 @@ impl Checker {
             // Já processado por `collect_records`, que roda antes (T29 —
             // duas sub-passadas: records primeiro, funções depois).
             TopLevel::TopLevelRecord { .. } => {}
+            // `import data` e `import data as d` (T72). O nome que colide,
+            // que vira símbolo e que chaveia `self.modules` é sempre o
+            // **local** (`localname`); `modname` só serve para achar a
+            // capability. Sem alias os dois são iguais, e o comportamento
+            // da T38 fica idêntico.
             TopLevel::TopLevelImport {
-                loc, modname, ..
+                loc,
+                localname,
+                modname,
             } => {
-                if self.st.find_symbol(modname).is_some() || self.modules.contains_key(modname) {
-                    self.error(*loc, format!("'{modname}' já foi declarado antes."));
+                if self.st.find_symbol(localname).is_some()
+                    || self.modules.contains_key(localname)
+                {
+                    self.error(*loc, format!("'{localname}' já foi declarado antes."));
                     return;
                 }
                 match crate::capabilities::lookup_module(modname) {
                     Some(capability) => {
-                        self.modules.insert(modname.clone(), capability);
+                        self.modules.insert(localname.clone(), capability);
                         self.st.add_symbol(
-                            modname,
+                            localname,
                             Type::Invalid,
                             SymbolKind::Module {
                                 name: modname.clone(),
@@ -1123,13 +1180,110 @@ impl Checker {
                     }
                 }
             }
-            TopLevel::TopLevelForeignImport { loc, .. } => {
-                self.error(*loc, "`foreign import` não é suportado nesta fase.");
+            // `foreign function abs(n: integer): integer` (T73). A
+            // assinatura é resolvida como a de qualquer função top-level —
+            // a diferença toda está na **fronteira**: só escalares e
+            // `string` atravessam (ADR 0025), e cada violação sai com erro
+            // em português aqui, antes de o rustc ver o `extern "C"`.
+            TopLevel::TopLevelForeignFunc {
+                loc,
+                name,
+                params,
+                rettypes,
+            } => {
+                if self.st.find_symbol(name).is_some() {
+                    self.error(*loc, format!("'{name}' já foi declarado antes."));
+                    return;
+                }
+                let param_types = match self.resolve_param_types(params) {
+                    Some(types) => types,
+                    None => return,
+                };
+                let ret_types = match self.resolve_types(rettypes) {
+                    Some(types) => types,
+                    None => return,
+                };
+
+                // Erros de fronteira são acumulados, não abortam no
+                // primeiro: uma assinatura com dois tipos inválidos deve
+                // apontar os dois, como o resto do checker faz.
+                let mut ok = true;
+                for (param, ty) in params.iter().zip(param_types.iter()) {
+                    if !self.check_foreign_boundary_type(
+                        param.loc,
+                        ty,
+                        &format!("o parâmetro '{}' de `foreign function {name}`", param.name),
+                    ) {
+                        ok = false;
+                    }
+                }
+                // Retorno `nil` é a função externa sem valor de retorno
+                // (`void` em C) — vale, e só nessa posição.
+                if ret_types.len() > 1 {
+                    self.error(
+                        *loc,
+                        format!(
+                            "`foreign function {name}` não pode ter mais de um retorno: \
+                             a fronteira C devolve um valor só."
+                        ),
+                    );
+                    ok = false;
+                } else if let Some(ret) = ret_types.first()
+                    && *ret != Type::Nil
+                    && !self.check_foreign_boundary_type(
+                        *loc,
+                        ret,
+                        &format!("o retorno de `foreign function {name}`"),
+                    )
+                {
+                    ok = false;
+                }
+                if !ok {
+                    return;
+                }
+
+                let fn_ty = Type::Function {
+                    params: param_types,
+                    rettypes: ret_types,
+                };
+                self.st
+                    .add_symbol(name, fn_ty.clone(), SymbolKind::Global, *loc);
+                self.foreigns.insert(name.clone());
+                self.record_use(*loc, *loc, name, &fn_ty);
             }
             TopLevel::TopLevelMethod { loc, .. } | TopLevel::TopLevelStatic { loc, .. } => {
                 self.error(*loc, "métodos não são suportados nesta fase.");
             }
         }
+    }
+
+    /// Tipos que atravessam a fronteira de FFI (T73, ADR 0025): escalares
+    /// (`integer`, `float`, `boolean`) e `string`. Devolve `true` quando o
+    /// tipo passa; senão registra o erro e devolve `false`.
+    ///
+    /// A lista é curta de propósito. `{T}`, `{K:V}` e `record` têm layout
+    /// escolhido pelo Rust (`Vec`, `HashMap`, `struct` sem `#[repr(C)]`),
+    /// que nenhuma função C sabe ler; `value` é um enum boxado do runtime;
+    /// `T?` é `Option<T>`, cujo layout só é garantido em casos que não vale
+    /// a pena enumerar aqui; `nil` só faz sentido como "sem retorno". Passar
+    /// qualquer um deles compilaria e leria memória errada — por isso a
+    /// recusa é do checker, com mensagem em português, e não do rustc.
+    fn check_foreign_boundary_type(&mut self, loc: Loc, ty: &Type, onde: &str) -> bool {
+        if matches!(
+            ty,
+            Type::Integer | Type::Float | Type::Boolean | Type::String
+        ) {
+            return true;
+        }
+        self.error(
+            loc,
+            format!(
+                "{onde} é {}, que não atravessa a fronteira de FFI; \
+                 só integer, float, boolean e string atravessam.",
+                type_name(ty)
+            ),
+        );
+        false
     }
 
     fn resolve_param_types(&mut self, params: &[ast::Decl]) -> Option<Vec<Type>> {
@@ -1250,6 +1404,10 @@ impl Checker {
                     None
                 }
             },
+            // `module` aqui é o nome **local** escrito no programa (`d` em
+            // `import data as d`, T72); `Type::Opaque::module` guarda o nome
+            // real do módulo, que é o que o codegen resolve contra
+            // `capabilities::lookup_module`.
             ast::Type::TypeQualName { loc, module, name } => {
                 let Some(capability) = self.modules.get(module) else {
                     self.error(*loc, format!("módulo '{module}' não foi importado."));
@@ -1257,7 +1415,7 @@ impl Checker {
                 };
                 match capability.find_opaque(name) {
                     Some(opaque) => Some(Type::Opaque {
-                        module: module.clone(),
+                        module: capability.titan_name.to_string(),
                         name: name.clone(),
                         rust_path: opaque.rust_path.to_string(),
                     }),
@@ -1380,6 +1538,39 @@ impl Checker {
                     loc: *loc,
                     name: name.clone(),
                     fields,
+                })
+            }
+            // `foreign function` (T73): a passada 1 já resolveu e validou
+            // a assinatura inteira (inclusive a fronteira de FFI). Não há
+            // corpo para checar, então aqui só reaproveitamos o símbolo —
+            // se ele não está em `self.foreigns`, já foi rejeitado lá.
+            TopLevel::TopLevelForeignFunc {
+                loc, name, params, ..
+            } => {
+                if !self.foreigns.contains(name) {
+                    return None;
+                }
+                let Some(Symbol {
+                    ty:
+                        Type::Function {
+                            params: param_types,
+                            rettypes: ret_types,
+                        },
+                    ..
+                }) = self.st.find_symbol(name).cloned()
+                else {
+                    return None;
+                };
+                let named_params = params
+                    .iter()
+                    .zip(param_types)
+                    .map(|(p, t)| (p.name.clone(), t))
+                    .collect();
+                Some(TypedTopLevel::ForeignFunc {
+                    loc: *loc,
+                    name: name.clone(),
+                    params: named_params,
+                    rettypes: ret_types,
                 })
             }
             // Já reportado como erro na passada 1.
@@ -3710,89 +3901,48 @@ valor precisam de nomes diferentes.",
                         rettypes: rettypes.clone(),
                     },
                 );
-                Some((Callee::Direct(name.clone()), name.clone(), params, rettypes))
+                let callee = if self.foreigns.contains(name) {
+                    Callee::Foreign(name.clone())
+                } else {
+                    Callee::Direct(name.clone())
+                };
+                Some((callee, name.clone(), params, rettypes))
             }
             // `data.read_csv(...)` (T39): base é o símbolo de um módulo
             // importado — resolve contra a tabela de capabilities em vez da
             // pilha de escopos.
+            //
+            // `local_name` é o que o programa escreveu (`d` em `import data
+            // as d`, T72) e é o que aparece nas mensagens de erro; o
+            // `Callee::Module` carrega o nome real do módulo, que é o que o
+            // codegen resolve contra `capabilities::lookup_module`.
             Var::VarDot { exp, name, .. } if self.dot_base_module(exp).is_some() => {
-                let module = self.dot_base_module(exp).expect("checado acima");
+                let local_name = self.dot_base_module(exp).expect("checado acima");
                 let capability = *self
                     .modules
-                    .get(&module)
+                    .get(&local_name)
                     .expect("dot_base_module só devolve módulo importado");
                 let Some(function) = capability.find_function(name) else {
                     self.error(
                         *loc,
-                        format!("o módulo '{module}' não tem função '{name}'."),
+                        format!("o módulo '{local_name}' não tem função '{name}'."),
                     );
                     return None;
                 };
+                let module = capability.titan_name.to_string();
                 Some((
                     Callee::Module {
                         module: module.clone(),
                         name: name.clone(),
                     },
-                    format!("{module}.{name}"),
+                    format!("{local_name}.{name}"),
                     function.params.to_vec(),
                     vec![requalify_rettype(&function.rettype, &module)],
                 ))
             }
-            // `df.soma(...)` (T40): base é uma expressão cujo *tipo* é
-            // `Opaque` — resolve o método contra a capability do módulo que
-            // originou o opaco (`Type::Opaque::module`, preenchido por
-            // `requalify_rettype` em T39). O receptor conta como uso mutável
-            // pela mesma regra de `checker.rs:2079-2110` (`is_composite`
-            // inclui `Opaque` — ver `is_composite` abaixo).
-            Var::VarDot { exp, name, .. } => {
-                let receiver = self.check_exp(exp, None)?;
-                let Type::Opaque {
-                    module,
-                    name: type_name_,
-                    ..
-                } = &receiver.ty
-                else {
-                    self.error(
-                        *loc,
-                        format!(
-                            "só é possível chamar um nome de função diretamente nesta fase, \
-                             encontrado {}.",
-                            type_name(&receiver.ty)
-                        ),
-                    );
-                    return None;
-                };
-                let capability = crate::capabilities::lookup_module(module)
-                    .expect("Opaque só é construído com módulo de capability existente");
-                let Some(method) = capability.find_method(type_name_, name) else {
-                    self.error(
-                        *loc,
-                        format!("o tipo '{module}.{type_name_}' não tem método '{name}'."),
-                    );
-                    return None;
-                };
-                let module = module.clone();
-                let recv_name = format!("{module}.{type_name_}");
-                if let Exp::ExpVar { var, .. } = exp.as_ref()
-                    && let Some(root_name) = root_var_name(var)
-                    && let Some(Symbol {
-                        kind: SymbolKind::Local { decl_id },
-                        ..
-                    }) = self.st.find_symbol(&root_name)
-                {
-                    self.assigned.insert(*decl_id);
-                }
-                Some((
-                    Callee::Method {
-                        recv: Box::new(receiver),
-                        module: module.clone(),
-                        name: name.clone(),
-                    },
-                    format!("{recv_name}.{name}"),
-                    method.params.to_vec(),
-                    vec![requalify_rettype(&method.rettype, &module)],
-                ))
-            }
+            // `df.soma(...)` (T40) — delegado a `resolve_method_callee`,
+            // que a forma com dois-pontos (`df:soma(...)`, T72) também usa.
+            Var::VarDot { exp, name, .. } => self.resolve_method_callee(loc, exp, name),
             _ => {
                 self.error(
                     *loc,
@@ -3801,6 +3951,71 @@ valor precisam de nomes diferentes.",
                 None
             }
         }
+    }
+
+    /// Resolve a chamada de método sobre um receptor de tipo `Opaque` — o
+    /// ponto em que `df.soma(...)` (T40) e `df:soma(...)` (T72) se
+    /// encontram. As duas formas diferem só em **onde o parser guarda o
+    /// nome do método** (`Var::VarDot` versus `Args::ArgsMethod`); daqui
+    /// para baixo são a mesma coisa, e produzem o mesmo `Callee::Method`.
+    ///
+    /// O método é resolvido contra a capability do módulo que originou o
+    /// opaco (`Type::Opaque::module`, preenchido por `requalify_rettype` em
+    /// T39). O receptor conta como uso mutável pela mesma regra de
+    /// `check_assign` (`is_composite` inclui `Opaque`).
+    fn resolve_method_callee(
+        &mut self,
+        loc: &Loc,
+        recv_exp: &Exp,
+        name: &str,
+    ) -> Option<(Callee, String, Vec<Type>, Vec<Type>)> {
+        let receiver = self.check_exp(recv_exp, None)?;
+        let Type::Opaque {
+            module,
+            name: type_name_,
+            ..
+        } = &receiver.ty
+        else {
+            self.error(
+                *loc,
+                format!(
+                    "só é possível chamar um nome de função diretamente nesta fase, \
+                     encontrado {}.",
+                    type_name(&receiver.ty)
+                ),
+            );
+            return None;
+        };
+        let capability = crate::capabilities::lookup_module(module)
+            .expect("Opaque só é construído com módulo de capability existente");
+        let Some(method) = capability.find_method(type_name_, name) else {
+            self.error(
+                *loc,
+                format!("o tipo '{module}.{type_name_}' não tem método '{name}'."),
+            );
+            return None;
+        };
+        let module = module.clone();
+        let recv_name = format!("{module}.{type_name_}");
+        if let Exp::ExpVar { var, .. } = recv_exp
+            && let Some(root_name) = root_var_name(var)
+            && let Some(Symbol {
+                kind: SymbolKind::Local { decl_id },
+                ..
+            }) = self.st.find_symbol(&root_name)
+        {
+            self.assigned.insert(*decl_id);
+        }
+        Some((
+            Callee::Method {
+                recv: Box::new(receiver),
+                module: module.clone(),
+                name: name.to_string(),
+            },
+            format!("{recv_name}.{name}"),
+            method.params.to_vec(),
+            vec![requalify_rettype(&method.rettype, &module)],
+        ))
     }
 
     /// Se `exp` é `ExpVar(VarName(nome))` e `nome` está registrado como
@@ -3835,12 +4050,26 @@ valor precisam de nomes diferentes.",
         callee: &Exp,
         args: &Args,
     ) -> Option<(TypedExp, Vec<Type>)> {
-        let Args::ArgsFunc { args: arg_exps, .. } = args else {
-            self.error(*loc, "chamada de método não é suportada nesta fase.");
-            return None;
+        // As duas formas de chamada (T72). `ArgsFunc` é `f(x)`,
+        // `data.f(x)` e `df.f(x)` — quem é chamado está todo em `callee`.
+        // `ArgsMethod` é `df:f(x)`: o receptor é o `callee` e o nome do
+        // método vem nos argumentos, então a resolução vai direto ao braço
+        // de método, sem passar por `resolve_callee`.
+        let (callee, name, params, rettypes, arg_exps) = match args {
+            Args::ArgsFunc { args: arg_exps, .. } => {
+                let (callee, name, params, rettypes) = self.resolve_callee(loc, callee)?;
+                (callee, name, params, rettypes, arg_exps)
+            }
+            Args::ArgsMethod {
+                method,
+                args: arg_exps,
+                ..
+            } => {
+                let (callee, name, params, rettypes) =
+                    self.resolve_method_callee(loc, callee, method)?;
+                (callee, name, params, rettypes, arg_exps)
+            }
         };
-
-        let (callee, name, params, rettypes) = self.resolve_callee(loc, callee)?;
 
         let mut typed_args = Vec::with_capacity(arg_exps.len());
         let mut ok = true;
@@ -4393,7 +4622,10 @@ fn run(program: &Program) -> (Checker, TypedProgram) {
             .visible_symbols()
             .into_iter()
             .map(|(name, symbol)| ScopedSymbol {
-                is_module: matches!(symbol.kind, SymbolKind::Module { .. }),
+                module: match &symbol.kind {
+                    SymbolKind::Module { name } => Some(name.clone()),
+                    _ => None,
+                },
                 type_name: type_name(&symbol.ty),
                 name,
             })
@@ -4637,28 +4869,225 @@ mod tests {
         }
     }
 
-    #[test]
-    fn foreign_import_produz_erro_de_construcao_nao_suportada() {
-        // Mesmo espírito de um arquivo `.titan` do Titan original:
-        // `foreign import` não faz parte do subconjunto desta fase. `record`
-        // passou a ser aceito a partir da T29 — coberto por
-        // `record_vazio_e_aceito_pelo_checker` mais abaixo.
-        let loc = Loc { line: 1, col: 1 };
-        let program: Program = vec![
-            TopLevel::TopLevelForeignImport {
-                loc,
-                localname: "stdio".to_string(),
-                headername: "stdio.h".to_string(),
-            },
-            TopLevel::TopLevelRecord {
-                loc,
-                name: "Ponto".to_string(),
-                fields: vec![],
-            },
-        ];
+    // ---- T73: `foreign function` ------------------------------------------
 
-        let errs = check(&program).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("foreign import")));
+    /// Junta as mensagens de erro num texto só, para os `assert!(contains)`
+    /// abaixo não dependerem de qual erro saiu primeiro.
+    fn mensagens(errs: &[CheckError]) -> String {
+        errs.iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn foreign_function_registra_o_simbolo_e_a_chamada_tipa() {
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return abs(-7)\n\
+                      end";
+        let typed = check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+
+        // A declaração externa sobrevive até a AST tipada — é dela que o
+        // codegen tira o bloco `extern "C"`.
+        let foreign = typed
+            .iter()
+            .find_map(|t| match t {
+                TypedTopLevel::ForeignFunc {
+                    name,
+                    params,
+                    rettypes,
+                    ..
+                } => Some((name, params, rettypes)),
+                _ => None,
+            })
+            .expect("esperava um TypedTopLevel::ForeignFunc");
+        assert_eq!(foreign.0, "abs");
+        assert_eq!(foreign.1, &vec![("n".to_string(), Type::Integer)]);
+        assert_eq!(foreign.2, &vec![Type::Integer]);
+    }
+
+    #[test]
+    fn chamada_a_foreign_function_produz_callee_foreign() {
+        // O que separa `Callee::Foreign` de `Callee::Direct` é só a emissão
+        // (`unsafe`, sem mangling) — mas a distinção tem de chegar ao
+        // codegen, e é isso que este teste fixa.
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return abs(-7)\n\
+                      end";
+        let typed = check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+
+        let mut achou = false;
+        for top in &typed {
+            let TypedTopLevel::Func { body, .. } = top else {
+                continue;
+            };
+            let TypedStat::Block { stats, .. } = body.as_ref() else {
+                continue;
+            };
+            for stat in stats {
+                let TypedStat::Return { exps, .. } = stat else {
+                    continue;
+                };
+                let TypedExpKind::Call { callee, .. } = &exps[0].kind else {
+                    continue;
+                };
+                assert_eq!(*callee, Callee::Foreign("abs".to_string()));
+                achou = true;
+            }
+        }
+        assert!(achou, "esperava encontrar a chamada a `abs` no corpo de main");
+    }
+
+    #[test]
+    fn foreign_function_sem_retorno_e_aceita() {
+        // Retorno omitido é `nil`, o `void` do C — a única posição em que
+        // `nil` atravessa a fronteira.
+        let source = "foreign function sync()\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   sync()\n\
+                      \x20   return 0\n\
+                      end";
+        check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+    }
+
+    #[test]
+    fn foreign_function_com_string_na_fronteira_e_aceita() {
+        let source = "foreign function strlen(s: string): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return strlen(\"abc\")\n\
+                      end";
+        check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+    }
+
+    #[test]
+    fn foreign_function_com_array_na_fronteira_da_erro_claro() {
+        let source = "foreign function soma(xs: {integer}): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let msg = mensagens(&errs);
+        assert!(
+            msg.contains("fronteira de FFI") && msg.contains("{integer}"),
+            "mensagem devia citar a fronteira e o tipo recusado: {msg}"
+        );
+    }
+
+    #[test]
+    fn foreign_function_com_record_na_fronteira_da_erro_claro() {
+        // O caso do critério de aceite: "tipo composto na fronteira dá erro
+        // claro". `record` é o composto mais tentador, porque em C existe
+        // `struct` — mas o layout do Rust não é o do C sem `#[repr(C)]`.
+        let source = "record Ponto\n\x20   x: integer\n\x20   y: integer\nend\n\n\
+                      foreign function dist(p: Ponto): float\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let msg = mensagens(&errs);
+        assert!(
+            msg.contains("fronteira de FFI") && msg.contains("Ponto"),
+            "mensagem devia citar a fronteira e o record recusado: {msg}"
+        );
+    }
+
+    #[test]
+    fn foreign_function_com_retorno_composto_da_erro_claro() {
+        let source = "foreign function nomes(): {string}\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let msg = mensagens(&errs);
+        assert!(
+            msg.contains("fronteira de FFI") && msg.contains("o retorno"),
+            "mensagem devia citar o retorno: {msg}"
+        );
+    }
+
+    #[test]
+    fn foreign_function_com_value_na_fronteira_da_erro_claro() {
+        // `value` compila e tem representação (T70), mas é um enum boxado do
+        // runtime — nenhuma função C sabe lê-lo.
+        let source = "foreign function f(v: value): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(mensagens(&errs).contains("fronteira de FFI"));
+    }
+
+    #[test]
+    fn foreign_function_com_opcional_na_fronteira_da_erro_claro() {
+        let source = "foreign function f(n: integer?): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(mensagens(&errs).contains("fronteira de FFI"));
+    }
+
+    #[test]
+    fn foreign_function_com_dois_retornos_da_erro_claro() {
+        // A ABI C devolve um valor só; retorno múltiplo (T66) para no
+        // checker, não no rustc.
+        let source = "foreign function divmod(a: integer, b: integer): integer, integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            mensagens(&errs).contains("não pode ter mais de um retorno"),
+            "obteve: {}",
+            mensagens(&errs)
+        );
+    }
+
+    #[test]
+    fn foreign_function_acumula_os_erros_de_fronteira() {
+        // Dois parâmetros inválidos devem render dois erros, não parar no
+        // primeiro — é o que o resto do checker faz.
+        let source = "foreign function f(xs: {integer}, ys: {string}): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let fronteira = errs
+            .iter()
+            .filter(|e| e.message.contains("fronteira de FFI"))
+            .count();
+        assert_eq!(fronteira, 2, "obteve: {}", mensagens(&errs));
+    }
+
+    #[test]
+    fn foreign_function_colidindo_com_funcao_titan_da_erro_claro() {
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function abs(n: integer): integer\n\
+                      \x20   return n\n\
+                      end\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(mensagens(&errs).contains("já foi declarado antes"));
+    }
+
+    #[test]
+    fn chamada_a_foreign_function_com_argumento_de_tipo_errado_da_erro_claro() {
+        // A fronteira não relaxa a tipagem: os argumentos são checados
+        // contra a assinatura como os de qualquer função Titan.
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return abs(\"x\")\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(!errs.is_empty(), "esperava erro de tipo no argumento");
     }
 
     // ---- T38: `import data` registra o módulo -----------------------------
@@ -4967,6 +5396,221 @@ function main(args: {string}): integer
 end"#;
         let errs = check_source(source).unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("incompatível")));
+    }
+
+    // ---- T72: `import` com alias e `df:metodo()` --------------------------
+
+    /// O alias entra na symtab e resolve tipo qualificado e chamada de
+    /// módulo pelo nome local — mas o `Type::Opaque` e o `Callee::Module`
+    /// carregam o nome **real** do módulo, que é o que o codegen resolve.
+    #[test]
+    fn import_com_alias_resolve_tipo_e_chamada_pelo_nome_local() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: d.DataFrame = d.read_csv("v.csv")
+    return 0
+end"#;
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava TypedTopLevel::Func, obteve {:?}", typed[0]);
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava TypedStat::Block, obteve {body:?}");
+        };
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(
+            value.ty,
+            Type::Opaque {
+                module: "data".to_string(),
+                name: "DataFrame".to_string(),
+                rust_path: "titan_data::DataFrame".to_string(),
+            }
+        );
+        assert!(matches!(
+            &value.kind,
+            TypedExpKind::Call {
+                callee: Callee::Module { module, name },
+                ..
+            } if module == "data" && name == "read_csv"
+        ));
+    }
+
+    /// Com alias, o nome do módulo **real** deixa de estar em escopo — quem
+    /// escreveu `as d` escolheu `d`.
+    #[test]
+    fn import_com_alias_nao_deixa_o_nome_do_modulo_em_escopo() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("módulo 'data' não foi importado"))
+        );
+    }
+
+    /// Mensagem de erro de membro inexistente cita o nome **local**, que é
+    /// o que o programa escreveu.
+    #[test]
+    fn funcao_inexistente_sob_alias_cita_o_nome_local() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: d.DataFrame = d.foo("v.csv")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("o módulo 'd' não tem função 'foo'")),
+            "obteve: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn alias_colidindo_com_nome_ja_declarado_produz_erro_claro() {
+        let source = r#"import data as soma
+
+function soma(): integer
+    return 0
+end
+
+function main(args: {string}): integer
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'soma' já foi declarado antes")),
+            "obteve: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dois_aliases_para_o_mesmo_modulo_convivem() {
+        let source = r#"import data as a
+import data as b
+
+function main(args: {string}): integer
+    local df: a.DataFrame = b.read_csv("v.csv")
+    return 0
+end"#;
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    /// O critério central da T72: `df:soma(...)` produz **o mesmo**
+    /// `TypedExp` que `df.soma(...)` — mesmo `Callee::Method`, mesmo tipo.
+    #[test]
+    fn metodo_com_dois_pontos_produz_o_mesmo_typedexp_que_com_ponto() {
+        let com_ponto = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df.soma("valor")
+    return 0
+end"#;
+        let com_dois_pontos = com_ponto.replace("df.soma", "df:soma");
+
+        let typed_ponto = check_source(com_ponto).expect("forma com ponto deve tipar");
+        let typed_dois = check_source(&com_dois_pontos).expect("forma com dois-pontos deve tipar");
+
+        let valor = |typed: &[TypedTopLevel]| {
+            let TypedTopLevel::Func { body, .. } = &typed[0] else {
+                panic!("esperava TypedTopLevel::Func");
+            };
+            let TypedStat::Block { stats, .. } = body.as_ref() else {
+                panic!("esperava TypedStat::Block");
+            };
+            let TypedStat::Decl { value, .. } = &stats[1] else {
+                panic!("esperava TypedStat::Decl");
+            };
+            value.clone()
+        };
+
+        let (ponto, dois) = (valor(&typed_ponto), valor(&typed_dois));
+        // `loc` difere de propósito — as duas formas escrevem a chamada em
+        // colunas diferentes (`(` versus `:`), e é isso que o LSP deve
+        // apontar em cada uma. O que a T72 exige idêntico é o resto: mesmo
+        // tipo e mesmo `Callee::Method` com o mesmo receptor e argumentos.
+        assert_eq!(ponto.ty, dois.ty);
+        assert_eq!(ponto.kind, dois.kind);
+    }
+
+    #[test]
+    fn metodo_com_dois_pontos_sobre_nao_opaco_produz_erro_claro() {
+        let source = r#"function main(args: {string}): integer
+    local x: integer = 1
+    local y: integer = x:soma(2)
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("só é possível chamar um nome de função")),
+            "obteve: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn metodo_inexistente_com_dois_pontos_produz_o_mesmo_erro_que_com_ponto() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df:foo("valor")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'data.DataFrame' não tem método 'foo'"))
+        );
+    }
+
+    /// As duas formas convivem inclusive sob alias.
+    #[test]
+    fn dois_pontos_funciona_sob_alias() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: d.DataFrame = d.read_csv("v.csv")
+    local total: float = df:soma("valor")
+    return 0
+end"#;
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
     }
 
     #[test]

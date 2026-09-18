@@ -148,6 +148,10 @@ impl<'a> Parser<'a> {
             return self.parse_toplevel_import(loc);
         }
 
+        if self.eat(&TokenKind::KwForeign) {
+            return self.parse_toplevel_foreign(loc);
+        }
+
         let islocal = self.eat(&TokenKind::Local);
 
         if self.eat(&TokenKind::Function) {
@@ -159,13 +163,73 @@ impl<'a> Parser<'a> {
         }
 
         Err(self.erro(
-            "Esperava uma declaração de topo (`function`, `import`, `local` ou `record`) em vez disso.",
+            "Esperava uma declaração de topo (`function`, `foreign function`, `import`, \
+             `local` ou `record`) em vez disso.",
         ))
     }
 
-    /// `import Nome` — `localname == modname` (decisão 2 da T35): sem alias.
-    /// `import "data"` (string) e `import data as d` (alias) ficam fora de
-    /// escopo, com erro claro em vez de aceitar silenciosamente.
+    /// `foreign function abs(n: integer): integer` (T73) — declaração de
+    /// função externa, sem corpo e sem `end`.
+    ///
+    /// A forma do Titan original (`foreign import stdio "stdio.h"`) é
+    /// recusada aqui com erro claro: ela nomeia um header C e deixa as
+    /// assinaturas implícitas, o que exigiria ler o header — exatamente o
+    /// gerador de bindings que o ADR 0025 recusa. A mensagem aponta a grafia
+    /// que existe, em vez de só dizer que a outra não existe.
+    fn parse_toplevel_foreign(&mut self, _loc: Loc) -> Result<TopLevel, ParseError> {
+        if self.check(&TokenKind::KwImport) {
+            return Err(self.erro(
+                "`foreign import` (a forma do Titan original, que lê um header C) não existe: \
+                 declare cada função externa com sua assinatura Titan, como em \
+                 `foreign function abs(n: integer): integer`.",
+            ));
+        }
+        self.expect(
+            &TokenKind::Function,
+            "Esperava 'function' após 'foreign' (a única forma é \
+             `foreign function nome(...): Tipo`).",
+        )?;
+
+        let (name, name_loc) =
+            self.expect_name("Esperava um nome de função após 'foreign function'.")?;
+
+        self.expect(
+            &TokenKind::LParen,
+            "Esperava '(' para a lista de parâmetros.",
+        )?;
+        let params = self.parse_param_list()?;
+        self.expect(
+            &TokenKind::RParen,
+            "Esperava ')' para fechar a lista de parâmetros.",
+        )?;
+
+        let rettypes = self.parse_rettypes_opt()?;
+
+        // Sem corpo: um `end` aqui é o erro típico de quem escreveu a
+        // declaração no molde de `function`, e merece apontar a causa.
+        if self.check(&TokenKind::End) {
+            return Err(self.erro(
+                "`foreign function` não tem corpo: remova o 'end' — a declaração termina \
+                 no tipo de retorno.",
+            ));
+        }
+
+        Ok(TopLevel::TopLevelForeignFunc {
+            loc: name_loc,
+            name,
+            params,
+            rettypes,
+        })
+    }
+
+    /// `import Nome` e `import Nome as apelido` (T72). O ADR 0011 já trata
+    /// `import data` como açúcar de `local data = import "data"` com
+    /// `localname == modname`; o alias é só `localname != modname`, sem
+    /// mecanismo novo — `SymbolKind::Module` (`checker.rs`) já guarda o nome
+    /// do módulo separado do nome local.
+    ///
+    /// `import "data"` (nome de módulo como string) segue fora de escopo,
+    /// com erro claro em vez de aceitar silenciosamente.
     fn parse_toplevel_import(&mut self, loc: Loc) -> Result<TopLevel, ParseError> {
         if matches!(self.peek().kind, TokenKind::String(_)) {
             return Err(self.erro(
@@ -174,13 +238,15 @@ impl<'a> Parser<'a> {
         }
         let (modname, _) = self.expect_name("Esperava um nome de módulo após 'import'.")?;
 
-        if self.check(&TokenKind::KwAs) {
-            return Err(self.erro("'import ... as ...' não é suportado."));
-        }
+        let localname = if self.eat(&TokenKind::KwAs) {
+            self.expect_name("Esperava um nome local após 'as'.")?.0
+        } else {
+            modname.clone()
+        };
 
         Ok(TopLevel::TopLevelImport {
             loc,
-            localname: modname.clone(),
+            localname,
             modname,
         })
     }
@@ -1078,8 +1144,9 @@ impl<'a> Parser<'a> {
 
     /// Expressão primária (nome ou `( exp )`) seguida de zero ou mais
     /// sufixos: `(` chamada, `[` indexação (`VarBracket`), `.` campo
-    /// (`VarDot`). `VarBracket`/`VarDot` são embrulhados em `ExpVar` para
-    /// poderem seguir sendo sufixados (`a[1].campo[2]`).
+    /// (`VarDot`), `:` chamada de método (`ArgsMethod`, T72).
+    /// `VarBracket`/`VarDot` são embrulhados em `ExpVar` para poderem
+    /// seguir sendo sufixados (`a[1].campo[2]`).
     fn parse_suffixed_exp(&mut self) -> Result<Exp, ParseError> {
         let mut exp = self.parse_primary_exp()?;
 
@@ -1091,6 +1158,23 @@ impl<'a> Parser<'a> {
                     loc: call_loc,
                     exp: Box::new(exp),
                     args,
+                };
+            } else if self.check(&TokenKind::Colon) {
+                // `df:soma(...)` (T72): a forma do Titan original, que o
+                // ADR 0014 rejeitava. O receptor fica na própria `ExpCall`
+                // e o nome do método em `Args::ArgsMethod` — o checker
+                // resolve no mesmo ponto em que `.` resolve, então as duas
+                // formas produzem o mesmo `Callee::Method`.
+                let call_loc = self.loc();
+                self.advance();
+                let (method, _) = self.expect_name("Esperava um nome de método após ':'.")?;
+                let Args::ArgsFunc { loc, args } = self.parse_call_args()? else {
+                    unreachable!("parse_call_args só produz ArgsFunc");
+                };
+                exp = Exp::ExpCall {
+                    loc: call_loc,
+                    exp: Box::new(exp),
+                    args: Args::ArgsMethod { loc, method, args },
                 };
             } else if self.check(&TokenKind::LBracket) {
                 let loc = self.loc();
@@ -2172,16 +2256,210 @@ end"#,
         assert!(!err.message.is_empty());
     }
 
+    // ---- T72: `import` com alias e `df:metodo()` -------------------------
+
     #[test]
-    fn parse_import_com_as_produz_erro_claro() {
-        let err = parse_source("import data as d").unwrap_err();
-        assert!(err.message.contains("as"), "obteve: {}", err.message);
+    fn parse_import_com_as_produz_localname_diferente_de_modname() {
+        let program =
+            parse_source("import data as d").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert_eq!(program.len(), 1);
+        let TopLevel::TopLevelImport {
+            localname, modname, ..
+        } = &program[0]
+        else {
+            panic!("esperava TopLevelImport, obteve {:?}", program[0]);
+        };
+        assert_eq!(localname, "d");
+        assert_eq!(modname, "data");
+    }
+
+    #[test]
+    fn parse_import_com_as_sem_nome_produz_erro_claro() {
+        let err = parse_source("import data as").unwrap_err();
+        assert!(
+            err.message.contains("nome local"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    /// `df:soma("valor")` produz `ExpCall` com `Args::ArgsMethod` — o
+    /// receptor fica no `exp` da chamada e o nome do método nos argumentos.
+    #[test]
+    fn parse_chamada_com_dois_pontos_produz_argsmethod() {
+        let exp = parse_exp_source(r#"df:soma("valor")"#)
+            .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpCall { exp, args, .. } = exp else {
+            panic!("esperava ExpCall, obteve {exp:?}");
+        };
+        let Exp::ExpVar { var, .. } = exp.as_ref() else {
+            panic!("esperava ExpVar como receptor");
+        };
+        assert!(matches!(var.as_ref(), Var::VarName { name, .. } if name == "df"));
+        let Args::ArgsMethod { method, args, .. } = args else {
+            panic!("esperava ArgsMethod, obteve {args:?}");
+        };
+        assert_eq!(method, "soma");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0], Exp::ExpString { value, .. } if value == "valor"));
+    }
+
+    /// O `:` é sufixo como `.` e `[`, então encadeia com eles.
+    #[test]
+    fn parse_dois_pontos_encadeia_com_outros_sufixos() {
+        let exp =
+            parse_exp_source("a.b:c(1).d").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpVar { var, .. } = &exp else {
+            panic!("esperava ExpVar (o `.d` final), obteve {exp:?}");
+        };
+        let Var::VarDot { exp, name, .. } = var.as_ref() else {
+            panic!("esperava VarDot");
+        };
+        assert_eq!(name, "d");
+        let Exp::ExpCall { args, .. } = exp.as_ref() else {
+            panic!("esperava ExpCall sob o `.d`");
+        };
+        assert!(matches!(args, Args::ArgsMethod { method, .. } if method == "c"));
+    }
+
+    #[test]
+    fn parse_dois_pontos_sem_nome_de_metodo_produz_erro_claro() {
+        let err = parse_exp_source("df:(1)").unwrap_err();
+        assert!(
+            err.message.contains("nome de método"),
+            "obteve: {}",
+            err.message
+        );
     }
 
     #[test]
     fn erro_de_toplevel_menciona_import() {
         let err = parse_source("42").unwrap_err();
         assert!(err.message.contains("import"), "obteve: {}", err.message);
+    }
+
+    // ---- T73: `foreign function` -----------------------------------------
+
+    #[test]
+    fn parse_foreign_function_produz_toplevelforeignfunc() {
+        let program = parse_source("foreign function abs(n: integer): integer")
+            .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert_eq!(program.len(), 1);
+        let TopLevel::TopLevelForeignFunc {
+            name,
+            params,
+            rettypes,
+            ..
+        } = &program[0]
+        else {
+            panic!("esperava TopLevelForeignFunc, obteve {:?}", program[0]);
+        };
+        assert_eq!(name, "abs");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "n");
+        assert!(matches!(params[0].r#type, Some(Type::TypeInteger { .. })));
+        assert_eq!(rettypes.len(), 1);
+        assert!(matches!(rettypes[0], Type::TypeInteger { .. }));
+    }
+
+    /// Sem parâmetros e sem retorno — retorno omitido vira `TypeNil`, exatamente
+    /// como numa `function` comum (`parse_rettypes_opt`).
+    #[test]
+    fn parse_foreign_function_sem_params_nem_retorno() {
+        let program = parse_source("foreign function sync()")
+            .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let TopLevel::TopLevelForeignFunc {
+            params, rettypes, ..
+        } = &program[0]
+        else {
+            panic!("esperava TopLevelForeignFunc, obteve {:?}", program[0]);
+        };
+        assert!(params.is_empty());
+        assert_eq!(rettypes.len(), 1);
+        assert!(matches!(rettypes[0], Type::TypeNil { .. }));
+    }
+
+    #[test]
+    fn parse_foreign_function_convive_com_function_no_mesmo_arquivo() {
+        let program = parse_source(
+            "foreign function abs(n: integer): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   return abs(-1)\n\
+             end",
+        )
+        .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        assert_eq!(program.len(), 2);
+        assert!(matches!(program[0], TopLevel::TopLevelForeignFunc { .. }));
+        assert!(matches!(program[1], TopLevel::TopLevelFunc { .. }));
+    }
+
+    /// A forma do Titan original tem erro **próprio**, que aponta a grafia
+    /// que existe — não o genérico "esperava 'function' após 'foreign'".
+    #[test]
+    fn parse_foreign_import_do_original_produz_erro_que_aponta_a_grafia_nova() {
+        let err = parse_source(r#"foreign import stdio "stdio.h""#).unwrap_err();
+        assert!(
+            err.message
+                .contains("foreign function abs(n: integer): integer"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_foreign_sem_function_produz_erro_claro() {
+        let err = parse_source("foreign abs(n: integer): integer").unwrap_err();
+        assert!(
+            err.message.contains("'function' após 'foreign'"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_foreign_function_sem_nome_produz_erro_claro() {
+        let err = parse_source("foreign function (n: integer): integer").unwrap_err();
+        assert!(
+            err.message.contains("nome de função"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    /// `end` é o erro de quem copiou o molde de `function`; a mensagem diz o
+    /// que fazer, em vez de só recusar o token.
+    #[test]
+    fn parse_foreign_function_com_end_produz_erro_que_manda_remover_o_end() {
+        let err = parse_source("foreign function abs(n: integer): integer\nend").unwrap_err();
+        assert!(
+            err.message.contains("não tem corpo") && err.message.contains("remova o 'end'"),
+            "obteve: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_foreign_function_sem_parenteses_produz_erro_claro() {
+        let err = parse_source("foreign function abs: integer").unwrap_err();
+        assert!(err.message.contains("'('"), "obteve: {}", err.message);
+    }
+
+    /// Parâmetro sem tipo para no parser (`parse_decl` exige o `:`), não no
+    /// checker — a assinatura de uma função externa nunca é inferida.
+    #[test]
+    fn parse_foreign_function_com_param_sem_tipo_produz_erro_claro() {
+        let err = parse_source("foreign function abs(n): integer").unwrap_err();
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn erro_de_toplevel_menciona_foreign_function() {
+        let err = parse_source("42").unwrap_err();
+        assert!(
+            err.message.contains("foreign function"),
+            "obteve: {}",
+            err.message
+        );
     }
 
     // ---- T60: bitwise e `//` na cascata de precedência -------------------
