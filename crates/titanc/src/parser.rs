@@ -581,11 +581,26 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `for nome [: T] = exp, exp [, exp] do block end` — só a forma numérica
-    /// (sem for-in nesta fase).
+    /// As duas formas de `for`:
+    ///
+    /// - numérica — `for nome [: T] = exp, exp [, exp] do block end`;
+    /// - `for`-in (T71) — `for nome [: T] in exp do block end` sobre `{T}` e
+    ///   `for k [: K], v [: V] in exp do block end` sobre `{K: V}`.
+    ///
+    /// O que decide entre elas é o token **depois** da primeira declaração:
+    /// `=` abre a numérica, `,` ou `in` abrem a forma de iteração. As duas
+    /// compartilham só a primeira `Decl`; daí em diante são gramáticas
+    /// distintas, e o erro de um `for` que não é nem uma nem outra precisa
+    /// citar as duas continuações possíveis.
     fn parse_stat_for(&mut self, loc: Loc) -> Result<Stat, ParseError> {
         let decl = self.parse_decl_opt_type("Esperava um nome de variável após 'for'.")?;
-        self.expect(&TokenKind::Assign, "Esperava '=' após a variável do 'for'.")?;
+        if self.check(&TokenKind::Comma) || self.check(&TokenKind::KwIn) {
+            return self.parse_stat_for_in(loc, decl);
+        }
+        self.expect(
+            &TokenKind::Assign,
+            "Esperava '=' (for numérico) ou 'in' (for sobre array/map) após a variável do 'for'.",
+        )?;
         let start = self.parse_exp()?;
         self.expect(
             &TokenKind::Comma,
@@ -606,6 +621,39 @@ impl<'a> Parser<'a> {
             start: Box::new(start),
             finish: Box::new(finish),
             inc,
+            block: Box::new(block),
+        })
+    }
+
+    /// `for`-in (T71) — a continuação depois que [`Self::parse_stat_for`]
+    /// já leu a primeira declaração e viu `,` ou `in`.
+    ///
+    /// O parser aceita **qualquer** número de declarações e deixa a aridade
+    /// para o checker: quantos nomes cabem depende do tipo do container
+    /// (`{T}` liga um, `{K: V}` liga dois), e o tipo é coisa que só o checker
+    /// conhece. Errar aqui produziria "esperava 1 ou 2 nomes" sem poder dizer
+    /// qual dos dois o programa deveria ter escrito.
+    fn parse_stat_for_in(&mut self, loc: Loc, primeira: Decl) -> Result<Stat, ParseError> {
+        let mut decls = vec![primeira];
+        while self.eat(&TokenKind::Comma) {
+            decls
+                .push(self.parse_decl_opt_type("Esperava um nome de variável após ',' no 'for'.")?);
+        }
+        self.expect(
+            &TokenKind::KwIn,
+            "Esperava 'in' após as variáveis do 'for'.",
+        )?;
+        let exp = self.parse_exp()?;
+        self.expect(
+            &TokenKind::Do,
+            "Esperava 'do' após a expressão iterada do 'for'.",
+        )?;
+        let block = self.parse_block()?;
+        self.expect(&TokenKind::End, "Esperava 'end' para fechar o 'for'.")?;
+        Ok(Stat::StatForIn {
+            loc,
+            decls,
+            exp: Box::new(exp),
             block: Box::new(block),
         })
     }
@@ -1440,6 +1488,69 @@ end"#,
         assert!(matches!(**start, Exp::ExpInteger { value: 1, .. }));
         assert!(matches!(**finish, Exp::ExpInteger { value: 10, .. }));
         assert!(inc.is_none());
+    }
+
+    /// T71: o token depois da primeira declaração é o que separa as duas
+    /// formas de `for` — aqui `in`, sobre um array.
+    #[test]
+    fn for_in_sobre_array_liga_um_nome() {
+        let stats = stats_da_primeira_funcao(
+            "function f(): integer\n    for x in v do\n    end\n    return 0\nend",
+        );
+        let Stat::StatForIn { decls, exp, .. } = &stats[0] else {
+            panic!("esperava StatForIn, obteve {:?}", stats[0]);
+        };
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "x");
+        assert_eq!(decls[0].r#type, None);
+        assert!(matches!(**exp, Exp::ExpVar { .. }));
+    }
+
+    /// T71: a vírgula também abre a forma de iteração — é ela que o parser vê
+    /// antes do `in`, e sem ela `for k, v in ...` cairia no erro do `=`.
+    #[test]
+    fn for_in_sobre_map_liga_dois_nomes_com_tipo_opcional() {
+        let stats = stats_da_primeira_funcao(
+            "function f(): integer\n    for k: string, n in m do\n    end\n    return 0\nend",
+        );
+        let Stat::StatForIn { decls, .. } = &stats[0] else {
+            panic!("esperava StatForIn, obteve {:?}", stats[0]);
+        };
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].name, "k");
+        assert!(matches!(decls[0].r#type, Some(Type::TypeString { .. })));
+        assert_eq!(decls[1].name, "n");
+        assert_eq!(decls[1].r#type, None);
+    }
+
+    /// T71: um `for` que não é nem numérico nem de iteração precisa citar as
+    /// **duas** continuações possíveis — antes da T71 a mensagem só falava do
+    /// `=`, e quem escrevesse `for x do` não descobria que `in` existia.
+    #[test]
+    fn for_sem_igual_nem_in_cita_as_duas_formas() {
+        let err = parse_source("function f(): integer\n    for x do\n    end\n    return 0\nend")
+            .unwrap_err();
+        assert!(
+            err.message
+                .contains("'=' (for numérico) ou 'in' (for sobre array/map)"),
+            "mensagem inesperada: {}",
+            err.message
+        );
+    }
+
+    /// T71: a aridade fica com o checker, mas o `in` em si é obrigatório —
+    /// `for k, v do` é erro de sintaxe, não de tipo.
+    #[test]
+    fn for_com_virgula_sem_in_da_erro_de_sintaxe() {
+        let err =
+            parse_source("function f(): integer\n    for k, v do\n    end\n    return 0\nend")
+                .unwrap_err();
+        assert!(
+            err.message
+                .contains("Esperava 'in' após as variáveis do 'for'."),
+            "mensagem inesperada: {}",
+            err.message
+        );
     }
 
     #[test]

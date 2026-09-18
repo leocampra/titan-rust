@@ -79,7 +79,7 @@
       "patterns": [
         {
           "name": "keyword.control.titan",
-          "match": "\\b(if|then|elseif|else|while|do|for|return|break)\\b"
+          "match": "\\b(if|then|elseif|else|while|repeat|until|do|for|in|return|break|continue)\\b"
         },
         {
           "name": "keyword.other.titan",

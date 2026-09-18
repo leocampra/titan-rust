@@ -53,7 +53,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, Args, Decl, Exp, Loc, Program, Stat, TopLevel, Var};
+use crate::ast::{self, Args, Decl, Exp, FieldName, Loc, Program, Stat, TopLevel, Var};
 use crate::types::Type;
 
 /// Erro semântico com posição (no espírito de `checker.typeerror`).
@@ -288,6 +288,20 @@ pub enum TypedStat {
         inc: Box<TypedExp>,
         block: Box<TypedStat>,
     },
+    /// `for`-in (Fase 5, T71) sobre array ou map, já resolvido para uma das
+    /// duas formas por [`TypedForInKind`]. O container vem como
+    /// [`TypedExp`] e não como nome porque `for x in f() do` é tão válido
+    /// quanto `for x in v do`; o que o checker garante é que **nenhuma**
+    /// mutação do container acontece dentro do corpo, o que é o que permite
+    /// ao codegen emitir um `for` nativo do Rust sobre `.iter()` sem esbarrar
+    /// no borrow checker.
+    ForIn {
+        loc: Loc,
+        kind: TypedForInKind,
+        /// O container iterado, já tipado (`{T}` ou `{K: V}`).
+        container: TypedExp,
+        block: Box<TypedStat>,
+    },
     Assign {
         loc: Loc,
         target: TypedLValue,
@@ -319,6 +333,25 @@ pub enum TypedLValue {
     Field {
         base: Box<TypedExp>,
         name: String,
+    },
+}
+
+/// As duas formas de `for`-in (T71), separadas depois que o checker
+/// conheceu o tipo do container — o parser só viu "um ou mais nomes".
+///
+/// Cada variante já carrega o tipo do que é ligado por volta, porque o
+/// codegen precisa dele para decidir se o valor vindo do iterador entra
+/// clonado (compostos e `String`, ADR 0006) ou copiado (escalares).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedForInKind {
+    /// `for x in v do` sobre `{T}` — `elem_ty` é o `T`.
+    Array { name: String, elem_ty: Type },
+    /// `for k, v in m do` sobre `{K: V}`.
+    Map {
+        key_name: String,
+        key_ty: Type,
+        value_name: String,
+        value_ty: Type,
     },
 }
 
@@ -1631,6 +1664,12 @@ impl Checker {
                 inc,
                 block,
             } => self.check_for(*loc, decl, start, finish, inc.as_deref(), block, rettypes),
+            Stat::StatForIn {
+                loc,
+                decls,
+                exp,
+                block,
+            } => self.check_for_in(*loc, decls, exp, block, rettypes),
             Stat::StatAssign { loc, vars, exps } => {
                 // `a, b = ...` (T67), pelo mesmo motivo de `StatDecl`.
                 if vars.len() != 1 || exps.len() != 1 {
@@ -1952,6 +1991,237 @@ impl Checker {
             inc: Box::new(typed_inc),
             block: Box::new(typed_block?),
         })
+    }
+
+    /// `for`-in (T71) sobre `{T}` e `{K: V}`.
+    ///
+    /// A ordem aqui importa: o container é tipado **antes** de qualquer nome
+    /// entrar em escopo, porque `for v in v do` deve ver o `v` de fora, não a
+    /// variável que o próprio laço está declarando.
+    ///
+    /// Três coisas são decididas neste ponto e em nenhum outro:
+    ///
+    /// 1. **Qual forma é** — `{T}` liga um nome, `{K: V}` liga dois. Um
+    ///    número errado de nomes é erro aqui e não no parser, que não conhece
+    ///    o tipo (ver [`Parser::parse_stat_for_in`]).
+    /// 2. **Que tipos as variáveis têm** — inferidos do container, ou
+    ///    conferidos contra a anotação quando o programa escreveu uma.
+    /// 3. **Que o corpo não muta o container** — a checagem que o PRD pede em
+    ///    português e que, de quebra, é o que torna seguro o `for` nativo do
+    ///    Rust sobre `.iter()` que o codegen emite. Sem ela o `rustc`
+    ///    recusaria o programa em inglês, quebrando a convenção do projeto.
+    fn check_for_in(
+        &mut self,
+        loc: Loc,
+        decls: &[ast::Decl],
+        exp: &Exp,
+        block: &Stat,
+        rettypes: &[Type],
+    ) -> Option<TypedStat> {
+        let container = self.check_exp(exp, None)?;
+
+        // `{T}?` / `{K: V}?` (T68): iterar exige o container presente, e a
+        // mensagem que ensina o teste vale mais que "esperava array ou map".
+        if self.reject_option(&container) {
+            return None;
+        }
+
+        // Cada `Decl` do `for`-in é ligada a um valor por volta, nunca à
+        // ausência de um — mesmo motivo do `for` numérico.
+        for decl in decls {
+            if decl.option {
+                self.error(
+                    decl.loc,
+                    "a variável do `for`-in não pode ser opcional (`?`).",
+                );
+                return None;
+            }
+        }
+
+        // `for k, k in m do`: as duas variáveis são ligadas pelo **mesmo**
+        // padrão do `for` do Rust, e repetir um nome ali é
+        // `identifier bound more than once` — erro do `rustc`, em inglês.
+        // Recusado aqui, e não só porque o Rust recusaria: sombrear a chave
+        // com o valor na mesma linha não tem leitura útil nenhuma.
+        if let [primeira, segunda] = decls
+            && primeira.name == segunda.name
+        {
+            self.error(
+                segunda.loc,
+                format!(
+                    "'{}' aparece duas vezes nas variáveis do `for`-in; chave e \
+valor precisam de nomes diferentes.",
+                    segunda.name
+                ),
+            );
+            return None;
+        }
+
+        let kind = match &container.ty {
+            Type::Array { elem } => {
+                if decls.len() != 1 {
+                    self.error(
+                        loc,
+                        format!(
+                            "iterar sobre {} liga um nome (o elemento); \
+                             encontrei {}. Escreva `for x in ... do`.",
+                            type_name(&container.ty),
+                            decls.len()
+                        ),
+                    );
+                    return None;
+                }
+                let elem_ty = (**elem).clone();
+                let ty = self.for_in_var_type(&decls[0], &elem_ty, "o elemento")?;
+                TypedForInKind::Array {
+                    name: decls[0].name.clone(),
+                    elem_ty: ty,
+                }
+            }
+            Type::Map { keys, values } => {
+                if decls.len() != 2 {
+                    self.error(
+                        loc,
+                        format!(
+                            "iterar sobre {} liga dois nomes (chave e valor); \
+                             encontrei {}. Escreva `for k, v in ... do`.",
+                            type_name(&container.ty),
+                            decls.len()
+                        ),
+                    );
+                    return None;
+                }
+                let key_ty_esperado = (**keys).clone();
+                let value_ty_esperado = (**values).clone();
+                let key_ty = self.for_in_var_type(&decls[0], &key_ty_esperado, "a chave")?;
+                let value_ty = self.for_in_var_type(&decls[1], &value_ty_esperado, "o valor")?;
+                TypedForInKind::Map {
+                    key_name: decls[0].name.clone(),
+                    key_ty,
+                    value_name: decls[1].name.clone(),
+                    value_ty,
+                }
+            }
+            outro => {
+                self.error(
+                    container.loc,
+                    format!(
+                        "o `for`-in itera sobre array (`{{T}}`) ou map (`{{K: V}}`), \
+                         encontrado {}.",
+                        type_name(outro)
+                    ),
+                );
+                return None;
+            }
+        };
+
+        // Mutar o container durante a iteração: erro claro do checker, em
+        // português, e não `cannot borrow as mutable` do `rustc` (PRD T71).
+        // Só é detectável quando o container é uma variável — `for x in f()
+        // do` itera um temporário que o corpo não tem como alcançar.
+        if let Some(nome) = root_exp_var_name(exp) {
+            self.reject_mutacao_durante_iteracao(block, &nome);
+        }
+
+        // As variáveis do laço vivem num bloco próprio que não vaza para fora
+        // (o corpo `StatBlock` abre o seu por cima), como no `for` numérico.
+        self.st.open_block();
+        match &kind {
+            TypedForInKind::Array { name, elem_ty } => {
+                self.st
+                    .add_symbol(name, elem_ty.clone(), SymbolKind::ForVar, decls[0].loc);
+                self.record_use(decls[0].loc, decls[0].loc, name, elem_ty);
+            }
+            TypedForInKind::Map {
+                key_name,
+                key_ty,
+                value_name,
+                value_ty,
+            } => {
+                self.st
+                    .add_symbol(key_name, key_ty.clone(), SymbolKind::ForVar, decls[0].loc);
+                self.record_use(decls[0].loc, decls[0].loc, key_name, key_ty);
+                self.st.add_symbol(
+                    value_name,
+                    value_ty.clone(),
+                    SymbolKind::ForVar,
+                    decls[1].loc,
+                );
+                self.record_use(decls[1].loc, decls[1].loc, value_name, value_ty);
+            }
+        }
+        self.loop_depth += 1;
+        let typed_block = self.check_stat(block, rettypes);
+        self.loop_depth -= 1;
+        self.close_scope(loc);
+
+        Some(TypedStat::ForIn {
+            loc,
+            kind,
+            container,
+            block: Box::new(typed_block?),
+        })
+    }
+
+    /// Tipo de uma variável de `for`-in: o que o container oferece, ou a
+    /// anotação do programa **se** ela disser a mesma coisa.
+    ///
+    /// Não há coerção aqui — nem a de `integer`→`float` que a atribuição
+    /// permite. `for x: float in {1, 2} do` é um engano sobre o que o array
+    /// contém, e dizer isso é mais útil que converter em silêncio.
+    fn for_in_var_type(&mut self, decl: &ast::Decl, oferecido: &Type, papel: &str) -> Option<Type> {
+        let Some(anotado) = &decl.r#type else {
+            return Some(oferecido.clone());
+        };
+        let anotado = self.resolve_type(anotado)?;
+        if !anotado.equals(oferecido) {
+            self.error(
+                decl.loc,
+                format!(
+                    "{papel} iterado tem tipo {}, mas '{}' foi declarado como {}.",
+                    type_name(oferecido),
+                    decl.name,
+                    type_name(&anotado)
+                ),
+            );
+            return None;
+        }
+        Some(anotado)
+    }
+
+    /// Recusa mutação do container **durante** a iteração (PRD T71).
+    ///
+    /// Duas formas contam como mutação, e são exatamente as duas que o ADR
+    /// 0007 já identifica como uso mutável de um composto:
+    ///
+    /// - escrever no container ou dentro dele — `v = ...`, `v[i] = ...`,
+    ///   `v.campo = ...`, inclusive como um dos alvos de uma atribuição
+    ///   múltipla (T67);
+    /// - passá-lo como argumento de função, porque o codegen emite `&mut`
+    ///   no call site independentemente do corpo do callee.
+    ///
+    /// A varredura é sintática e roda sobre a AST **antes** de o corpo ser
+    /// tipado, de propósito: o nome do container ainda designa, em todo o
+    /// corpo, o mesmo símbolo de fora do laço — as variáveis do laço só
+    /// entram em escopo depois. O preço é que a varredura não tem escopo: um
+    /// `local v = ...` que **sombreie** o container é aceito (declarar não é
+    /// mutar), mas escrever no `v` novo depois disso é reportado como se
+    /// fosse o container. Conservador na direção segura — recusa um programa
+    /// válido em vez de aceitar um que o `rustc` recusaria —, e trocar o nome
+    /// resolve.
+    fn reject_mutacao_durante_iteracao(&mut self, block: &Stat, container: &str) {
+        let mut ofensas = Vec::new();
+        coleta_mutacoes(block, container, &mut ofensas);
+        for loc in ofensas {
+            self.error(
+                loc,
+                format!(
+                    "não é possível modificar '{container}' dentro do `for`-in que \
+                     itera sobre ele; itere sobre uma cópia ou colete as mudanças \
+                     e aplique-as depois do laço."
+                ),
+            );
+        }
     }
 
     /// Atribuição single-target `nome = exp` | `v[i] = exp` | `p.campo = exp`
@@ -3769,7 +4039,8 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
         }
         TypedStat::While { block, .. }
         | TypedStat::Repeat { block, .. }
-        | TypedStat::For { block, .. } => {
+        | TypedStat::For { block, .. }
+        | TypedStat::ForIn { block, .. } => {
             fixup_mutability(block, assigned);
         }
         TypedStat::Call { .. }
@@ -3865,6 +4136,150 @@ fn root_exp_var_name(exp: &Exp) -> Option<String> {
     }
 }
 
+/// Acumula em `ofensas` cada `Loc` do bloco em que `container` é mutado
+/// (T71) — ver [`Checker::reject_mutacao_durante_iteracao`], onde a política
+/// está explicada; aqui está só a travessia.
+///
+/// A travessia é a da AST inteira, laços aninhados inclusive: `for x in v do
+/// for y in w do v[1] = 0 end end` muta `v` durante a iteração de `v`
+/// exatamente como se estivesse um nível acima.
+fn coleta_mutacoes(stat: &Stat, container: &str, ofensas: &mut Vec<Loc>) {
+    match stat {
+        Stat::StatBlock { stats, .. } => {
+            for stat in stats {
+                coleta_mutacoes(stat, container, ofensas);
+            }
+        }
+        Stat::StatWhile {
+            condition, block, ..
+        } => {
+            coleta_mutacoes_exp(condition, container, ofensas);
+            coleta_mutacoes(block, container, ofensas);
+        }
+        Stat::StatRepeat {
+            block, condition, ..
+        } => {
+            coleta_mutacoes(block, container, ofensas);
+            coleta_mutacoes_exp(condition, container, ofensas);
+        }
+        Stat::StatIf {
+            thens, elsestat, ..
+        } => {
+            for then in thens {
+                coleta_mutacoes_exp(&then.condition, container, ofensas);
+                coleta_mutacoes(&then.block, container, ofensas);
+            }
+            if let Some(elsestat) = elsestat {
+                coleta_mutacoes(elsestat, container, ofensas);
+            }
+        }
+        Stat::StatFor {
+            start,
+            finish,
+            inc,
+            block,
+            ..
+        } => {
+            coleta_mutacoes_exp(start, container, ofensas);
+            coleta_mutacoes_exp(finish, container, ofensas);
+            if let Some(inc) = inc {
+                coleta_mutacoes_exp(inc, container, ofensas);
+            }
+            coleta_mutacoes(block, container, ofensas);
+        }
+        Stat::StatForIn { exp, block, .. } => {
+            coleta_mutacoes_exp(exp, container, ofensas);
+            coleta_mutacoes(block, container, ofensas);
+        }
+        Stat::StatAssign { vars, exps, .. } => {
+            for var in vars {
+                if root_var_name(var).as_deref() == Some(container) {
+                    ofensas.push(var_loc(var));
+                }
+            }
+            for exp in exps {
+                coleta_mutacoes_exp(exp, container, ofensas);
+            }
+        }
+        // `local v = ...` dentro do corpo: o nome passa a designar outra
+        // coisa, mas a varredura é anterior à tipagem e não tem escopo — o
+        // conservadorismo é declarado em `reject_mutacao_durante_iteracao`.
+        // O que interessa aqui são os **valores**, que podem conter chamadas.
+        Stat::StatDecl { exps, .. } => {
+            for exp in exps {
+                coleta_mutacoes_exp(exp, container, ofensas);
+            }
+        }
+        Stat::StatCall { callexp, .. } => coleta_mutacoes_exp(callexp, container, ofensas),
+        Stat::StatReturn { exps, .. } => {
+            for exp in exps {
+                coleta_mutacoes_exp(exp, container, ofensas);
+            }
+        }
+        Stat::StatBreak { .. } | Stat::StatContinue { .. } => {}
+    }
+}
+
+/// A metade de [`coleta_mutacoes`] que percorre expressões. Só uma forma de
+/// expressão muta um composto: passá-lo como argumento, porque o codegen
+/// emite `&mut` no call site (ADR 0007). Ler `v[i]` não muta nada.
+fn coleta_mutacoes_exp(exp: &Exp, container: &str, ofensas: &mut Vec<Loc>) {
+    match exp {
+        Exp::ExpCall { exp, args, .. } => {
+            coleta_mutacoes_exp(exp, container, ofensas);
+            let args = match args {
+                Args::ArgsFunc { args, .. } => args,
+                Args::ArgsMethod { args, .. } => args,
+            };
+            for arg in args {
+                if root_exp_var_name(arg).as_deref() == Some(container) {
+                    ofensas.push(exp_loc(arg));
+                }
+                coleta_mutacoes_exp(arg, container, ofensas);
+            }
+        }
+        Exp::ExpVar { var, .. } => coleta_mutacoes_var(var, container, ofensas),
+        Exp::ExpUnop { exp, .. }
+        | Exp::ExpCast { exp, .. }
+        | Exp::ExpAdjust { exp, .. }
+        | Exp::ExpExtra { exp, .. } => coleta_mutacoes_exp(exp, container, ofensas),
+        Exp::ExpBinop { lhs, rhs, .. } => {
+            coleta_mutacoes_exp(lhs, container, ofensas);
+            coleta_mutacoes_exp(rhs, container, ofensas);
+        }
+        Exp::ExpConcat { exps, .. } => {
+            for exp in exps {
+                coleta_mutacoes_exp(exp, container, ofensas);
+            }
+        }
+        Exp::ExpInitList { fields, .. } => {
+            for field in fields {
+                if let FieldName::Key(key) = &field.name {
+                    coleta_mutacoes_exp(key, container, ofensas);
+                }
+                coleta_mutacoes_exp(&field.exp, container, ofensas);
+            }
+        }
+        Exp::ExpNil { .. }
+        | Exp::ExpBool { .. }
+        | Exp::ExpInteger { .. }
+        | Exp::ExpFloat { .. }
+        | Exp::ExpString { .. } => {}
+    }
+}
+
+/// `v[f(w)]` e `p.campo` também carregam expressões dentro.
+fn coleta_mutacoes_var(var: &Var, container: &str, ofensas: &mut Vec<Loc>) {
+    match var {
+        Var::VarName { .. } => {}
+        Var::VarBracket { exp1, exp2, .. } => {
+            coleta_mutacoes_exp(exp1, container, ofensas);
+            coleta_mutacoes_exp(exp2, container, ofensas);
+        }
+        Var::VarDot { exp, .. } => coleta_mutacoes_exp(exp, container, ofensas),
+    }
+}
+
 /// Coerção numérica int→float centralizada (T13): o tipo resultante de
 /// combinar dois operandos **já validados** como numéricos — `Integer` só
 /// quando os dois lados são `Integer`; qualquer `Float` promove o resultado
@@ -3887,12 +4302,21 @@ fn stat_loc(stat: &Stat) -> Loc {
         | Stat::StatRepeat { loc, .. }
         | Stat::StatIf { loc, .. }
         | Stat::StatFor { loc, .. }
+        | Stat::StatForIn { loc, .. }
         | Stat::StatAssign { loc, .. }
         | Stat::StatDecl { loc, .. }
         | Stat::StatCall { loc, .. }
         | Stat::StatReturn { loc, .. }
         | Stat::StatBreak { loc, .. }
         | Stat::StatContinue { loc, .. } => *loc,
+    }
+}
+
+/// `Loc` de um alvo de atribuição (T71) — o que a mensagem de "mutou o
+/// container durante a iteração" aponta.
+fn var_loc(var: &Var) -> Loc {
+    match var {
+        Var::VarName { loc, .. } | Var::VarBracket { loc, .. } | Var::VarDot { loc, .. } => *loc,
     }
 }
 
@@ -5237,6 +5661,296 @@ end"#;
                 "esperava sucesso, obteve erros: {}",
                 errs.iter()
                     .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    // ---- T71: `for`-in sobre array e map --------------------------------
+
+    /// Monta um `main` com `corpo` no meio — o formato de quase todo caso
+    /// desta seção, onde só o corpo do laço muda.
+    fn fonte_main(corpo: &str) -> String {
+        format!("function main(args: {{string}}): integer\n{corpo}\n    return 0\nend")
+    }
+
+    fn erros_de(corpo: &str) -> Vec<CheckError> {
+        check_source(&fonte_main(corpo)).unwrap_err()
+    }
+
+    fn contem_erro(corpo: &str, trecho: &str) {
+        let errs = erros_de(corpo);
+        assert!(
+            errs.iter().any(|e| e.message.contains(trecho)),
+            "esperava um erro contendo {trecho:?}, obtive: {}",
+            errs.iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
+    /// O tipo do elemento vem do container, sem anotação nenhuma no fonte.
+    #[test]
+    fn for_in_infere_o_tipo_do_elemento_do_array() {
+        let source = fonte_main(
+            "    local v: {integer} = {1, 2}\n\
+             \x20   local s: integer = 0\n\
+             \x20   for x in v do\n\
+             \x20       s = s + x\n\
+             \x20   end",
+        );
+        check_source(&source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    /// Sobre um map, os dois nomes recebem tipos **diferentes** — chave e
+    /// valor —, e é a ordem das declarações que decide qual é qual.
+    #[test]
+    fn for_in_liga_chave_e_valor_com_os_tipos_do_map() {
+        let source = fonte_main(
+            "    local m: {string: integer} = {[\"a\"] = 1}\n\
+             \x20   local s: integer = 0\n\
+             \x20   local t: string = \"\"\n\
+             \x20   for k, n in m do\n\
+             \x20       s = s + n\n\
+             \x20       t = k\n\
+             \x20   end",
+        );
+        check_source(&source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    /// As variáveis do laço não vazam para fora dele — mesmo escopo do `for`
+    /// numérico.
+    #[test]
+    fn variavel_do_for_in_nao_vaza_para_fora_do_laco() {
+        contem_erro(
+            "    local v: {integer} = {1}\n\
+             \x20   for x in v do\n\
+             \x20   end\n\
+             \x20   local y: integer = x",
+            "'x' não foi declarado",
+        );
+    }
+
+    /// `for v in v do` enxerga o `v` **de fora**: o container é tipado antes
+    /// de qualquer nome do laço entrar em escopo.
+    #[test]
+    fn container_e_tipado_antes_de_a_variavel_entrar_em_escopo() {
+        let source = fonte_main(
+            "    local v: {integer} = {1}\n\
+             \x20   local s: integer = 0\n\
+             \x20   for v in v do\n\
+             \x20       s = s + v\n\
+             \x20   end",
+        );
+        check_source(&source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    #[test]
+    fn for_in_sobre_array_com_dois_nomes_produz_erro() {
+        contem_erro(
+            "    local v: {integer} = {1}\n\
+             \x20   for k, x in v do\n\
+             \x20   end",
+            "liga um nome (o elemento)",
+        );
+    }
+
+    #[test]
+    fn for_in_sobre_map_com_um_nome_produz_erro() {
+        contem_erro(
+            "    local m: {string: integer} = {[\"a\"] = 1}\n\
+             \x20   for x in m do\n\
+             \x20   end",
+            "liga dois nomes (chave e valor)",
+        );
+    }
+
+    #[test]
+    fn for_in_sobre_escalar_produz_erro() {
+        contem_erro(
+            "    local n: integer = 3\n\
+             \x20   for x in n do\n\
+             \x20   end",
+            "itera sobre array (`{T}`) ou map (`{K: V}`), encontrado integer",
+        );
+    }
+
+    /// Anotar a variável com outro tipo é um engano sobre o que o container
+    /// contém — e não há coerção aqui, nem a de `integer`→`float`.
+    #[test]
+    fn anotacao_divergente_na_variavel_do_for_in_produz_erro() {
+        contem_erro(
+            "    local v: {integer} = {1}\n\
+             \x20   for x: float in v do\n\
+             \x20   end",
+            "o elemento iterado tem tipo integer, mas 'x' foi declarado como float",
+        );
+    }
+
+    /// `for k, k in m do` liga os dois nomes pelo **mesmo** padrão do `for`
+    /// do Rust, onde repetir um nome é `identifier bound more than once` —
+    /// erro do `rustc`, em inglês. Recusado aqui antes disso.
+    #[test]
+    fn nomes_repetidos_no_for_in_produzem_erro() {
+        contem_erro(
+            "    local m: {string: integer} = {[\"a\"] = 1}\n\
+             \x20   for k, k in m do\n\
+             \x20   end",
+            "'k' aparece duas vezes nas variáveis do `for`-in",
+        );
+    }
+
+    #[test]
+    fn variavel_opcional_no_for_in_produz_erro() {
+        contem_erro(
+            "    local v: {integer} = {1}\n\
+             \x20   for x? in v do\n\
+             \x20   end",
+            "não pode ser opcional",
+        );
+    }
+
+    /// Iterar um `{T}?` exige o container presente (T68).
+    #[test]
+    fn for_in_sobre_opcional_produz_erro_que_ensina_o_teste() {
+        let errs = erros_de(
+            "    local v: {integer}? = nil\n\
+             \x20   for x in v do\n\
+             \x20   end",
+        );
+        assert!(!errs.is_empty(), "esperava erro ao iterar sobre opcional");
+    }
+
+    /// `break`/`continue` (T63) contam o `for`-in como laço: `loop_depth`
+    /// sobe pelo corpo como em qualquer outro.
+    #[test]
+    fn break_e_continue_valem_dentro_do_for_in() {
+        let source = fonte_main(
+            "    local v: {integer} = {1, 2}\n\
+             \x20   for x in v do\n\
+             \x20       if x == 1 then\n\
+             \x20           continue\n\
+             \x20       end\n\
+             \x20       break\n\
+             \x20   end",
+        );
+        check_source(&source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    /// Iterar sobre uma **chamada** não passa pela checagem de mutação: o
+    /// temporário não tem nome que o corpo possa alcançar.
+    #[test]
+    fn iterar_sobre_chamada_permite_mutar_outros_containers() {
+        let source = "function nums(): {integer}\n\
+             \x20   return {1, 2}\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local v: {integer} = {9}\n\
+             \x20   for x in nums() do\n\
+             \x20       v[1] = x\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end";
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    /// Sombrear o nome do container é aceito — declarar não é mutar. Fixa o
+    /// lado permissivo da varredura sem escopo (ADR 0024).
+    #[test]
+    fn sombrear_o_nome_do_container_e_permitido() {
+        let source = fonte_main(
+            "    local v: {integer} = {1, 2}\n\
+             \x20   for x in v do\n\
+             \x20       local v: integer = x\n\
+             \x20       print(\"v: \" .. v)\n\
+             \x20   end",
+        );
+        check_source(&source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    /// E o lado conservador do mesmo desenho: escrever no `v` **sombreado**
+    /// é recusado como se fosse o container, porque a varredura roda antes da
+    /// tipagem e não tem escopo. Documentado no ADR 0024 — o teste existe
+    /// para que a troca por uma varredura com escopo seja uma mudança
+    /// **visível**, e não um efeito colateral silencioso.
+    #[test]
+    fn escrever_no_container_sombreado_e_recusado_conservadoramente() {
+        contem_erro(
+            "    local v: {integer} = {1, 2}\n\
+             \x20   for x in v do\n\
+             \x20       local v: {integer} = {9}\n\
+             \x20       v[1] = x\n\
+             \x20   end",
+            "não é possível modificar 'v' dentro do `for`-in",
+        );
+    }
+
+    /// Mutar **outro** container dentro do laço é legítimo — a checagem é
+    /// sobre o container iterado, não sobre escrita em geral.
+    #[test]
+    fn mutar_outro_container_dentro_do_for_in_e_permitido() {
+        let source = fonte_main(
+            "    local v: {integer} = {1, 2}\n\
+             \x20   local w: {integer} = {0, 0}\n\
+             \x20   for x in v do\n\
+             \x20       w[1] = x\n\
+             \x20   end",
+        );
+        check_source(&source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
                     .collect::<Vec<_>>()
                     .join("; ")
             )

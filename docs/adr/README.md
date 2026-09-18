@@ -25,3 +25,4 @@
 | [0021](0021-bitwise-exige-integer-sem-coercao.md) | Bitwise exige `integer` estrito, sem coagir `float` (diverge do original); `//` e deslocamentos vão para o runtime |
 | [0022](0022-for-como-loop-com-incremento-no-topo.md) | `for` numérico como `loop` com o incremento no topo (supera o 0004, viabiliza `continue`) |
 | [0023](0023-continue-entra-com-o-incremento-no-topo.md) | `continue` entra na linguagem, com o mesmo desenho de `break` (supera o "não" do 0017) |
+| [0024](0024-for-in-nativo-sem-mutacao-do-container.md) | `for`-in como `for` nativo do Rust sobre `.iter()`; mutar o container durante a iteração é erro do checker; ordem de map não especificada |

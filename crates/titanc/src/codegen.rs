@@ -45,8 +45,8 @@
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
 
 use crate::checker::{
-    BinOp, Callee, CastKind, TypedExp, TypedExpKind, TypedLValue, TypedMultiValues, TypedProgram,
-    TypedStat, TypedThen, TypedTopLevel, UnOp,
+    BinOp, Callee, CastKind, TypedExp, TypedExpKind, TypedForInKind, TypedLValue, TypedMultiValues,
+    TypedProgram, TypedStat, TypedThen, TypedTopLevel, UnOp,
 };
 use crate::types::Type;
 use std::collections::HashSet;
@@ -261,6 +261,14 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
         } => {
             collect_referenced_names_stat(block, names);
             collect_referenced_names_exp(condition, names);
+        }
+        // `for`-in (T71): o container é lido — é ele que dá o `&mut`/`&` do
+        // iterador —, as variáveis do laço são destinos como as de `For`.
+        TypedStat::ForIn {
+            container, block, ..
+        } => {
+            collect_referenced_names_exp(container, names);
+            collect_referenced_names_stat(block, names);
         }
         TypedStat::For {
             start,
@@ -562,7 +570,8 @@ fn assigns_to_name(stat: &TypedStat, nome: &str) -> bool {
             }
             TypedStat::While { block, .. }
             | TypedStat::Repeat { block, .. }
-            | TypedStat::For { block, .. } => stat_atribui(block, nome),
+            | TypedStat::For { block, .. }
+            | TypedStat::ForIn { block, .. } => stat_atribui(block, nome),
             TypedStat::Decl { .. }
             | TypedStat::DeclMulti { .. }
             | TypedStat::Call { .. }
@@ -834,6 +843,86 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             indent(out, depth);
             out.push_str("}\n");
         }
+        // `for`-in (T71) → `for` **nativo** do Rust sobre `.iter()`, nunca o
+        // template de `loop` do `for` numérico (ADR 0022): aquele existe
+        // porque `Range` não cobre passo negativo nem float, e nada disso se
+        // aplica a percorrer um container. Aqui o iterador do Rust é
+        // exatamente a construção certa, e `break`/`continue` (T63) caem
+        // dentro dele sem caso especial nenhum.
+        //
+        // `.iter()` e não `.iter_mut()`: o checker já recusou qualquer
+        // mutação do container dentro do corpo, então não há o que mutar
+        // através do iterador — e um `&mut` desnecessário só arriscaria
+        // empréstimos que o `rustc` recusaria em inglês.
+        //
+        // O nome que o iterador liga é `titan_forin_*` (referência), e o
+        // nome do usuário nasce logo dentro do corpo, por valor — mesmo
+        // idioma do `if let` do narrowing (T68). Isso resolve de uma vez
+        // três coisas: o corpo lê `x` com o tipo `T` que o checker lhe deu,
+        // o clone de composto/`String` do ADR 0006 acontece num lugar só, e
+        // escalares saem com um `*` que não custa nada.
+        TypedStat::ForIn {
+            kind,
+            container,
+            block,
+            ..
+        } => {
+            let base = emit_exp(container, ctx);
+            // Nome do laço que o corpo nunca **usa** não ganha ligação
+            // nenhuma, e o iterador o descarta com `_` — `for k, v in m do`
+            // que só olha `v` é escrita natural, e abrir um `let k` que
+            // ninguém lê renderia `unused_variables`. Mesma disciplina do
+            // narrowing (T68) e mesmo critério de aceite da T69: Rust **sem
+            // warnings**.
+            //
+            // "Usar" inclui **escrever**: `for x in v do x = 0 end` é aceito
+            // pelo checker (a variável do laço é `SymbolKind::ForVar`, que
+            // permite atribuição), e a ligação precisa existir — e ser `mut`
+            // — senão o corpo emitiria `x = 0;` para um `x` que não foi
+            // declarado. É atribuição a uma **cópia**, sem efeito sobre o
+            // container (ADR 0024), como no `for` numérico.
+            let lidos = referenced_names(block);
+            let usado = |nome: &str| lidos.contains(nome) || assigns_to_name(block, nome);
+            indent(out, depth);
+            match kind {
+                TypedForInKind::Array { name, elem_ty } => {
+                    let interno = forin_pattern(name, usado(name));
+                    out.push_str(&format!("for {interno} in {base}.iter() {{\n"));
+                    emit_forin_binding(out, name, elem_ty, &interno, block, usado(name), depth + 1);
+                }
+                TypedForInKind::Map {
+                    key_name,
+                    key_ty,
+                    value_name,
+                    value_ty,
+                } => {
+                    let chave = forin_pattern(key_name, usado(key_name));
+                    let valor = forin_pattern(value_name, usado(value_name));
+                    out.push_str(&format!("for ({chave}, {valor}) in {base}.iter() {{\n"));
+                    emit_forin_binding(
+                        out,
+                        key_name,
+                        key_ty,
+                        &chave,
+                        block,
+                        usado(key_name),
+                        depth + 1,
+                    );
+                    emit_forin_binding(
+                        out,
+                        value_name,
+                        value_ty,
+                        &valor,
+                        block,
+                        usado(value_name),
+                        depth + 1,
+                    );
+                }
+            }
+            emit_block_stats(out, block, depth + 1, ctx);
+            indent(out, depth);
+            out.push_str("}\n");
+        }
         TypedStat::Break { .. } => {
             indent(out, depth);
             out.push_str("break;\n");
@@ -846,6 +935,57 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             indent(out, depth);
             out.push_str("continue;\n");
         }
+    }
+}
+
+/// Liga o nome do usuário, por valor, ao que o iterador do `for`-in (T71)
+/// entregou por referência.
+///
+/// Compostos e `String` clonam (ADR 0006: cada nome é dono da sua cópia, e
+/// mutar a variável do laço não pode alcançar o container); o resto
+/// desreferencia. `let` sem `mut` de propósito: o fix-up de mutabilidade não
+/// alcança variáveis de laço, e uma atribuição a elas é `SymbolKind::ForVar`
+/// no checker — que a T71 não precisou abrir, porque o corpo que atribui à
+/// variável do laço cai no `unused_mut`/`immutable` do rustc antes. Uma fase
+/// futura que queira permitir `x = x + 1` sobre a variável ligada faz disso
+/// um `let mut`.
+fn emit_forin_binding(
+    out: &mut String,
+    name: &str,
+    ty: &Type,
+    interno: &str,
+    block: &TypedStat,
+    usado: bool,
+    depth: usize,
+) {
+    if !usado {
+        return;
+    }
+    indent(out, depth);
+    let rust_ty = rust_type_name(ty);
+    // `let mut` só quando o corpo escreve na variável — senão o rustc
+    // reclamaria de `unused_mut`, e o critério é Rust sem warnings.
+    let bind = if assigns_to_name(block, name) {
+        "let mut"
+    } else {
+        "let"
+    };
+    if is_composite(ty) || *ty == Type::String {
+        out.push_str(&format!("{bind} {name}: {rust_ty} = {interno}.clone();\n"));
+    } else {
+        out.push_str(&format!("{bind} {name}: {rust_ty} = *{interno};\n"));
+    }
+}
+
+/// Padrão que o `for` do Rust liga para uma variável do `for`-in: o nome
+/// interno quando o corpo usa a variável, `_` quando não — o descarte tem de
+/// estar no padrão, e não só na ligação omitida, senão o próprio
+/// `titan_forin_*` fica sem uso.
+fn forin_pattern(name: &str, usado: bool) -> String {
+    if usado {
+        format!("titan_forin_{name}")
+    } else {
+        "_".to_string()
     }
 }
 
@@ -2334,6 +2474,188 @@ end"#;
         // Nunca o Range do Rust (`.step_by` não cobre passo negativo/float).
         assert!(!rust.contains(".."));
         assert!(!rust.contains("step_by"));
+    }
+
+    // ---- T71: `for`-in como `for` nativo do Rust sobre `.iter()` --------
+
+    /// O `for`-in **não** reusa o template de `loop` do `for` numérico (ADR
+    /// 0022/0024): emite o `for` nativo do Rust, onde o iterador já avança
+    /// sozinho antes de cada volta.
+    #[test]
+    fn for_in_sobre_array_emite_for_nativo_do_rust() {
+        let source = r#"function main(args: {string}): integer
+    local v: {integer} = {1, 2}
+    local s: integer = 0
+    for x in v do
+        s = s + x
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("for titan_forin_x in v.iter() {"), "{rust}");
+        // O nome do usuário nasce por valor dentro do corpo — escalar
+        // desreferencia, sem clone.
+        assert!(rust.contains("let x: i64 = *titan_forin_x;"), "{rust}");
+        // Nenhuma peça do template do `for` numérico aparece.
+        assert!(!rust.contains("titan_for_inc"), "{rust}");
+        assert!(!rust.contains("titan_for_primeira"), "{rust}");
+        // `.iter()`, nunca `.iter_mut()`: o checker já recusou mutação.
+        assert!(!rust.contains("iter_mut"), "{rust}");
+    }
+
+    /// Sobre um map o iterador liga um par, e cada metade vira um nome do
+    /// usuário — a chave `String` **clona** (ADR 0006), o valor escalar não.
+    #[test]
+    fn for_in_sobre_map_emite_par_e_clona_so_a_chave() {
+        let source = r#"function main(args: {string}): integer
+    local m: {string: integer} = {["a"] = 1}
+    local s: integer = 0
+    local t: string = ""
+    for k, n in m do
+        s = s + n
+        t = k
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("for (titan_forin_k, titan_forin_n) in m.iter() {"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("let k: String = titan_forin_k.clone();"),
+            "{rust}"
+        );
+        assert!(rust.contains("let n: i64 = *titan_forin_n;"), "{rust}");
+    }
+
+    /// Nome que o corpo nunca lê é descartado com `_` **no padrão** do
+    /// iterador, e não ganha ligação nenhuma — senão o Rust gerado sairia com
+    /// `unused_variables`, contra o critério herdado da T69.
+    #[test]
+    fn nome_nao_lido_do_for_in_vira_underscore_no_padrao() {
+        let source = r#"function main(args: {string}): integer
+    local m: {string: integer} = {["a"] = 1}
+    local s: integer = 0
+    for k, n in m do
+        s = s + n
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("for (_, titan_forin_n) in m.iter() {"),
+            "{rust}"
+        );
+        assert!(!rust.contains("let k:"), "{rust}");
+        assert!(!rust.contains("titan_forin_k"), "{rust}");
+    }
+
+    /// Elemento composto entra clonado, para que escrever na variável do laço
+    /// não alcance o container (ADR 0006/0024).
+    #[test]
+    fn elemento_composto_do_for_in_entra_clonado() {
+        let source = r#"function main(args: {string}): integer
+    local matriz: {{integer}} = {{1, 2}}
+    local s: integer = 0
+    for linha in matriz do
+        s = s + linha[1]
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("let linha: Vec<i64> = titan_forin_linha.clone();"),
+            "{rust}"
+        );
+    }
+
+    /// Escrever na variável do laço é aceito pelo checker (ela é
+    /// `SymbolKind::ForVar`, como a do `for` numérico), e a ligação precisa
+    /// sair `let mut` — senão o Rust gerado tem um `x = ...` para um `x` que
+    /// não foi declarado, e o `rustc` recusa o programa em inglês. É
+    /// atribuição a uma **cópia**: não alcança o container (ADR 0024).
+    #[test]
+    fn atribuir_a_variavel_do_for_in_emite_let_mut_e_nao_toca_o_container() {
+        let source = r#"function main(args: {string}): integer
+    local v: {integer} = {1, 2}
+    local s: integer = 0
+    for x in v do
+        x = x * 2
+        s = s + x
+    end
+    print("s: " .. s)
+    print("v1: " .. v[1])
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("let mut x: i64 = *titan_forin_x;"), "{rust}");
+        let (avisos, output) = compila_e_executa(&rust, "for-in-atribui-t71");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // 1*2 + 2*2 = 6, e o container segue intacto.
+        assert_eq!(stdout, "s: 6\nv1: 1\n", "stdout: {stdout}");
+    }
+
+    /// Variável só escrita, nunca lida, ainda precisa da ligação: é o caso
+    /// que sairia como `x = 5;` sem declaração nenhuma se o codegen olhasse
+    /// apenas as **leituras** do corpo.
+    #[test]
+    fn variavel_do_for_in_apenas_escrita_ainda_ganha_ligacao() {
+        let source = r#"function main(args: {string}): integer
+    local v: {integer} = {1, 2}
+    for x in v do
+        x = 5
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(rust.contains("for titan_forin_x in v.iter() {"), "{rust}");
+        assert!(rust.contains("let mut x: i64 = *titan_forin_x;"), "{rust}");
+        // Nunca um `x = 5;` órfão, que o rustc recusaria em inglês.
+        assert!(!rust.contains("for _ in v.iter()"), "{rust}");
+    }
+
+    /// Ponta a ponta com o `rustc` de verdade: as duas formas, `break` e
+    /// `continue` dentro, e — o critério herdado da T69 — **zero warnings**.
+    #[test]
+    fn for_in_compila_sem_warnings_e_roda() {
+        let source = r#"function main(args: {string}): integer
+    local v: {integer} = {10, 20, 30}
+    local soma: integer = 0
+    for x in v do
+        soma = soma + x
+    end
+    print("soma: " .. soma)
+    local m: {string: integer} = {["a"] = 5, ["b"] = 7}
+    local total: integer = 0
+    for k, n in m do
+        total = total + n
+    end
+    print("total: " .. total)
+    for y in v do
+        if y == 20 then
+            continue
+        end
+        if y == 30 then
+            break
+        end
+        print("bc: " .. y)
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        let (avisos, output) = compila_e_executa(&rust, "for-in-t71");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout, "soma: 60\ntotal: 12\nbc: 10\n", "stdout: {stdout}");
+        assert_eq!(output.status.code(), Some(0));
     }
 
     /// O incremento precisa vir **antes** do corpo no texto emitido: é o que

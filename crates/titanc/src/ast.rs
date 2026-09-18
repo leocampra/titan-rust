@@ -158,6 +158,25 @@ pub enum Stat {
         inc: Option<Box<Exp>>,
         block: Box<Stat>,
     },
+    /// `for x in v do ... end` / `for k, v in m do ... end` (Fase 5, T71) —
+    /// o laço de iteração sobre um container, que a Fase 1 adiou por depender
+    /// de `array`/`map`. Nó **próprio**, e não uma variante de
+    /// [`Stat::StatFor`]: o `for` numérico tem início/limite/passo e uma
+    /// variável de controle escalar, enquanto este tem um container e de uma
+    /// a duas variáveis ligadas por volta — juntar os dois num só nó
+    /// espalharia `Option` por todos os campos e obrigaria checker e codegen
+    /// a decidir qual forma é, em cada braço, o que o PRD (T71) pede
+    /// explicitamente para não fazer.
+    ///
+    /// `decls` tem 1 elemento sobre `{T}` (o elemento) e 2 sobre `{K: V}`
+    /// (chave e valor); a aridade só é validada no checker, porque o parser
+    /// não conhece o tipo de `exp`.
+    StatForIn {
+        loc: Loc,
+        decls: Vec<Decl>,
+        exp: Box<Exp>,
+        block: Box<Stat>,
+    },
     StatAssign {
         loc: Loc,
         vars: Vec<Var>,
