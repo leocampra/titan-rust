@@ -46,7 +46,7 @@
 
 use crate::checker::{
     BinOp, Callee, TypedExp, TypedExpKind, TypedLValue, TypedMultiValues, TypedProgram, TypedStat,
-    TypedTopLevel, UnOp,
+    TypedThen, TypedTopLevel, UnOp,
 };
 use crate::types::Type;
 use std::collections::HashSet;
@@ -367,9 +367,10 @@ fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::Ha
         }
         // Ajuste de retorno múltiplo (T65): os nomes lidos são os da
         // chamada envolvida.
-        TypedExpKind::Adjust(inner) | TypedExpKind::Extra { exp: inner, .. } => {
-            collect_referenced_names_exp(inner, names)
-        }
+        TypedExpKind::Adjust(inner)
+        | TypedExpKind::Extra { exp: inner, .. }
+        // `SomeOf` (T68) é um invólucro: quem é lido é o valor dentro dele.
+        | TypedExpKind::SomeOf(inner) => collect_referenced_names_exp(inner, names),
         TypedExpKind::Nil
         | TypedExpKind::Bool(_)
         | TypedExpKind::Integer(_)
@@ -394,6 +395,181 @@ fn indent(out: &mut String, depth: usize) {
     for _ in 0..depth {
         out.push_str(INDENT);
     }
+}
+
+/// Corpo de um ramo `then` que pode ter estreitado opcionais (T68/T69).
+///
+/// Para cada nome em `then.narrowed` o corpo foi **tipado** contra o tipo
+/// base (`integer`, não `integer?`), então dentro dele toda leitura de `x`
+/// emite o nome cru e espera um `i64`. Fora do ramo o mesmo nome é um
+/// `Option<i64>`. A ponte entre os dois é uma ligação que sombreia o nome
+/// com o valor desembrulhado, aberta no topo do ramo:
+///
+/// ```ignore
+/// if x.is_some() {
+///     let x: i64 = x.clone().unwrap();
+///     /* corpo, lendo `x` como i64 */
+/// }
+/// ```
+///
+/// O `.clone()` antes do `.unwrap()` não é supérfluo: `unwrap` **consome**
+/// o opcional, e o de fora precisa continuar vivo depois do `if` (é a única
+/// razão de o estreitamento não vazar ser uma questão de escopo, e não de
+/// valor movido). Para um `Option<i64>` o clone é uma cópia trivial que o
+/// rustc apaga; para `Option<String>` ele é o que evita o E0382.
+///
+/// **Atribuir dentro do ramo** é a armadilha que a T68 registrou: um
+/// `let x` novo é uma variável nova, e `x = 2` lá dentro escreveria nela,
+/// não na de fora. Quando o ramo atribui ao nome estreitado, a emissão muda
+/// de forma — um alias `&mut` para a variável externa é criado **antes** do
+/// sombreamento, e o valor volta por ele no fim do ramo:
+///
+/// ```ignore
+/// if x.is_some() {
+///     let titan_opt_x: &mut Option<i64> = &mut x;
+///     let mut x: i64 = titan_opt_x.clone().unwrap();
+///     /* corpo, que atribui a `x` */
+///     *titan_opt_x = Some(x);
+/// }
+/// ```
+///
+/// O write-back no fim (e não a cada atribuição) basta porque ninguém de
+/// fora do ramo enxerga a variável enquanto o ramo roda. Um `return` no
+/// meio do corpo pula o write-back — o que é exatamente o correto: a função
+/// termina ali e a variável externa morre sem ser observada.
+///
+/// Sem nomes estreitados — o caso de toda condição que não testa opcional —
+/// nada disso aparece e o corpo sai exatamente como antes da T69.
+fn emit_narrowed_block(out: &mut String, then: &TypedThen, depth: usize, ctx: Ctx) {
+    if then.narrowed.is_empty() {
+        emit_block_stats(out, &then.block, depth, ctx);
+        return;
+    }
+
+    // Tipo base de cada nome estreitado: o `Option<T>` está no tipo da
+    // condição, não aqui, então quem sabe o `T` é o próprio corpo — a
+    // primeira leitura do nome tem o tipo base que o checker lhe deu.
+    // Nome estreitado que o corpo nunca lê nem escreve não ganha ligação
+    // nenhuma: abrir um `let` que ninguém usa renderia `unused_variables`,
+    // e o critério de aceite da T69 é Rust gerado **sem warnings**.
+    let lidos = referenced_names(&then.block);
+
+    for nome in &then.narrowed {
+        let reatribuido = assigns_to_name(&then.block, nome);
+        if !lidos.contains(nome) && !reatribuido {
+            continue;
+        }
+        let Some(base) = narrowed_base_type(&then.condition, nome) else {
+            continue;
+        };
+        let t = rust_type_name(&base);
+        if reatribuido {
+            indent(out, depth);
+            out.push_str(&format!(
+                "let {}: &mut Option<{t}> = &mut {nome};\n",
+                alias_opcional(nome)
+            ));
+            indent(out, depth);
+            out.push_str(&format!(
+                "let mut {nome}: {t} = {}.clone().unwrap();\n",
+                alias_opcional(nome)
+            ));
+        } else {
+            indent(out, depth);
+            out.push_str(&format!("let {nome}: {t} = {nome}.clone().unwrap();\n"));
+        }
+    }
+
+    emit_block_stats(out, &then.block, depth, ctx);
+
+    // Write-back, na ordem inversa da abertura: o alias mais interno é o
+    // último aberto, e escrever de dentro para fora mantém cada `*alias`
+    // ainda em escopo.
+    for nome in then.narrowed.iter().rev() {
+        if assigns_to_name(&then.block, nome) && narrowed_base_type(&then.condition, nome).is_some()
+        {
+            indent(out, depth);
+            out.push_str(&format!("*{} = Some({nome});\n", alias_opcional(nome)));
+        }
+    }
+}
+
+/// Nome do alias `&mut Option<T>` que segura a variável externa enquanto o
+/// ramo estreitado a sombreia. Prefixo `titan_` como todo o resto do
+/// mangling do backend.
+fn alias_opcional(nome: &str) -> String {
+    format!("titan_opt_{nome}")
+}
+
+/// Tipo base do nome estreitado — o `T` de um `x: T?` que vale dentro do
+/// ramo.
+///
+/// A lista `narrowed` do `TypedThen` traz só os nomes; o tipo vem da
+/// **condição**, onde `x` ainda aparece com o tipo opcional que tinha antes
+/// do teste (`x ~= nil` tipa o `x` como `integer?`). Ler dali, e não do
+/// corpo, é o que faz um nome estreitado mas nunca usado no corpo continuar
+/// respondendo com o tipo certo.
+///
+/// `None` quer dizer que a condição não menciona o nome com tipo opcional —
+/// não deveria acontecer para um nome que o checker pôs em `narrowed`, mas
+/// devolver `None` deixa a emissão seguir sem desembrulhar nada em vez de
+/// entrar em pânico.
+fn narrowed_base_type(condition: &TypedExp, nome: &str) -> Option<Type> {
+    fn busca(exp: &TypedExp, nome: &str) -> Option<Type> {
+        if let TypedExpKind::Var(n) = &exp.kind
+            && n == nome
+            && let Type::Option { base } = &exp.ty
+        {
+            return Some(base.as_ref().clone());
+        }
+        // A condição só precisa ser varrida através do `and`, que é a única
+        // forma composta que o checker (`check_if_condition`) atravessa ao
+        // montar `narrowed`; o teste em si é sempre um `~=` no topo.
+        match &exp.kind {
+            TypedExpKind::Binop { lhs, rhs, .. } => busca(lhs, nome).or_else(|| busca(rhs, nome)),
+            _ => None,
+        }
+    }
+    busca(condition, nome)
+}
+
+/// `true` quando o bloco atribui **diretamente** ao nome (`x = ...`,
+/// `a, x = ...`) — o caso que obriga o write-back de
+/// [`emit_narrowed_block`].
+///
+/// Escrever *através* do nome (`x[1] = 9`, `x.campo = 9`) não conta: ali o
+/// alvo é o composto que o nome já aponta, e a variável externa em si não
+/// muda. Um `local x` novo dentro do ramo também não conta — é outra
+/// variável, que o próprio Rust sombreia.
+fn assigns_to_name(stat: &TypedStat, nome: &str) -> bool {
+    fn lvalue_e_o_nome(target: &TypedLValue, nome: &str) -> bool {
+        matches!(target, TypedLValue::Name(n) if n == nome)
+    }
+    fn stat_atribui(stat: &TypedStat, nome: &str) -> bool {
+        match stat {
+            TypedStat::Block { stats, .. } => stats.iter().any(|s| stat_atribui(s, nome)),
+            TypedStat::Assign { target, .. } => lvalue_e_o_nome(target, nome),
+            TypedStat::AssignMulti { targets, .. } => {
+                targets.iter().any(|t| lvalue_e_o_nome(t, nome))
+            }
+            TypedStat::If {
+                thens, elsestat, ..
+            } => {
+                thens.iter().any(|t| stat_atribui(&t.block, nome))
+                    || elsestat.as_ref().is_some_and(|e| stat_atribui(e, nome))
+            }
+            TypedStat::While { block, .. }
+            | TypedStat::Repeat { block, .. }
+            | TypedStat::For { block, .. } => stat_atribui(block, nome),
+            TypedStat::Decl { .. }
+            | TypedStat::DeclMulti { .. }
+            | TypedStat::Call { .. }
+            | TypedStat::Return { .. }
+            | TypedStat::Break { .. }
+            | TypedStat::Continue { .. } => false,
+        }
+    }
+    stat_atribui(stat, nome)
 }
 
 fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
@@ -509,7 +685,7 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                 out.push_str(keyword);
                 out.push_str(&emit_delimited_exp(&then.condition, ctx));
                 out.push_str(" {\n");
-                emit_block_stats(out, &then.block, depth + 1, ctx);
+                emit_narrowed_block(out, then, depth + 1, ctx);
                 indent(out, depth);
                 out.push('}');
                 keyword = " else if ";
@@ -812,6 +988,12 @@ fn emit_multi_values(
 /// [`emit_delimited_exp`].
 fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
     match &exp.kind {
+        // `nil` num destino opcional (T69) é `None`, não `()`: o checker
+        // (`widen_to_option`) deixa o literal intacto e só troca o `ty` para
+        // o `Option`, justamente para a decisão cair aqui. O `nil` do tipo
+        // `nil` — o retorno vazio, o valor de um `Decl` sem tipo opcional —
+        // continua `()` como sempre foi.
+        TypedExpKind::Nil if matches!(exp.ty, Type::Option { .. }) => "None".to_string(),
         TypedExpKind::Nil => "()".to_string(),
         TypedExpKind::Bool(v) => v.to_string(),
         TypedExpKind::Integer(v) => v.to_string(),
@@ -844,6 +1026,15 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::Adjust(inner) => format!("{}.0", emit_exp(inner, ctx)),
         TypedExpKind::Extra { exp: inner, index } => {
             format!("{}.{index}", emit_exp(inner, ctx))
+        }
+        // Injeção `T → T?` (T69): o `SomeOf` que o checker planta no ponto
+        // exato em que o destino declara `T?` vira o `Some(...)` do Rust.
+        // O valor de dentro passa por [`emit_slot_value`] com o **tipo
+        // base**, e não por `emit_exp` cru, porque `Some(...)` é um slot
+        // como qualquer outro: `local s: string? = t` precisa de
+        // `Some(t.clone())`, senão o `t` de fora sairia movido.
+        TypedExpKind::SomeOf(inner) => {
+            format!("Some({})", emit_slot_value(&inner.ty, inner, ctx))
         }
     }
 }
@@ -1158,6 +1349,14 @@ fn emit_shift(op: BinOp, lhs: &TypedExp, rhs: &TypedExp, ctx: Ctx) -> String {
 /// número (com coerção int→float quando os lados divergem), string com
 /// string, e boolean com boolean (só `==`/`~=`).
 fn emit_comparison(symbol: &str, lhs: &TypedExp, rhs: &TypedExp, ctx: Ctx) -> String {
+    // Teste de presença (T69): `x ~= nil` / `nil ~= x` sobre um opcional é
+    // `x.is_some()`, e `==` é `x.is_none()`. O mapeamento direto sairia
+    // `x != ()` — nem compila, porque `Option<T>` não se compara com `()`.
+    // O checker (T68) só deixa um opcional chegar a uma comparação quando o
+    // outro lado é `nil`, então basta olhar de que lado está o opcional.
+    if let Some(rendered) = emit_presence_test(symbol, lhs, rhs, ctx) {
+        return rendered;
+    }
     if matches!(lhs.ty, Type::Integer | Type::Float) {
         // Mesma regra de `numeric_result`: qualquer Float promove os dois
         // lados para f64.
@@ -1184,6 +1383,28 @@ fn emit_comparison(symbol: &str, lhs: &TypedExp, rhs: &TypedExp, ctx: Ctx) -> St
     }
     // Igualdade de boolean: `bool == bool` direto.
     format!("{} {symbol} {}", emit_exp(lhs, ctx), emit_exp(rhs, ctx))
+}
+
+/// `x ~= nil` → `x.is_some()`, `x == nil` → `x.is_none()` (T69), nas duas
+/// ordens dos operandos.
+///
+/// Devolve `None` quando a comparação não envolve opcional — aí
+/// [`emit_comparison`] segue pelo caminho de sempre. O lado `nil` não é
+/// emitido: em Rust o teste é um método sobre o próprio opcional, e emitir
+/// o `None` do outro lado (`x != None`) exigiria `PartialEq` e anotação de
+/// tipo que `is_some()`/`is_none()` dispensam.
+fn emit_presence_test(symbol: &str, lhs: &TypedExp, rhs: &TypedExp, ctx: Ctx) -> Option<String> {
+    let metodo = match symbol {
+        "!=" => "is_some",
+        "==" => "is_none",
+        _ => return None,
+    };
+    let opcional = match (&lhs.ty, &rhs.ty) {
+        (Type::Option { .. }, Type::Nil) => lhs,
+        (Type::Nil, Type::Option { .. }) => rhs,
+        _ => return None,
+    };
+    Some(format!("{}.{metodo}()", emit_exp(opcional, ctx)))
 }
 
 /// Operando numérico já validado pelo checker: `Integer` em posição cujo
@@ -1484,6 +1705,13 @@ fn rust_type_name(ty: &Type) -> String {
             )
         }
         Type::Record { name, .. } => name.clone(),
+        // `T?` (T69) → `Option<T>`. O braço que a T68 deixou faltando: até
+        // aqui um tipo opcional caía no `unreachable!` abaixo, e por isso
+        // `generate` tinha de recusar o programa inteiro antes de emitir
+        // qualquer coisa. O `base` passa por esta mesma função, então
+        // composto dentro de opcional sai `Option<Vec<i64>>` e segue o ADR
+        // 0006/0007 como qualquer outro composto.
+        Type::Option { base } => format!("Option<{}>", rust_type_name(base)),
         // Tipo opaco de capability (T42): o caminho Rust totalmente
         // qualificado que o checker já resolveu via `requalify_rettype`
         // (`titan_data::DataFrame`), nunca o `name` Titan cru.
@@ -2990,6 +3218,234 @@ end"#;
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
             "swap-2-1\ndivmod-3-1\nstr-dois-um\nvetor-20-10\n"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    // ---- T69: `Option` no Rust gerado ---------------------------------
+
+    #[test]
+    fn t69_tipo_opcional_vira_option() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer? = nil\n\
+             \x20   if x ~= nil then\n\
+             \x20       print(\"\" .. x)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("let x: Option<i64> = None;"), "{rust}");
+    }
+
+    /// `nil` só vira `None` quando o destino é opcional — o `nil` do tipo
+    /// `nil` continua `()`, que é o que a função sem retorno devolve.
+    #[test]
+    fn t69_valor_do_tipo_base_vira_some() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer? = 10\n\
+             \x20   if x ~= nil then\n\
+             \x20       print(\"\" .. x)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("let x: Option<i64> = Some(10);"), "{rust}");
+    }
+
+    /// `Some(...)` é um slot como outro qualquer: a `string` de dentro sai
+    /// dona, senão o valor de fora sairia movido.
+    #[test]
+    fn t69_some_de_string_clona_o_valor_de_dentro() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local t: string = \"oi\"\n\
+             \x20   local s: string? = t\n\
+             \x20   if s ~= nil then\n\
+             \x20       print(s)\n\
+             \x20   end\n\
+             \x20   print(t)\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(
+            rust.contains("let s: Option<String> = Some(t.clone());"),
+            "{rust}"
+        );
+    }
+
+    /// O teste de presença vira método sobre o opcional — `x != ()` nem
+    /// compilaria.
+    #[test]
+    fn t69_teste_de_presenca_vira_is_some_e_is_none() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       print(\"\" .. x)\n\
+             \x20   end\n\
+             \x20   if x == nil then\n\
+             \x20       print(\"vazio\")\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("if x.is_some() {"), "{rust}");
+        assert!(rust.contains("if x.is_none() {"), "{rust}");
+        assert!(!rust.contains("x != ()"), "{rust}");
+    }
+
+    /// `nil ~= x` estreita igual — a ordem dos operandos não muda a emissão.
+    #[test]
+    fn t69_teste_de_presenca_com_nil_do_lado_esquerdo() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer? = 1\n\
+             \x20   if nil ~= x then\n\
+             \x20       print(\"\" .. x)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("if x.is_some() {"), "{rust}");
+    }
+
+    /// Ramo que só **lê** o nome estreitado: ligação simples, sem `mut`,
+    /// sem alias e sem write-back.
+    #[test]
+    fn t69_ramo_que_so_le_abre_ligacao_simples() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       print(\"\" .. x)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("let x: i64 = x.clone().unwrap();"), "{rust}");
+        assert!(!rust.contains("titan_opt_x"), "{rust}");
+    }
+
+    /// A armadilha que a T68 registrou: atribuir dentro do ramo estreitado
+    /// precisa alcançar a variável de fora, não a ligação nova.
+    #[test]
+    fn t69_atribuicao_no_ramo_estreitado_volta_para_a_variavel_externa() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       x = x + 10\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(
+            rust.contains("let titan_opt_x: &mut Option<i64> = &mut x;"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("let mut x: i64 = titan_opt_x.clone().unwrap();"),
+            "{rust}"
+        );
+        assert!(rust.contains("*titan_opt_x = Some(x);"), "{rust}");
+    }
+
+    /// Nome estreitado que o corpo nunca menciona não abre ligação nenhuma
+    /// — um `let` não lido seria `unused_variables` no Rust gerado.
+    #[test]
+    fn t69_nome_estreitado_sem_uso_nao_abre_ligacao() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       print(\"presente\")\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(!rust.contains("let x: i64"), "{rust}");
+    }
+
+    /// Composto dentro de `Option` segue o ADR 0006/0007: o `Vec`/`HashMap`
+    /// entra em `Option<...>` e o retorno sai por valor.
+    #[test]
+    fn t69_composto_dentro_de_opcional() {
+        let rust = generate_source(
+            "function f(): {integer}?\n\
+             \x20   return nil\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local v: {integer}? = f()\n\
+             \x20   if v ~= nil then\n\
+             \x20       print(\"\" .. #v)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(
+            rust.contains("pub fn titan_f() -> Option<Vec<i64>> {"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("let v: Vec<i64> = v.clone().unwrap();"),
+            "{rust}"
+        );
+    }
+
+    /// O critério de aceite da T69 em execução real: uma função que devolve
+    /// `integer?`, um chamador que testa, e Rust gerado **sem warnings**.
+    #[test]
+    fn t69_opcional_compila_e_roda_sem_warnings() {
+        let rust = generate_source(
+            "function busca(v: {integer}, alvo: integer): integer?\n\
+             \x20   local i: integer = 1\n\
+             \x20   while i <= #v do\n\
+             \x20       if v[i] == alvo then\n\
+             \x20           return i\n\
+             \x20       end\n\
+             \x20       i = i + 1\n\
+             \x20   end\n\
+             \x20   return nil\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local v: {integer} = {10, 20, 30}\n\
+             \x20   local achou: integer? = busca(v, 20)\n\
+             \x20   if achou ~= nil then\n\
+             \x20       print(\"achou-\" .. achou)\n\
+             \x20   end\n\
+             \x20   local nao: integer? = busca(v, 99)\n\
+             \x20   if nao == nil then\n\
+             \x20       print(\"nao-achou\")\n\
+             \x20   end\n\
+             \x20   local s: string? = \"oi\"\n\
+             \x20   if s ~= nil then\n\
+             \x20       print(\"str-\" .. s)\n\
+             \x20   end\n\
+             \x20   local acc: integer? = 0\n\
+             \x20   local i: integer = 1\n\
+             \x20   while i <= 3 do\n\
+             \x20       if acc ~= nil then\n\
+             \x20           acc = acc + i\n\
+             \x20       end\n\
+             \x20       i = i + 1\n\
+             \x20   end\n\
+             \x20   if acc ~= nil then\n\
+             \x20       print(\"acc-\" .. acc)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t69_opcional");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "achou-2\nnao-achou\nstr-oi\nacc-6\n"
         );
         assert_eq!(output.status.code(), Some(0));
     }

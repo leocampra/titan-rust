@@ -40,9 +40,16 @@
 //!   expressão ajusta para o primeiro valor (`TypedExpKind::Adjust`); o
 //!   enésimo valor é `TypedExpKind::Extra`.
 //!
-//! Tudo fora do subconjunto (records, maps, arrays manipuláveis, `import`,
-//! `foreign import`, métodos, `Option`/`?`) produz um erro semântico claro —
-//! nunca panic.
+//! - **Tipos opcionais** (T68): `T?` entra no sistema de tipos, com a
+//!   injeção `T → T?` nos pontos em que o destino está escrito
+//!   ([`Checker::widen_to_option`]), a recusa de usar um `T?` sem testar
+//!   ([`Checker::reject_option`]) e o **estreitamento de fluxo** de
+//!   `if x ~= nil then` ([`Checker::check_if_condition`]), que vale só
+//!   dentro do ramo. `T?` é invariante em `compatible` (ADR 0008) e
+//!   continua sendo: o que a T68 acrescenta é injeção, não variância.
+//!
+//! Tudo fora do subconjunto (`foreign import`, métodos com `:`, cast `as`)
+//! produz um erro semântico claro — nunca panic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -366,6 +373,23 @@ pub struct TypedThen {
     pub loc: Loc,
     pub condition: TypedExp,
     pub block: TypedStat,
+    /// Nomes que a condição deste ramo estreitou de `T?` para `T` (T68), na
+    /// ordem em que aparecem na condição. Dentro de `block` cada um deles
+    /// **já** tem o tipo base — é o que faz `if x ~= nil then print(x) end`
+    /// tipar sem o usuário escrever desembrulho nenhum.
+    ///
+    /// O codegen (T69) lê esta lista para emitir `if let Some(x) = x` em vez
+    /// de comparar com `None` e desembrulhar dentro do corpo; enquanto ela
+    /// estiver vazia — o caso de toda condição que não testa opcional —
+    /// nada muda na emissão.
+    ///
+    /// **Armadilha para a T69:** um `if let Some(x) = x` liga um `x` novo,
+    /// então uma atribuição a `x` dentro do ramo escreveria na ligação e
+    /// não na variável de fora. O checker não proíbe essa atribuição (ela é
+    /// válida e tipa contra o **tipo base**, o que aliás impede
+    /// `x = nil` lá dentro), então quem emitir precisa escrever de volta —
+    /// `if let Some(x) = x` sobre uma referência, ou o `match` equivalente.
+    pub narrowed: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -451,6 +475,17 @@ pub enum TypedExpKind {
         exp: Box<TypedExp>,
         index: usize,
     },
+    /// Injeção `T → T?` (T68): um valor do tipo base entregue onde o destino
+    /// declara `T?`. O `ty` do `TypedExp` que envolve este nó é o `Option`;
+    /// `exp` é o valor original, com o tipo base.
+    ///
+    /// É um nó explícito, e não um `ty` reescrito em silêncio, porque é
+    /// exatamente aqui que o codegen (T69) emite o `Some(...)` — decidir
+    /// isso no checker, onde o tipo do destino é conhecido, evita o backend
+    /// ter de reinferir contexto. O `nil` entregue a um `T?` **não** passa
+    /// por aqui: continua `TypedExpKind::Nil`, só que com `ty` opcional, e
+    /// vira `None`.
+    SomeOf(Box<TypedExp>),
 }
 
 /// Operador binário já resolvido (T13). Enum, não `String`, para o `match`
@@ -1110,9 +1145,34 @@ impl Checker {
                 );
                 None
             }
-            ast::Type::TypeOption { loc, .. } => {
-                self.error(*loc, "tipo opcional (`?`) não é suportado nesta fase.");
-                None
+            // `T?` (T68) — o tipo que o ADR 0008 adiou desde a Fase 2.
+            //
+            // Duas bases não fazem sentido e saem aqui, cada uma com sua
+            // mensagem: `nil?` (o "ausente" já é o próprio `nil`) e `value?`
+            // (`value` do gradual typing já aceita `nil`, então o `?` não
+            // acrescentaria estado nenhum). `T??` nem chega — o parser
+            // recusa o segundo `?`.
+            ast::Type::TypeOption { loc, basetype } => {
+                let base = self.resolve_type(basetype)?;
+                match base {
+                    Type::Nil => {
+                        self.error(
+                            *loc,
+                            "`nil?` não faz sentido: `nil` já é a ausência de valor.",
+                        );
+                        None
+                    }
+                    Type::Value => {
+                        self.error(
+                            *loc,
+                            "`value?` não faz sentido: `value` já aceita `nil`.",
+                        );
+                        None
+                    }
+                    base => Some(Type::Option {
+                        base: Box::new(base),
+                    }),
+                }
             }
             ast::Type::TypeName { loc, name } => match self.records.get(name).cloned() {
                 Some(ty) => {
@@ -1304,9 +1364,19 @@ impl Checker {
                 };
                 let value = self.check_exp(&exps[0], declared.as_ref())?;
 
-                let ty = match declared {
+                let (ty, value) = match declared {
                     Some(declared) => {
+                        // `T → T?` e `nil → T?` (T68) antes da conferência:
+                        // é a única injeção que `compatible` não faz, e
+                        // fazê-la aqui é o que permite
+                        // `local x: integer? = 10` e `... = nil`.
+                        let value = Self::widen_to_option(&declared, value);
                         if !declared.compatible(&value.ty) {
+                            // `T?` num destino `T` (T68): a mensagem que
+                            // ensina o teste, não a genérica de tipos.
+                            if self.reject_option_where_base_expected(&declared, &value) {
+                                return None;
+                            }
                             self.error(
                                 decl.loc,
                                 format!(
@@ -1318,9 +1388,52 @@ impl Checker {
                             );
                             return None;
                         }
-                        declared
+                        (declared, value)
                     }
-                    None => value.ty.clone(),
+                    // `local x? = exp` (T68, `Decl.option`): o tipo é o do
+                    // valor **envolvido** no opcional, e não o do valor —
+                    // é a forma de declarar `T?` sem repetir o `T`. Um
+                    // `local x? = nil` não tem base para inferir: erro
+                    // claro, com a saída escrita (anotar o tipo).
+                    None if decl.option => {
+                        if matches!(value.ty, Type::Nil) {
+                            self.error(
+                                decl.loc,
+                                format!(
+                                    "não dá para inferir o tipo de '{}?' a partir de `nil`: escreva o tipo (`local {}: T? = nil`).",
+                                    decl.name, decl.name
+                                ),
+                            );
+                            return None;
+                        }
+                        let optional = Type::Option {
+                            base: Box::new(value.ty.clone()),
+                        };
+                        let value = Self::widen_to_option(&optional, value);
+                        (optional, value)
+                    }
+                    // Sem anotação e sem `?`: o tipo é o do valor, e um
+                    // valor opcional **não** é inferido como opcional por
+                    // acidente — `local y = x` com `x: integer?` seria
+                    // propagar a ausência sem o usuário ter pedido. O
+                    // original faz o mesmo, forçando o valor
+                    // (`tryforce`/"never infer option type",
+                    // `checker.lua:322`); aqui, sem cast implícito, a
+                    // forma honesta é recusar e apontar as duas saídas.
+                    None => {
+                        if matches!(value.ty, Type::Option { .. }) {
+                            self.error(
+                                decl.loc,
+                                format!(
+                                    "tipo opcional não é inferido: escreva `local {}? = ...` para declarar {} ou teste com `if ... ~= nil then` antes.",
+                                    decl.name,
+                                    type_name(&value.ty)
+                                ),
+                            );
+                            return None;
+                        }
+                        (value.ty.clone(), value)
+                    }
                 };
 
                 let decl_id = self.next_decl_id;
@@ -1378,8 +1491,20 @@ impl Checker {
                     return None;
                 }
 
+                // `return nil` / `return 10` numa função `: integer?`
+                // (T68) — mesma injeção, com o destino escrito na
+                // assinatura.
+                let typed_exps: Vec<TypedExp> = typed_exps
+                    .into_iter()
+                    .zip(rettypes)
+                    .map(|(exp, expected)| Self::widen_to_option(expected, exp))
+                    .collect();
+
                 for (found, expected) in typed_exps.iter().zip(rettypes) {
                     if !expected.compatible(&found.ty) {
+                        if self.reject_option_where_base_expected(expected, found) {
+                            return None;
+                        }
                         self.error(
                             found.loc,
                             format!(
@@ -1410,13 +1535,22 @@ impl Checker {
                 let mut typed_thens = Vec::with_capacity(thens.len());
                 let mut ok = true;
                 for then in thens {
-                    let condition = self.check_condition(&then.condition, "if");
+                    // Estreitamento de fluxo (T68): a condição pode tornar
+                    // um `T?` um `T` **dentro** do seu ramo. O bloco aberto
+                    // aqui é o que hospeda os símbolos estreitados, e é
+                    // fechá-lo logo depois do corpo que garante que o
+                    // estreitamento não vaza — nem para o `elseif`/`else`
+                    // seguintes, nem para depois do `if`.
+                    self.st.open_block();
+                    let (condition, narrowed) = self.check_if_condition(&then.condition);
                     let block = self.check_stat(&then.block, rettypes);
+                    self.st.close_block();
                     match (condition, block) {
                         (Some(condition), Some(block)) => typed_thens.push(TypedThen {
                             loc: then.loc,
                             condition,
                             block,
+                            narrowed,
                         }),
                         _ => ok = false,
                     }
@@ -1500,6 +1634,13 @@ impl Checker {
     /// types.Boolean())` do original.
     fn check_condition(&mut self, exp: &Exp, contexto: &str) -> Option<TypedExp> {
         let typed = self.check_exp(exp, Some(&Type::Boolean))?;
+        // `if x then` com `x: boolean?` (T68): Titan não tem truthy/falsy
+        // (decisão 7 da Fase 1), então a condição precisa do valor presente
+        // — e a mensagem que ensina o teste vale mais que "precisa ser
+        // boolean, encontrado boolean?".
+        if self.reject_option(&typed) {
+            return None;
+        }
         if !Type::Boolean.compatible(&typed.ty) {
             self.error(
                 typed.loc,
@@ -1511,6 +1652,108 @@ impl Checker {
             return None;
         }
         Some(typed)
+    }
+
+    /// A condição de um ramo `if`/`elseif`, com o estreitamento de fluxo da
+    /// T68 aplicado à medida que ela é lida.
+    ///
+    /// Só uma forma estreita, e é a que o Titan precisa ter: `x ~= nil`
+    /// (nas duas ordens), com `x` sendo um nome de tipo `T?`. O símbolo
+    /// estreitado é acrescentado ao bloco que o chamador **já abriu**, o
+    /// que faz o estreitamento valer do ponto da condição em diante e
+    /// morrer quando esse bloco fecha.
+    ///
+    /// Ler a condição em ordem importa por causa do `and`: em
+    /// `x ~= nil and x > 0`, o lado direito precisa enxergar o `x` já
+    /// estreitado, senão o próprio idioma canônico do teste não tiparia.
+    /// Por isso este método desce pelo `and` em vez de tipar a condição
+    /// inteira de uma vez — e desce **só** pelo `and`: num `or`, nenhum dos
+    /// lados sabe o que o outro testou, e num `not` o estreitamento se
+    /// inverteria.
+    ///
+    /// Divergência deliberada do Titan original, que não estreita nada: lá
+    /// (`checker.lua:183`, `tryforce`) um `T?` usado como `T` ganha um cast
+    /// implícito, sem que o fluxo tenha provado coisa alguma. Um cast que o
+    /// usuário não escreveu e que pode falhar é exatamente o que a
+    /// convenção deste projeto — erro claro em português, nunca panic —
+    /// existe para evitar.
+    ///
+    /// `while`/`repeat` ficam de fora de propósito, e não por falta de
+    /// oportunidade: o corpo do laço pode atribuir `nil` ao nome e a volta
+    /// seguinte entraria com ele ausente. Provar que não atribui é análise
+    /// de fluxo de verdade, que este checker não faz — e um estreitamento
+    /// que às vezes mente é pior que nenhum. No `if` a pergunta não se
+    /// coloca: o ramo executa uma vez, e uma atribuição lá dentro tipa
+    /// contra o tipo **base** (o que, de quebra, recusa `x = nil` dentro do
+    /// ramo que acabou de provar que `x` não é nil).
+    ///
+    /// Devolve a condição tipada (`None` quando ela não tipa) e os nomes
+    /// estreitados, que o `TypedThen` carrega para o codegen (T69).
+    fn check_if_condition(&mut self, exp: &Exp) -> (Option<TypedExp>, Vec<String>) {
+        if let Exp::ExpBinop { loc, lhs, op, rhs } = exp
+            && op == "and"
+        {
+            let (typed_lhs, mut narrowed) = self.check_if_condition(lhs);
+            let (typed_rhs, narrowed_rhs) = self.check_if_condition(rhs);
+            narrowed.extend(narrowed_rhs);
+            let (Some(typed_lhs), Some(typed_rhs)) = (typed_lhs, typed_rhs) else {
+                return (None, narrowed);
+            };
+            // Os dois lados de um `and` são boolean estrito (decisão 7 da
+            // Fase 1) — a mesma exigência que `check_binop` faz, repetida
+            // aqui porque a condição não passa mais por ele.
+            let mut ok = true;
+            for side in [&typed_lhs, &typed_rhs] {
+                if !side.ty.equals(&Type::Boolean) {
+                    self.error(
+                        side.loc,
+                        format!(
+                            "operando de `and` precisa ser boolean, encontrado {}.",
+                            type_name(&side.ty)
+                        ),
+                    );
+                    ok = false;
+                }
+            }
+            if !ok {
+                return (None, narrowed);
+            }
+            return (
+                Some(TypedExp {
+                    loc: *loc,
+                    ty: Type::Boolean,
+                    kind: TypedExpKind::Binop {
+                        op: BinOp::And,
+                        lhs: Box::new(typed_lhs),
+                        rhs: Box::new(typed_rhs),
+                    },
+                }),
+                narrowed,
+            );
+        }
+
+        let nome_testado = presence_test_name(exp);
+        let condition = self.check_condition(exp, "if");
+        let mut narrowed = Vec::new();
+        if condition.is_some()
+            && let Some(nome) = nome_testado
+            && let Some(symbol) = self.st.find_symbol(&nome).cloned()
+            && let Type::Option { base } = &symbol.ty
+        {
+            // O símbolo estreitado guarda o **mesmo** `kind` e `def_loc` do
+            // original: atribuir ao nome dentro do ramo continua alcançando
+            // a mesma declaração (e o mesmo `let mut` no fix-up), e
+            // go-to-definition continua saltando para onde ele foi
+            // declarado. Só o tipo muda.
+            self.st.add_symbol(
+                &nome,
+                base.as_ref().clone(),
+                symbol.kind.clone(),
+                symbol.def_loc,
+            );
+            narrowed.push(nome);
+        }
+        (condition, narrowed)
     }
 
     /// `repeat block until cond` (T64).
@@ -1594,6 +1837,17 @@ impl Checker {
             Some(exp) => Some(self.check_exp(exp, None)?),
             None => None,
         };
+
+        // `for i? = 1, 10` (T68): a variável de controle recebe um valor a
+        // cada volta, nunca a ausência de um — o `?` do lado do nome, que o
+        // `local` usa para inferir `T?`, não tem leitura aqui.
+        if decl.option {
+            self.error(
+                decl.loc,
+                "a variável de controle do `for` não pode ser opcional (`?`).",
+            );
+            return None;
+        }
 
         let var_ty = match &decl.r#type {
             Some(annotated) => self.resolve_type(annotated)?,
@@ -1824,8 +2078,14 @@ impl Checker {
     /// mensagem nomeia a variável quando o alvo é um nome — as duas grafias
     /// que existiam antes da T67, preservadas palavra por palavra.
     fn coerce_assign_value(&mut self, alvo: &AssignTarget, value: TypedExp) -> Option<TypedExp> {
+        // `x = 10` e `x = nil` com `x: integer?` (T68): mesma injeção da
+        // declaração, no outro ponto em que o destino está escrito.
+        let value = Self::widen_to_option(&alvo.ty, value);
         if alvo.ty.compatible(&value.ty) {
             return Some(value);
+        }
+        if self.reject_option_where_base_expected(&alvo.ty, &value) {
+            return None;
         }
         let mensagem = match &alvo.name {
             Some(name) => format!(
@@ -1841,6 +2101,101 @@ impl Checker {
         };
         self.error(value.loc, mensagem);
         None
+    }
+
+    // ---- `Option`/`?` (T68) ---------------------------------------------
+
+    /// Ajusta um valor ao destino quando o destino é `T?` — a injeção
+    /// `T → T?` e `nil → T?` (T68).
+    ///
+    /// `compatible` **não** faz esse trabalho de propósito: `Option` é
+    /// invariante lá (ADR 0008), e tem de continuar sendo, senão
+    /// `{integer}?` aceitaria `{value}?`. O que falta não é variância, é a
+    /// **injeção** do tipo base no opcional, que só é válida num sentido e
+    /// só num ponto conhecido: onde o destino está escrito. É o mesmo lugar
+    /// em que o Titan original insere seu `trycoerce`
+    /// (`checker.lua:926-930`), e é por isso que a marcação vira um nó
+    /// (`SomeOf`) em vez de uma reescrita silenciosa de `ty`: o codegen
+    /// (T69) emite o `Some(...)` exatamente aqui.
+    ///
+    /// Valores que já são do tipo do destino passam intactos, e isso inclui
+    /// um `T?` entregue a um `T?` — a injeção não se aplica duas vezes.
+    fn widen_to_option(expected: &Type, value: TypedExp) -> TypedExp {
+        let Type::Option { base } = expected else {
+            return value;
+        };
+        match &value.ty {
+            // `nil` não vira `Some(nil)`: vira `None`, e o nó continua
+            // sendo o literal — só o tipo passa a ser o opcional.
+            Type::Nil => TypedExp {
+                ty: expected.clone(),
+                ..value
+            },
+            // `T?` já é o destino (ou é incompatível com ele, e quem chama
+            // reporta): nada a injetar.
+            Type::Option { .. } => value,
+            found if base.compatible(found) => TypedExp {
+                loc: value.loc,
+                ty: expected.clone(),
+                kind: TypedExpKind::SomeOf(Box::new(value)),
+            },
+            _ => value,
+        }
+    }
+
+    /// Recusa um valor opcional usado onde o tipo base é exigido — a regra
+    /// "usar um `T?` sem testar é erro claro" da T68.
+    ///
+    /// A mensagem nomeia a variável quando dá (o caso que importa, porque é
+    /// o nome que o usuário vai escrever no teste) e sempre aponta a saída:
+    /// o `if ... ~= nil`, que é o único desembrulho que a linguagem tem.
+    ///
+    /// Devolve `true` quando recusou, para o chamador encadear com os `ok`
+    /// que já acumula.
+    fn reject_option(&mut self, exp: &TypedExp) -> bool {
+        let Type::Option { base } = &exp.ty else {
+            return false;
+        };
+        let base = type_name(base);
+        let mensagem = match &exp.kind {
+            TypedExpKind::Var(name) => format!(
+                "'{name}' é {base}? e pode ser nil: teste com `if {name} ~= nil then` antes de usar como {base}."
+            ),
+            _ => format!(
+                "este valor é {base}? e pode ser nil: guarde-o num `local` e teste com `if nome ~= nil then` antes de usar como {base}."
+            ),
+        };
+        self.error(exp.loc, mensagem);
+        true
+    }
+
+    /// Recusa opcional em cada operando de uma vez, sem curto-circuito: os
+    /// dois lados de `a + b` com ambos opcionais rendem os dois erros, como
+    /// em toda checagem de operando deste arquivo.
+    fn reject_option_operands(&mut self, sides: [&TypedExp; 2]) -> bool {
+        // `|` e não `||`: os dois lados precisam ser avaliados.
+        self.reject_option(sides[0]) | self.reject_option(sides[1])
+    }
+
+    /// O mesmo erro, mas na checagem de compatibilidade com um destino
+    /// escrito (declaração, atribuição, argumento, retorno): entregar um
+    /// `T?` onde se pede `T` é o caso principal de "usar sem testar", e
+    /// "esperado integer, encontrado integer?" não diz o que fazer.
+    ///
+    /// Só fala quando o destino **não** é opcional: entre dois opcionais de
+    /// bases diferentes o problema é de tipo, não de ausência, e aí a
+    /// mensagem genérica do chamador é a certa.
+    ///
+    /// Devolve `true` quando recusou.
+    fn reject_option_where_base_expected(
+        &mut self,
+        expected: &Type,
+        found: &TypedExp,
+    ) -> bool {
+        if matches!(expected, Type::Option { .. } | Type::Value) {
+            return false;
+        }
+        self.reject_option(found)
     }
 
     /// Registra o `DeclId` do alvo em `self.assigned` — é o que faz
@@ -1867,6 +2222,23 @@ impl Checker {
                 None => None,
             };
             anotados.push(anotado);
+        }
+
+        // `local a?, b = ...` (T68): o `?` do lado do nome infere o tipo do
+        // valor, e a forma múltipla não tem como fazer isso — o tipo do
+        // alvo entra em `check_multi_values` **antes** de o valor ser
+        // tipado. Em vez de inferir errado, erro claro com a saída escrita.
+        for decl in decls {
+            if decl.option {
+                self.error(
+                    decl.loc,
+                    format!(
+                        "`{}?` não vale em declaração múltipla: escreva o tipo (`local {}: T?, ...`).",
+                        decl.name, decl.name
+                    ),
+                );
+                return None;
+            }
         }
 
         let (values, tipos): (TypedMultiValues, Vec<Type>) =
@@ -1983,6 +2355,13 @@ impl Checker {
                 return None;
             }
             // Cada componente da tupla precisa caber no seu alvo.
+            //
+            // Aqui **não** cabe a injeção `T → T?` da T68: a tupla é
+            // desestruturada num `let` só, e não há expressão por alvo onde
+            // pendurar o `Some(...)`. Quem quiser um `T?` a partir de uma
+            // função que devolve `T` declara o retorno como `T?`; o caso
+            // contrário cai na mensagem de tipos incompatíveis logo abaixo,
+            // que já nomeia os dois tipos.
             let mut tipos = Vec::with_capacity(alvos);
             for (i, rettype) in rettypes.iter().enumerate() {
                 match &esperados[i] {
@@ -2024,9 +2403,17 @@ impl Checker {
         for (i, exp) in exps.iter().enumerate() {
             let esperado = esperados[i].as_ref();
             let value = self.check_exp(exp, esperado)?;
+            // `T → T?` / `nil → T?` (T68), igual à forma single-target.
+            let value = match esperado {
+                Some(esperado) => Self::widen_to_option(esperado, value),
+                None => value,
+            };
             match esperado {
                 Some(esperado) => {
                     if !esperado.compatible(&value.ty) {
+                        if self.reject_option_where_base_expected(esperado, &value) {
+                            return None;
+                        }
                         self.error(
                             value.loc,
                             format!(
@@ -2088,6 +2475,13 @@ impl Checker {
                 for e in exps {
                     match self.check_exp(e, None) {
                         Some(typed) => {
+                            // `T?` concatenado tem a mensagem da T68, não a
+                            // genérica de operando de `..`.
+                            if self.reject_option(&typed) {
+                                ok = false;
+                                typed_exps.push(typed);
+                                continue;
+                            }
                             // Decisão 4 da Fase 1: `..` coage número→string
                             // (espírito do `trytostr` do original) — a
                             // conversão em si fica no codegen. `Boolean` e
@@ -2167,6 +2561,12 @@ impl Checker {
         // (checker.lua:646-662). `{}` vazio sem contexto não tem como
         // decidir — erro claro.
         match context {
+            // `local xs: {integer}? = {1, 2}` (T68): num destino opcional,
+            // quem desambigua o `{...}` é o tipo **base** — o `?` diz o que
+            // o destino aceita além do valor, não que forma o valor tem. A
+            // injeção `T → T?` acontece depois, em `widen_to_option`, no
+            // ponto onde o destino está escrito.
+            Some(Type::Option { base }) => self.check_init_list(loc, fields, Some(base.as_ref())),
             Some(Type::Array { elem }) => self.check_array_lit(loc, fields, Some(elem.as_ref())),
             Some(Type::Map { keys, values }) => {
                 self.check_map_lit(loc, fields, Some((keys.as_ref(), values.as_ref())))
@@ -2485,6 +2885,15 @@ impl Checker {
         let lhs = self.check_exp(lhs, None)?;
         let rhs = self.check_exp(rhs, None)?;
 
+        // Um `T?` só é operando legítimo de `==`/`~=` (o teste de presença);
+        // em qualquer outro operador é o erro "pode ser nil" da T68, e é
+        // melhor dá-lo aqui, uma vez, do que deixar cada regra abaixo
+        // reclamar que o operando "não é numérico" — o problema não é o
+        // tipo base, é a ausência possível.
+        if !matches!(op, BinOp::Eq | BinOp::Ne) && self.reject_option_operands([&lhs, &rhs]) {
+            return None;
+        }
+
         let ty = match op {
             // Ambos numéricos; int/int → int, qualquer float promove a float.
             // `//` entra aqui: no original é o mesmo braço de `+ - * %`
@@ -2504,12 +2913,28 @@ impl Checker {
                 Type::Float
             }
             // Igualdade: número com número (com coerção int→float),
-            // string/string ou boolean/boolean.
+            // string/string ou boolean/boolean — mais o teste de presença
+            // `T? == nil` / `T? ~= nil` (T68), o **único** desembrulho que
+            // a linguagem oferece e a porta de entrada do estreitamento.
+            //
+            // `T == nil` com `T` não-opcional segue sendo erro: a resposta
+            // seria constante, e a pergunta quase sempre denuncia um tipo
+            // escrito errado.
             BinOp::Eq | BinOp::Ne => {
+                let testa_presenca = (matches!(lhs.ty, Type::Option { .. })
+                    && matches!(rhs.ty, Type::Nil))
+                    || (matches!(lhs.ty, Type::Nil) && matches!(rhs.ty, Type::Option { .. }));
                 let both_numeric = is_numeric(&lhs.ty) && is_numeric(&rhs.ty);
                 let same_primitive =
                     lhs.ty.equals(&rhs.ty) && matches!(lhs.ty, Type::String | Type::Boolean);
-                if !(both_numeric || same_primitive) {
+                if !(testa_presenca || both_numeric || same_primitive) {
+                    // Um opcional comparado com algo que não é `nil`
+                    // (`x == 10`) é o erro de "usar sem testar", não o de
+                    // tipos incomparáveis: a mensagem que ensina a saída
+                    // vale mais aqui.
+                    if self.reject_option_operands([&lhs, &rhs]) {
+                        return None;
+                    }
                     self.error(
                         loc,
                         format!(
@@ -2655,6 +3080,11 @@ impl Checker {
         };
 
         let exp = self.check_exp(exp, None)?;
+        // Mesma regra do binário: `-x`, `not x`, `#x` e `~x` exigem o valor
+        // presente (T68).
+        if self.reject_option(&exp) {
+            return None;
+        }
         let ty = match op {
             UnOp::Neg => {
                 if !is_numeric(&exp.ty) {
@@ -2756,6 +3186,12 @@ impl Checker {
             },
             Var::VarBracket { loc, exp1, exp2 } => {
                 let base = self.check_exp(exp1, None)?;
+                // `xs[i]` com `xs: {integer}?` (T68): indexar um possível
+                // `nil` é o erro de "usar sem testar", não "não é possível
+                // indexar".
+                if self.reject_option(&base) {
+                    return None;
+                }
                 let (keys_ty, result_ty) = match &base.ty {
                     Type::Array { elem } => (Type::Integer, elem.as_ref().clone()),
                     Type::Map { keys, values } => (keys.as_ref().clone(), values.as_ref().clone()),
@@ -2775,6 +3211,9 @@ impl Checker {
                     }
                 };
                 let index = self.check_exp(exp2, Some(&keys_ty))?;
+                if self.reject_option(&index) {
+                    return None;
+                }
                 if !keys_ty.compatible(&index.ty) {
                     self.error(
                         index.loc,
@@ -2799,6 +3238,11 @@ impl Checker {
             }
             Var::VarDot { loc, exp, name } => {
                 let base = self.check_exp(exp, None)?;
+                // `p.x` com `p: Ponto?` (T68), pelo mesmo motivo da
+                // indexação.
+                if self.reject_option(&base) {
+                    return None;
+                }
                 if let Type::Opaque { .. } = &base.ty {
                     self.error(
                         base.loc,
@@ -3082,8 +3526,20 @@ impl Checker {
             return None;
         }
 
+        // `f(10)` com `f(x: integer?)` (T68): a injeção `T → T?` vale no
+        // argumento como vale na declaração — o tipo do destino está
+        // escrito, é o do parâmetro.
+        let typed_args: Vec<TypedExp> = typed_args
+            .into_iter()
+            .zip(&params)
+            .map(|(arg, expected)| Self::widen_to_option(expected, arg))
+            .collect();
+
         for (arg, expected) in typed_args.iter().zip(&params) {
             if !expected.compatible(&arg.ty) {
+                if self.reject_option_where_base_expected(expected, arg) {
+                    return None;
+                }
                 self.error(
                     arg.loc,
                     format!(
@@ -3227,6 +3683,31 @@ fn is_numeric(ty: &Type) -> bool {
 /// mutável (`check_call` insere seu `DeclId` em `assigned`). Consulta apenas
 /// o tipo, sem inflar `SymbolKind` com mais uma variante. `Opaque` entra na
 /// T40: o receptor de `df.soma(...)` é `&mut` pelo mesmo motivo.
+/// O nome testado por `nome ~= nil` (ou `nil ~= nome`) — o gatilho do
+/// estreitamento de fluxo da T68.
+///
+/// Reconhece **só** a variável nua, nas duas ordens. `p.campo ~= nil` e
+/// `xs[i] ~= nil` ficam de fora de propósito: estreitar um lugar exigiria
+/// provar que nada entre o teste e o uso o reescreveu, e não há nada no
+/// checker que prove isso hoje. `==` também fica de fora: ele estreitaria o
+/// ramo `else`, e este método só responde pelo ramo `then`.
+fn presence_test_name(exp: &Exp) -> Option<String> {
+    let Exp::ExpBinop { lhs, op, rhs, .. } = exp else {
+        return None;
+    };
+    if op != "~=" {
+        return None;
+    }
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (Exp::ExpVar { var, .. }, Exp::ExpNil { .. })
+        | (Exp::ExpNil { .. }, Exp::ExpVar { var, .. }) => match var.as_ref() {
+            Var::VarName { name, .. } => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn is_composite(ty: &Type) -> bool {
     matches!(
         ty,
@@ -5993,6 +6474,568 @@ end"#;
                 .message
                 .contains("2 alvo(s), mas a chamada produz 1 valor(es)")),
             "{errs:?}"
+        );
+    }
+
+    // ---- T68: `Option`/`?` e narrowing de fluxo -------------------------
+
+    /// Envolve `corpo` num `main` válido — o critério de aceite da T68 é
+    /// todo sobre statements dentro de uma função.
+    fn em_main(corpo: &str) -> String {
+        format!("function main(args: {{string}}): integer\n{corpo}\n    return 0\nend")
+    }
+
+    #[test]
+    fn t68_local_com_tipo_opcional_e_nil_tipa() {
+        let stats = typed_body_stats(&em_main("    local x: integer? = nil"));
+        let TypedStat::Decl { ty, value, .. } = &stats[0] else {
+            panic!("esperava Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(
+            *ty,
+            Type::Option {
+                base: Box::new(Type::Integer)
+            }
+        );
+        // `nil` no destino opcional continua sendo o literal (vira `None` na
+        // T69), com o tipo do destino — não um `SomeOf`.
+        assert_eq!(value.kind, TypedExpKind::Nil);
+        assert_eq!(*ty, value.ty);
+    }
+
+    #[test]
+    fn t68_valor_do_tipo_base_e_injetado_no_opcional() {
+        let stats = typed_body_stats(&em_main("    local x: integer? = 10"));
+        let TypedStat::Decl { ty, value, .. } = &stats[0] else {
+            panic!("esperava Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(
+            *ty,
+            Type::Option {
+                base: Box::new(Type::Integer)
+            }
+        );
+        let TypedExpKind::SomeOf(inner) = &value.kind else {
+            panic!("esperava SomeOf, obteve {:?}", value.kind);
+        };
+        assert_eq!(inner.ty, Type::Integer);
+        assert_eq!(inner.kind, TypedExpKind::Integer(10));
+    }
+
+    #[test]
+    fn t68_usar_opcional_direto_da_erro_claro_sobre_nil() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 10\n    local y: integer = x + 1",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'x' é integer? e pode ser nil")
+                    && e.message.contains("if x ~= nil then")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn t68_opcional_como_condicao_da_erro_claro() {
+        let errs =
+            check_source(&em_main("    local b: boolean? = true\n    if b then\n    end"))
+                .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn t68_narrowing_dentro_do_if_da_o_tipo_base() {
+        let stats = typed_body_stats(&em_main(
+            "    local x: integer? = 10\n\
+             \x20   if x ~= nil then\n\
+             \x20       local y: integer = x + 1\n\
+             \x20   end",
+        ));
+        let TypedStat::If { thens, .. } = &stats[1] else {
+            panic!("esperava If, obteve {:?}", stats[1]);
+        };
+        assert_eq!(thens[0].narrowed, vec!["x".to_string()]);
+    }
+
+    /// `nil ~= x` estreita igual a `x ~= nil` — a ordem dos operandos não é
+    /// parte da regra.
+    #[test]
+    fn t68_narrowing_funciona_com_nil_do_lado_esquerdo() {
+        let stats = typed_body_stats(&em_main(
+            "    local x: integer? = 10\n\
+             \x20   if nil ~= x then\n\
+             \x20       local y: integer = x\n\
+             \x20   end",
+        ));
+        let TypedStat::If { thens, .. } = &stats[1] else {
+            panic!("esperava If, obteve {:?}", stats[1]);
+        };
+        assert_eq!(thens[0].narrowed, vec!["x".to_string()]);
+    }
+
+    /// O critério de aceite em uma linha: o estreitamento **não** vaza para
+    /// depois do `if`.
+    #[test]
+    fn t68_narrowing_nao_vaza_para_depois_do_if() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 10\n\
+             \x20   if x ~= nil then\n\
+             \x20       local dentro: integer = x\n\
+             \x20   end\n\
+             \x20   local fora: integer = x",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+        // E só o uso de **fora** reclama: o de dentro tipou.
+        assert_eq!(errs.len(), 1, "{errs:?}");
+    }
+
+    /// Nem para o `else` do mesmo `if`: lá o valor continua podendo ser nil.
+    #[test]
+    fn t68_narrowing_nao_vaza_para_o_else() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 10\n\
+             \x20   if x ~= nil then\n\
+             \x20   else\n\
+             \x20       local y: integer = x\n\
+             \x20   end",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    /// Nem para o ramo `elseif` seguinte, que é um bloco irmão.
+    #[test]
+    fn t68_narrowing_nao_vaza_para_o_elseif_seguinte() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 10\n\
+             \x20   if x ~= nil then\n\
+             \x20   elseif 1 == 1 then\n\
+             \x20       local y: integer = x\n\
+             \x20   end",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    /// O lado direito de um `and` enxerga o que o lado esquerdo estreitou —
+    /// senão o idioma mais natural do teste (`x ~= nil and x > 0`) não
+    /// tiparia.
+    #[test]
+    fn t68_narrowing_atravessa_o_and_da_esquerda_para_a_direita() {
+        let stats = typed_body_stats(&em_main(
+            "    local x: integer? = 10\n\
+             \x20   if x ~= nil and x > 0 then\n\
+             \x20       local y: integer = x\n\
+             \x20   end",
+        ));
+        let TypedStat::If { thens, .. } = &stats[1] else {
+            panic!("esperava If, obteve {:?}", stats[1]);
+        };
+        assert_eq!(thens[0].narrowed, vec!["x".to_string()]);
+    }
+
+    /// Dois opcionais testados no mesmo `and` estreitam os dois.
+    #[test]
+    fn t68_and_estreita_os_dois_nomes_testados() {
+        let stats = typed_body_stats(&em_main(
+            "    local x: integer? = 1\n\
+             \x20   local y: integer? = 2\n\
+             \x20   if x ~= nil and y ~= nil then\n\
+             \x20       local s: integer = x + y\n\
+             \x20   end",
+        ));
+        let TypedStat::If { thens, .. } = &stats[2] else {
+            panic!("esperava If, obteve {:?}", stats[2]);
+        };
+        assert_eq!(thens[0].narrowed, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    /// `or` não estreita: nenhum dos lados sabe o que o outro testou.
+    #[test]
+    fn t68_or_nao_estreita() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 1\n\
+             \x20   if x ~= nil or 1 == 1 then\n\
+             \x20       local y: integer = x\n\
+             \x20   end",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    /// Estreitar não impede atribuir: dentro do ramo o nome continua sendo
+    /// a mesma declaração, e o fix-up de mutabilidade a alcança.
+    #[test]
+    fn t68_atribuicao_dentro_do_ramo_estreitado_alcanca_a_declaracao() {
+        let stats = typed_body_stats(&em_main(
+            "    local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       x = 2\n\
+             \x20   end",
+        ));
+        let TypedStat::Decl { mutable, .. } = &stats[0] else {
+            panic!("esperava Decl, obteve {:?}", stats[0]);
+        };
+        assert!(mutable, "a declaração estreitada deveria sair `mut`");
+    }
+
+    #[test]
+    fn t68_comparar_opcional_com_nil_e_boolean() {
+        let stats = typed_body_stats(&em_main(
+            "    local x: integer? = 1\n    local b: boolean = x ~= nil",
+        ));
+        let TypedStat::Decl { ty, .. } = &stats[1] else {
+            panic!("esperava Decl, obteve {:?}", stats[1]);
+        };
+        assert_eq!(*ty, Type::Boolean);
+    }
+
+    /// Comparar um opcional com um valor que não é `nil` é o erro de "usar
+    /// sem testar", não o de tipos incomparáveis.
+    #[test]
+    fn t68_comparar_opcional_com_valor_pede_o_teste() {
+        let errs =
+            check_source(&em_main("    local x: integer? = 1\n    local b: boolean = x == 10"))
+                .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn t68_local_com_interrogacao_no_nome_infere_o_opcional() {
+        let stats = typed_body_stats(&em_main("    local x? = 10"));
+        let TypedStat::Decl { ty, value, .. } = &stats[0] else {
+            panic!("esperava Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(
+            *ty,
+            Type::Option {
+                base: Box::new(Type::Integer)
+            }
+        );
+        assert!(matches!(value.kind, TypedExpKind::SomeOf(_)));
+    }
+
+    #[test]
+    fn t68_local_com_interrogacao_a_partir_de_nil_nao_infere() {
+        let errs = check_source(&em_main("    local x? = nil")).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("não dá para inferir")),
+            "{errs:?}"
+        );
+    }
+
+    /// Um `T?` não é inferido por acidente: `local y = x` com `x: integer?`
+    /// propagaria a ausência sem o usuário ter pedido.
+    #[test]
+    fn t68_tipo_opcional_nao_e_inferido_sem_pedir() {
+        let errs =
+            check_source(&em_main("    local x: integer? = 1\n    local y = x")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("tipo opcional não é inferido")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn t68_parametro_e_retorno_opcionais_tipam() {
+        let typed = check_source(
+            "function primeiro(xs: {integer}): integer?\n\
+             \x20   if #xs == 0 then\n\
+             \x20       return nil\n\
+             \x20   end\n\
+             \x20   return xs[1]\n\
+             end\n\
+             function usa(x: integer?): integer\n\
+             \x20   if x ~= nil then\n\
+             \x20       return x\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local xs: {integer} = {1, 2}\n\
+             \x20   return usa(primeiro(xs))\n\
+             end",
+        );
+        assert!(typed.is_ok(), "{:?}", typed.unwrap_err());
+    }
+
+    /// A injeção `T → T?` também vale em argumento e em `return`.
+    #[test]
+    fn t68_injecao_vale_em_argumento_e_em_retorno() {
+        let typed = check_source(
+            "function f(x: integer?): integer\n\
+             \x20   return 0\n\
+             end\n\
+             function g(): integer?\n\
+             \x20   return 7\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return f(10)\n\
+             end",
+        );
+        assert!(typed.is_ok(), "{:?}", typed.unwrap_err());
+    }
+
+    #[test]
+    fn t68_atribuicao_de_nil_e_de_valor_a_local_opcional() {
+        let typed = check_source(&em_main(
+            "    local x: integer? = nil\n    x = 10\n    x = nil",
+        ));
+        assert!(typed.is_ok(), "{:?}", typed.unwrap_err());
+    }
+
+    #[test]
+    fn t68_indexar_array_opcional_pede_o_teste() {
+        let errs =
+            check_source(&em_main("    local xs: {integer}? = nil\n    local y: integer = xs[1]"))
+                .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn t68_concatenar_opcional_pede_o_teste() {
+        let errs =
+            check_source(&em_main("    local s: string? = \"a\"\n    local t: string = s .. \"b\""))
+                .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    /// `nil?` não faz sentido: o "ausente" já é o próprio `nil`.
+    /// (`value?` tem o mesmo destino, mas ainda não chega até lá: `value`
+    /// segue rejeitado antes, desde a T22.)
+    #[test]
+    fn t68_nil_opcional_e_recusado() {
+        let errs = check_source(&em_main("    local x: nil? = nil")).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("`nil?`")),
+            "{errs:?}"
+        );
+    }
+
+    /// `Option` continua invariante em `compatible` (ADR 0008): a injeção
+    /// que a T68 acrescentou é `T → T?`, não variância entre opcionais.
+    #[test]
+    fn t68_opcionais_de_bases_diferentes_nao_se_misturam() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 1\n    local y: float? = x",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("incompatíveis")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn t68_variavel_de_controle_do_for_nao_pode_ser_opcional() {
+        let errs = check_source(&em_main("    for i? = 1, 3 do\n    end")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("variável de controle do `for` não pode ser opcional")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn t68_interrogacao_no_nome_nao_vale_em_declaracao_multipla() {
+        let errs = check_source(&em_main("    local a?, b = 1, 2")).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("não vale em declaração múltipla")),
+            "{errs:?}"
+        );
+    }
+
+    /// Num destino `{T}?`/`{K: V}?`/`Nome?`, quem desambigua o `{...}` é o
+    /// tipo base: o `?` fala do destino, não da forma do valor.
+    #[test]
+    fn t68_literal_composto_se_desambigua_pelo_tipo_base_do_opcional() {
+        let stats = typed_body_stats(&em_main("    local xs: {integer}? = {1, 2}"));
+        let TypedStat::Decl { ty, value, .. } = &stats[0] else {
+            panic!("esperava Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(
+            *ty,
+            Type::Option {
+                base: Box::new(Type::Array {
+                    elem: Box::new(Type::Integer)
+                })
+            }
+        );
+        let TypedExpKind::SomeOf(inner) = &value.kind else {
+            panic!("esperava SomeOf, obteve {:?}", value.kind);
+        };
+        assert!(matches!(inner.kind, TypedExpKind::ArrayLit(_)));
+    }
+
+    /// Record, map e string opcionais tipam e estreitam pelo mesmo caminho
+    /// dos arrays — `p.x`, `m["a"]` e `print(s)` dentro do ramo.
+    #[test]
+    fn t68_record_map_e_string_opcionais_tipam_e_estreitam() {
+        let typed = check_source(
+            "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   y: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto? = {x = 1, y = 2}\n\
+             \x20   local m: {string: integer}? = {[\"a\"] = 1}\n\
+             \x20   local s: string? = \"oi\"\n\
+             \x20   if p ~= nil then\n\
+             \x20       print(\"x=\" .. p.x)\n\
+             \x20   end\n\
+             \x20   if m ~= nil then\n\
+             \x20       print(\"a=\" .. m[\"a\"])\n\
+             \x20   end\n\
+             \x20   if s ~= nil then\n\
+             \x20       print(s)\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(typed.is_ok(), "{:?}", typed.unwrap_err());
+    }
+
+    /// Um composto estreitado entra numa chamada como o composto que é —
+    /// o estreitamento vale para tudo que o tipo base vale.
+    #[test]
+    fn t68_composto_estreitado_pode_ser_passado_a_funcao() {
+        let typed = check_source(
+            "function soma(xs: {integer}): integer\n\
+             \x20   return #xs\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local xs: {integer}? = {1, 2}\n\
+             \x20   if xs ~= nil then\n\
+             \x20       print(\"n=\" .. soma(xs))\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(typed.is_ok(), "{:?}", typed.unwrap_err());
+    }
+
+    /// O `while` **não** estreita: o corpo do laço poderia atribuir `nil` e
+    /// a volta seguinte entraria com o valor ausente.
+    #[test]
+    fn t68_while_nao_estreita() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 1\n\
+             \x20   while x ~= nil do\n\
+             \x20       local y: integer = x\n\
+             \x20   end",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("pode ser nil")),
+            "{errs:?}"
+        );
+    }
+
+    /// Dentro do ramo estreitado o nome tem o tipo **base**, então atribuir
+    /// `nil` ali é recusado — o estreitamento não vira uma janela por onde
+    /// a ausência volta a entrar.
+    #[test]
+    fn t68_atribuir_nil_dentro_do_ramo_estreitado_e_recusado() {
+        let errs = check_source(&em_main(
+            "    local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       x = nil\n\
+             \x20   end",
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("atribuição incompatível para 'x'")),
+            "{errs:?}"
+        );
+    }
+
+    /// Um `local` interno de mesmo nome sombreia o estreitado, e o
+    /// estreitamento volta ao normal quando o `if` fecha — as duas coisas
+    /// saem da mesma pilha de escopos, sem caso especial.
+    #[test]
+    fn t68_sombreamento_dentro_do_ramo_estreitado() {
+        let typed = check_source(&em_main(
+            "    local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       local x: string = \"sombra\"\n\
+             \x20       print(x)\n\
+             \x20   end\n\
+             \x20   local depois: integer? = x",
+        ));
+        assert!(typed.is_ok(), "{:?}", typed.unwrap_err());
+    }
+
+    /// Testar com `~= nil` um valor que **não** é opcional segue sendo erro:
+    /// a resposta seria constante, e a pergunta denuncia um tipo escrito
+    /// errado. Vale também para um nome já estreitado, testado de novo.
+    #[test]
+    fn t68_testar_nao_opcional_contra_nil_continua_erro() {
+        for corpo in [
+            "    local x: integer = 1\n    if x ~= nil then\n    end",
+            "    local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       if x ~= nil then\n\
+             \x20       end\n\
+             \x20   end",
+        ] {
+            let errs = check_source(&em_main(corpo)).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("não é possível comparar integer com nil")),
+                "{corpo}: {errs:?}"
+            );
+        }
+    }
+
+    /// Hover/autocomplete (T49/T50) enxergam o tipo estreitado dentro do
+    /// ramo: o estreitamento é um símbolo de verdade na symtab, não um
+    /// truque local do `check_exp`.
+    #[test]
+    fn t68_escopo_do_ramo_estreitado_reporta_o_tipo_base() {
+        let source = em_main(
+            "    local x: integer? = 1\n\
+             \x20   if x ~= nil then\n\
+             \x20       local y: integer = x\n\
+             \x20   end",
+        );
+        let tokens = lex(&source).expect("fonte válida");
+        let program = parse(&tokens).expect("fonte válida");
+        let checked = check(&program).expect("fonte válida");
+        assert!(
+            checked.scopes.iter().any(|escopo| escopo
+                .symbols
+                .iter()
+                .any(|s| s.name == "x" && s.type_name == "integer")),
+            "nenhum escopo reportou `x: integer`"
         );
     }
 }
