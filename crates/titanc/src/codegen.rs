@@ -49,6 +49,7 @@
 //! semântica de valor de arrays/maps/records vem de clonar explicitamente na
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
 
+use crate::ast::Loc;
 use crate::checker::{
     BinOp, Callee, CastKind, TypedExp, TypedExpKind, TypedForInKind, TypedLValue, TypedMultiValues,
     TypedProgram, TypedStat, TypedThen, TypedTopLevel, UnOp,
@@ -84,6 +85,114 @@ impl std::fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
+/// A guarda que separa a T76 da T77: devolve o erro se o programa tipado
+/// usa tipo soma em qualquer forma — declaração de `enum`, construção de
+/// variante ou `match`.
+///
+/// Existe para que a emissão não precise de um braço "isto não deveria
+/// acontecer" que **poderia** acontecer. Some inteira na T77, junto com os
+/// `unreachable!` que ela protege.
+fn enum_ainda_nao_emitido(program: &TypedProgram) -> Option<CodegenError> {
+    fn erro(loc: Loc, o_que: &str) -> CodegenError {
+        CodegenError(format!(
+            "linha {}, coluna {}: {o_que} já tipa, mas a emissão de tipos soma \
+             (o `enum` do Rust, o `Box` dos campos recursivos e a tradução do \
+             `match`) entra na T77.",
+            loc.line, loc.col
+        ))
+    }
+
+    fn em_stat(stat: &TypedStat) -> Option<CodegenError> {
+        match stat {
+            TypedStat::Match { loc, .. } => Some(erro(*loc, "`match`")),
+            TypedStat::Block { stats, .. } => stats.iter().find_map(em_stat),
+            TypedStat::Decl { value, .. } => em_exp(value),
+            TypedStat::DeclMulti { values, .. } | TypedStat::AssignMulti { values, .. } => {
+                em_multi(values)
+            }
+            TypedStat::Assign { value, .. } => em_exp(value),
+            TypedStat::Call { call, .. } => em_exp(call),
+            TypedStat::Return { exps, .. } => exps.iter().find_map(em_exp),
+            TypedStat::If {
+                thens, elsestat, ..
+            } => thens
+                .iter()
+                .find_map(|t| em_exp(&t.condition).or_else(|| em_stat(&t.block)))
+                .or_else(|| elsestat.as_deref().and_then(em_stat)),
+            TypedStat::While {
+                condition, block, ..
+            }
+            | TypedStat::Repeat {
+                condition, block, ..
+            } => em_exp(condition).or_else(|| em_stat(block)),
+            TypedStat::For {
+                start,
+                finish,
+                inc,
+                block,
+                ..
+            } => em_exp(start)
+                .or_else(|| em_exp(finish))
+                .or_else(|| em_exp(inc))
+                .or_else(|| em_stat(block)),
+            TypedStat::ForIn {
+                container, block, ..
+            } => em_exp(container).or_else(|| em_stat(block)),
+            TypedStat::Break { .. } | TypedStat::Continue { .. } => None,
+        }
+    }
+
+    fn em_multi(values: &TypedMultiValues) -> Option<CodegenError> {
+        match values {
+            TypedMultiValues::Call(exp) => em_exp(exp),
+            TypedMultiValues::List(exps) => exps.iter().find_map(em_exp),
+        }
+    }
+
+    fn em_exp(exp: &TypedExp) -> Option<CodegenError> {
+        match &exp.kind {
+            TypedExpKind::VariantLit { variant, .. } => {
+                Some(erro(exp.loc, &format!("a construção de '{variant}'")))
+            }
+            TypedExpKind::Match { .. } => Some(erro(exp.loc, "`match`")),
+            TypedExpKind::Call { callee, args } => {
+                let recv = match callee {
+                    Callee::Method { recv, .. } => em_exp(recv),
+                    _ => None,
+                };
+                recv.or_else(|| args.iter().find_map(em_exp))
+            }
+            TypedExpKind::Concat(exps) | TypedExpKind::ArrayLit(exps) => {
+                exps.iter().find_map(em_exp)
+            }
+            TypedExpKind::Binop { lhs, rhs, .. } => em_exp(lhs).or_else(|| em_exp(rhs)),
+            TypedExpKind::Index { base, index } => em_exp(base).or_else(|| em_exp(index)),
+            TypedExpKind::Field { base, .. } => em_exp(base),
+            TypedExpKind::RecordLit { fields, .. } => fields.iter().find_map(|(_, e)| em_exp(e)),
+            TypedExpKind::MapLit(entries) => entries
+                .iter()
+                .find_map(|(k, v)| em_exp(k).or_else(|| em_exp(v))),
+            TypedExpKind::Unop { exp, .. }
+            | TypedExpKind::Adjust(exp)
+            | TypedExpKind::Extra { exp, .. }
+            | TypedExpKind::SomeOf(exp)
+            | TypedExpKind::Cast { exp, .. } => em_exp(exp),
+            TypedExpKind::Nil
+            | TypedExpKind::Bool(_)
+            | TypedExpKind::Integer(_)
+            | TypedExpKind::Float(_)
+            | TypedExpKind::String(_)
+            | TypedExpKind::Var(_) => None,
+        }
+    }
+
+    program.iter().find_map(|top| match top {
+        TypedTopLevel::Enum { loc, name, .. } => Some(erro(*loc, &format!("o enum '{name}'"))),
+        TypedTopLevel::Func { body, .. } => em_stat(body),
+        TypedTopLevel::Record { .. } | TypedTopLevel::ForeignFunc { .. } => None,
+    })
+}
+
 /// Gera o `main.rs` completo (structs de record + funções do programa + shim
 /// de entrada) a partir da AST tipada.
 ///
@@ -91,6 +200,17 @@ impl std::error::Error for CodegenError {}
 /// antes de todos estarem declarados, mas manter a ordem "tipos antes de
 /// funções" é convenção usual do Rust gerado.
 pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
+    // Tipos soma (T76) tipam, mas ainda não são emitidos: o `enum` do Rust,
+    // o `Box` automático dos campos recursivos e a tradução do `match` são a
+    // T77. Recusar aqui — uma vez, com a razão em português — é o que
+    // mantém a promessa de "nunca panic" enquanto as duas tarefas não se
+    // encontram: sem esta guarda, os braços de `emit_stat`/`emit_exp`
+    // seriam alcançáveis, e um programa que passou no checker abortaria no
+    // backend.
+    if let Some(erro) = enum_ainda_nao_emitido(program) {
+        return Err(erro);
+    }
+
     let mut out = String::new();
 
     for top in program {
@@ -380,6 +500,16 @@ fn collect_referenced_names_stat(stat: &TypedStat, names: &mut std::collections:
             collect_referenced_names_lvalue(target, names);
             collect_referenced_names_exp(value, names);
         }
+        // `match` (T76): o escrutinado é lido, e o corpo de cada braço é
+        // código como o de um ramo do `if`. Os nomes que o padrão **liga**
+        // não entram: eles são destinos do padrão, não leituras — exatamente
+        // como a variável de controle de um `for`.
+        TypedStat::Match { exp, arms, .. } => {
+            collect_referenced_names_exp(exp, names);
+            for arm in arms {
+                collect_referenced_names_stat(&arm.body, names);
+            }
+        }
         TypedStat::Break { .. } | TypedStat::Continue { .. } => {}
     }
 }
@@ -475,6 +605,20 @@ fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::Ha
         | TypedExpKind::SomeOf(inner)
         // `Cast` (T70), idem: o `as` não lê nome nenhum por conta própria.
         | TypedExpKind::Cast { exp: inner, .. } => collect_referenced_names_exp(inner, names),
+        // Construção de variante (T76): os argumentos são expressões como
+        // as de uma chamada.
+        TypedExpKind::VariantLit { args, .. } => {
+            for arg in args {
+                collect_referenced_names_exp(arg, names);
+            }
+        }
+        // `match` como expressão (T76): mesma leitura do comando.
+        TypedExpKind::Match { exp, arms } => {
+            collect_referenced_names_exp(exp, names);
+            for arm in arms {
+                collect_referenced_names_exp(&arm.body, names);
+            }
+        }
         TypedExpKind::Nil
         | TypedExpKind::Bool(_)
         | TypedExpKind::Integer(_)
@@ -666,6 +810,8 @@ fn assigns_to_name(stat: &TypedStat, nome: &str) -> bool {
             | TypedStat::Repeat { block, .. }
             | TypedStat::For { block, .. }
             | TypedStat::ForIn { block, .. } => stat_atribui(block, nome),
+            // `match` (T76): um braço atribui ao nome como um ramo do `if`.
+            TypedStat::Match { arms, .. } => arms.iter().any(|arm| stat_atribui(&arm.body, nome)),
             TypedStat::Decl { .. }
             | TypedStat::DeclMulti { .. }
             | TypedStat::Call { .. }
@@ -1029,6 +1175,12 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             indent(out, depth);
             out.push_str("continue;\n");
         }
+        // T76/T77: `enum_ainda_nao_emitido` recusa o programa inteiro antes
+        // de qualquer emissão, então este braço não é alcançável enquanto a
+        // T77 não o substituir pela tradução de verdade.
+        TypedStat::Match { .. } => {
+            unreachable!("`match` ainda não é emitido — `generate` recusa o programa antes (T77)")
+        }
     }
 }
 
@@ -1229,6 +1381,14 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         // o `Option`, justamente para a decisão cair aqui. O `nil` do tipo
         // `nil` — o retorno vazio, o valor de um `Decl` sem tipo opcional —
         // continua `()` como sempre foi.
+        // T76/T77: mesma razão do braço de `TypedStat::Match` em
+        // `emit_stat` — `generate` já recusou.
+        TypedExpKind::VariantLit { variant, .. } => unreachable!(
+            "a construção de '{variant}' ainda não é emitida — `generate` recusa o programa antes (T77)"
+        ),
+        TypedExpKind::Match { .. } => {
+            unreachable!("`match` ainda não é emitido — `generate` recusa o programa antes (T77)")
+        }
         TypedExpKind::Nil if matches!(exp.ty, Type::Option { .. }) => "None".to_string(),
         TypedExpKind::Nil => "()".to_string(),
         TypedExpKind::Bool(v) => v.to_string(),
@@ -4530,5 +4690,56 @@ end"#;
 
         let (_, output) = compila_e_executa(&rust, "t73_strlen_stmt");
         assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// A guarda que separa a T76 da T77: um programa com tipo soma **tipa**,
+    /// mas a emissão o recusa com erro em português — e não com um panic —
+    /// enquanto o `enum` do Rust, o `Box` automático e a tradução do `match`
+    /// não chegam.
+    #[test]
+    fn t76_tipo_soma_tipa_mas_a_emissao_recusa_com_erro_em_portugues() {
+        let checar = |fonte: &str| {
+            let tokens = lex(fonte).unwrap_or_else(|e| panic!("erro léxico inesperado: {e}"));
+            let program =
+                parse(&tokens).unwrap_or_else(|e| panic!("erro sintático inesperado: {e}"));
+            let typed = check(&program)
+                .unwrap_or_else(|errs| panic!("o programa deveria tipar, erros: {errs:?}"));
+            generate(&typed.program)
+                .expect_err("a emissão de tipos soma ainda não existe (T77)")
+                .to_string()
+        };
+
+        let declaracao = checar(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(
+            declaracao.contains("o enum 'Cor'") && declaracao.contains("T77"),
+            "erro: {declaracao}"
+        );
+
+        let uso = checar(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             \x20   Verde\n\
+             end\n\
+             function tinge(c: Cor): integer\n\
+             \x20   match c with\n\
+             \x20       Vermelho then\n\
+             \x20           return 0\n\
+             \x20       Verde then\n\
+             \x20           return 1\n\
+             \x20   end\n\
+             \x20   return 2\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return tinge(Vermelho)\n\
+             end",
+        );
+        assert!(uso.contains("T77"), "erro: {uso}");
     }
 }

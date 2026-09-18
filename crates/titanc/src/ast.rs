@@ -250,6 +250,51 @@ pub enum Stat {
     StatContinue {
         loc: Loc,
     },
+    /// `match e with ... end` em posição de comando (T75) — o terceiro nó de
+    /// comando realmente novo do projeto, depois de [`Stat::StatBreak`] e
+    /// [`Stat::StatContinue`]: o Titan original não tem tipos soma.
+    ///
+    /// Cada braço executa um **bloco**, ao contrário de [`Exp::ExpMatch`],
+    /// em que cada braço é uma expressão. A exaustividade dos braços é
+    /// verificada no checker (T76), não aqui: o parser não sabe quais
+    /// variantes o `enum` tem.
+    StatMatch {
+        loc: Loc,
+        exp: Box<Exp>,
+        arms: Vec<MatchArm<Stat>>,
+    },
+}
+
+/// Padrão de um braço de `match` (T75).
+///
+/// O parser não distingue variante existente de variante inventada — só a
+/// forma escrita. Se `Variante` é mesmo uma variante do `enum` escrutinado, e
+/// se a aridade de `fields` bate, é o checker que decide (T76).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// `ExpBinop(op, l, r)` — variante com os campos ligados a nomes locais,
+    /// **posicionalmente**. `fields` vazio é a variante sem payload
+    /// (`ExpNil`), escrita sem parênteses: parênteses vazios são erro, como
+    /// na declaração ([`Variant`]).
+    Variant {
+        loc: Loc,
+        name: String,
+        fields: Vec<Decl>,
+    },
+    /// `_` — o braço curinga, que casa o que sobrou.
+    Wildcard { loc: Loc },
+}
+
+/// Um braço de `match` (T75), genérico no que ele produz: um [`Stat`] no
+/// comando ([`Stat::StatMatch`]), uma [`Exp`] na expressão ([`Exp::ExpMatch`]).
+///
+/// É o análogo de [`Then`] para o `if` — com a diferença de que o que
+/// seleciona o braço é um padrão, não uma condição booleana.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm<T> {
+    pub loc: Loc,
+    pub pattern: Pattern,
+    pub body: T,
 }
 
 /// Ramo `then` de um `if` (`ast.lua`: `Then.Then`).
@@ -345,6 +390,16 @@ pub enum Exp {
         exp: Box<Exp>,
         index: usize,
         r#type: Option<Type>,
+    },
+    /// `match e with ... end` em posição de expressão (T75).
+    ///
+    /// Mesma sintaxe de [`Stat::StatMatch`]; o que muda é o corpo do braço,
+    /// que aqui é uma expressão — e a exigência, imposta pelo checker (T76),
+    /// de que todos os braços tenham o mesmo tipo.
+    ExpMatch {
+        loc: Loc,
+        exp: Box<Exp>,
+        arms: Vec<MatchArm<Exp>>,
     },
 }
 

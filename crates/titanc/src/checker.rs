@@ -214,6 +214,16 @@ pub enum TypedTopLevel {
         name: String,
         fields: Vec<(String, Type)>,
     },
+    /// Declaração de `enum` (T76) — o análogo de [`TypedTopLevel::Record`]
+    /// para os tipos soma. Carrega as variantes já com os tipos dos campos
+    /// resolvidos, na **ordem escrita**, porque é ela que o codegen (T77)
+    /// usa para emitir o `enum` do Rust e que a mensagem de exaustividade
+    /// usa para listar o que falta.
+    Enum {
+        loc: Loc,
+        name: String,
+        variants: Vec<(String, Vec<Type>)>,
+    },
     /// `foreign function abs(n: integer): integer` (T73) — vira um bloco
     /// `unsafe extern "C"` no Rust gerado. Não tem corpo, e por isso não
     /// carrega `body` nem `islocal`: o símbolo vem do linker.
@@ -331,6 +341,49 @@ pub enum TypedStat {
     /// `continue` (Fase 5, T63) — mesma disciplina de `Break`: só produzido
     /// dentro de laço, com a **mesma** checagem de `loop_depth`.
     Continue {
+        loc: Loc,
+    },
+    /// `match e with ... end` em posição de comando (T76). O escrutinado já
+    /// está tipado como [`Type::Sum`] — `check_match` recusa qualquer outra
+    /// coisa —, e os braços já passaram pela checagem de exaustividade,
+    /// então o codegen (T77) emite um `match` do Rust sem ter de reconferir
+    /// nada.
+    Match {
+        loc: Loc,
+        exp: TypedExp,
+        arms: Vec<TypedMatchArm<TypedStat>>,
+    },
+}
+
+/// Um braço de `match` já verificado (T76), genérico no corpo pela mesma
+/// razão que [`ast::MatchArm`] é: um [`TypedStat`] no comando, um
+/// [`TypedExp`] na expressão.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedMatchArm<T> {
+    pub loc: Loc,
+    pub pattern: TypedPattern,
+    pub body: T,
+}
+
+/// Padrão de um braço já resolvido contra a declaração do `enum` (T76).
+///
+/// Ao contrário de [`ast::Pattern`], os campos ligados aqui já vêm com o
+/// **tipo** que a declaração da variante lhes dá — o parser só viu nomes. É
+/// isso que permite ao codegen emitir o padrão do Rust e decidir o deref dos
+/// campos encaixotados sem consultar a tabela de enums.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedPattern {
+    Variant {
+        loc: Loc,
+        /// Nome do `enum` a que a variante pertence — o codegen precisa dele
+        /// para escrever o caminho `Enum::Variante` do padrão.
+        enum_name: String,
+        name: String,
+        /// Nome e tipo de cada campo ligado, na ordem posicional da
+        /// declaração.
+        fields: Vec<(String, Type)>,
+    },
+    Wildcard {
         loc: Loc,
     },
 }
@@ -551,6 +604,26 @@ pub enum TypedExpKind {
         kind: CastKind,
         exp: Box<TypedExp>,
     },
+    /// Construção de variante de `enum` (T76): `ExpInteger(42)`, ou
+    /// `ExpNil` sem payload.
+    ///
+    /// O parser não distingue isto de uma chamada de função — as duas formas
+    /// se escrevem igual (decisão da T75) —, então é `check_call` quem
+    /// decide, consultando a tabela de enums, e é aqui que a decisão fica
+    /// registrada: o codegen emite `Enum::Variante(args)` sem reinspecionar
+    /// nome nenhum.
+    VariantLit {
+        enum_name: String,
+        variant: String,
+        args: Vec<TypedExp>,
+    },
+    /// `match e with ... end` em posição de expressão (T76). O `ty` do
+    /// [`TypedExp`] que envolve este nó é o tipo **comum** a todos os
+    /// braços, que `check_match_exp` já exigiu.
+    Match {
+        exp: Box<TypedExp>,
+        arms: Vec<TypedMatchArm<TypedExp>>,
+    },
 }
 
 /// Qual das conversões de [`TypedExpKind::Cast`] o backend deve emitir (T70).
@@ -698,6 +771,15 @@ pub struct CheckedProgram {
     pub program: TypedProgram,
     pub uses: Vec<SymbolUse>,
     pub scopes: Vec<ScopeSnapshot>,
+    /// Diagnósticos que **não** impedem a compilação (T76) — hoje só o
+    /// braço curinga `_` de um `match` que já cobre todas as variantes.
+    ///
+    /// Lista separada de `errors`, e não uma `CheckError` com um campo de
+    /// severidade, porque quem consome as duas as trata de forma oposta: um
+    /// erro aborta a compilação, um aviso é impresso e o programa segue. O
+    /// tipo é o mesmo ([`CheckError`]) porque a *forma* do diagnóstico —
+    /// mensagem em português mais posição — é a mesma.
+    pub warnings: Vec<CheckError>,
 }
 
 /// Operador unário já resolvido (T13; `Len` acrescentado estruturalmente na
@@ -718,6 +800,9 @@ pub enum UnOp {
 struct Checker {
     st: SymTab,
     errors: Vec<CheckError>,
+    /// Diagnósticos que não impedem a compilação (T76) — ver
+    /// [`CheckedProgram::warnings`].
+    warnings: Vec<CheckError>,
     /// Próximo id de declaração `local` — os ids são globais e únicos, então
     /// não precisam de reset entre funções.
     next_decl_id: DeclId,
@@ -751,6 +836,29 @@ struct Checker {
     /// (que `ast::Stat` não guarda) para fechar o intervalo de um
     /// [`ScopeSnapshot`] quando o bloco fecha.
     last_loc: Loc,
+    /// Tabela de tipos soma (T76), no molde exato de `records`: nome do
+    /// `enum` → [`Type::Sum`] com os campos de cada variante já resolvidos.
+    ///
+    /// Separada de `records` — e não uma única tabela de "tipos nomeados" —
+    /// porque as duas respondem a perguntas diferentes: `records` diz se
+    /// `Nome{...}` é um literal de record, `enums` diz se `Variante(...)` é
+    /// construção em vez de chamada de função. Unificá-las obrigaria todo
+    /// consumidor a reinspecionar o `Type` para saber qual dos dois casos
+    /// está olhando.
+    enums: HashMap<String, Type>,
+    /// Nome do `enum` a que cada variante pertence — `"ExpInteger"` →
+    /// `"Exp"` —, o índice que desambigua construção de variante × chamada
+    /// de função em `check_call` sem varrer `enums` inteira a cada nome.
+    ///
+    /// Uma variante pertence a **um** enum: dois enums com uma variante de
+    /// mesmo nome são recusados em `collect_enums`, porque `ExpInteger(42)`
+    /// não teria como escolher entre eles (não há contexto na sintaxe de
+    /// construção).
+    variant_owner: HashMap<String, String>,
+    /// Local de declaração do *nome* de cada enum, pela mesma razão de
+    /// `record_def_locs`: `Type::Sum` não carrega `Loc`, e o
+    /// go-to-definition (T49) sobre `x: Exp` precisa dela.
+    enum_def_locs: HashMap<String, Loc>,
     /// Local de declaração do *nome* de cada record (a chave do `record ...
     /// end`), separado de `records` porque `Type::Record` não carrega `Loc`.
     record_def_locs: HashMap<String, Loc>,
@@ -799,9 +907,13 @@ impl Checker {
         Checker {
             st,
             errors: Vec::new(),
+            warnings: Vec::new(),
             next_decl_id: 0,
             assigned: HashSet::new(),
             records: HashMap::new(),
+            enums: HashMap::new(),
+            variant_owner: HashMap::new(),
+            enum_def_locs: HashMap::new(),
             modules: HashMap::new(),
             foreigns: HashSet::new(),
             uses: Vec::new(),
@@ -866,6 +978,37 @@ impl Checker {
         });
     }
 
+    /// Recusa um nome novo que colida com uma variante de `enum` (T76).
+    ///
+    /// Uma variante é construída escrevendo seu nome nu (`ExpNil`) ou
+    /// chamando-o (`ExpInteger(42)`), e a desambiguação é pelo nome: uma
+    /// local ou um parâmetro homônimo tornaria a construção inalcançável
+    /// dentro daquele escopo — em silêncio, e só ali. Recusar a declaração
+    /// é o que mantém `ExpNil` querendo dizer a mesma coisa no arquivo
+    /// inteiro. É a mesma regra que `collect_signature` aplica às funções.
+    fn reject_variant_name(&mut self, loc: Loc, name: &str) -> bool {
+        let Some(dono) = self.variant_owner.get(name).cloned() else {
+            return false;
+        };
+        self.error(
+            loc,
+            format!(
+                "'{name}' é uma variante do enum '{dono}': escolha outro nome, \
+                 ou a construção de '{name}' ficaria inacessível aqui."
+            ),
+        );
+        true
+    }
+
+    /// Diagnóstico que não impede a compilação (T76) — ver
+    /// [`CheckedProgram::warnings`].
+    fn warning(&mut self, loc: Loc, message: impl Into<String>) {
+        self.warnings.push(CheckError {
+            message: message.into(),
+            loc,
+        });
+    }
+
     // ---- Passada 1: assinaturas top-level ------------------------------
 
     /// Nomes que colidiriam com tipos do prelúdio do Rust se virassem o nome
@@ -884,7 +1027,9 @@ impl Checker {
             let TopLevel::TopLevelRecord { loc, name, fields } = node else {
                 continue;
             };
-            if raw.contains_key(name) {
+            // `self.enums` já está preenchido com os nomes (T76):
+            // `record`/`enum` disputam o mesmo espaço de nomes de tipo.
+            if raw.contains_key(name) || self.enums.contains_key(name) {
                 self.error(*loc, format!("'{name}' já foi declarado antes."));
                 continue;
             }
@@ -986,6 +1131,15 @@ impl Checker {
     /// estar completo antes de `resolve_param_types`/`resolve_types`
     /// resolverem qualquer `TypeName`.
     fn collect_records(&mut self, program: &Program) {
+        // Enums primeiro, e em duas etapas (T76): os **nomes** entram já
+        // aqui, como placeholders de variantes vazias, para que um record
+        // possa ter um campo do tipo de um `enum` declarado adiante; os
+        // campos das variantes só são resolvidos depois dos records, quando
+        // `self.records` está completo e a referência inversa (uma variante
+        // que carrega um record) resolve. É a mesma dança de placeholders
+        // que os records já faziam entre si, esticada por um tipo.
+        let raw_enums = self.collect_enum_names(program);
+
         let raw = self.collect_record_names(program);
 
         if let Some(cycle_name) = Self::find_recursive_record(&raw) {
@@ -1005,6 +1159,10 @@ impl Checker {
                      esta fase não suporta indireção para quebrar o ciclo."
                 ),
             );
+            // Os enums seguem sendo resolvidos: o programa já não compila,
+            // mas resolvê-los evita uma cascata de "tipo 'Exp' desconhecido"
+            // sobre um `enum` que não tem defeito nenhum.
+            self.resolve_enum_fields(raw_enums);
             return;
         }
 
@@ -1070,6 +1228,145 @@ impl Checker {
                 self.records.remove(&name);
             }
         }
+
+        // Campos das variantes por último (T76): agora `self.records` está
+        // completo, então uma variante que carrega um record resolve.
+        self.resolve_enum_fields(raw_enums);
+    }
+
+    /// Registra o nome de cada `enum` e os campos **brutos** de suas
+    /// variantes (T76) — o análogo de [`Checker::collect_record_names`],
+    /// com três recusas próprias do tipo soma.
+    ///
+    /// Deixa em `self.enums` um placeholder de variantes vazias por enum
+    /// aceito: é ele que faz `resolve_type` reconhecer `x: Exp` enquanto os
+    /// campos das variantes ainda não foram resolvidos — e é o que permite
+    /// a **recursão** (`ExpBinop(string, Exp, Exp)`), o motivo de ser da
+    /// fase (decisão técnica 6 do PRD.md). Nenhuma detecção de ciclo roda
+    /// sobre enums: o `Box` da emissão (T77) é quem quebra o ciclo, ao
+    /// contrário do record, que o `checker.rs` rejeita.
+    fn collect_enum_names(&mut self, program: &Program) -> Vec<(String, Vec<ast::Variant>)> {
+        let mut raw: Vec<(String, Vec<ast::Variant>)> = Vec::new();
+        for node in program {
+            let TopLevel::TopLevelEnum {
+                loc,
+                name,
+                variants,
+            } = node
+            else {
+                continue;
+            };
+            // Um `enum` disputa o mesmo espaço de nomes que um record: os
+            // dois viram um tipo nomeado e uma declaração de item no Rust
+            // gerado.
+            if self.enums.contains_key(name) || self.records.contains_key(name) {
+                self.error(*loc, format!("'{name}' já foi declarado antes."));
+                continue;
+            }
+            if Self::RESERVED_RUST_NAMES.contains(&name.as_str()) {
+                self.error(
+                    *loc,
+                    format!("'{name}' é um nome reservado do Rust; escolha outro nome de enum."),
+                );
+                continue;
+            }
+            let mut ok = true;
+            let mut seen = HashSet::new();
+            for variant in variants {
+                if !seen.insert(variant.name.clone()) {
+                    self.error(
+                        variant.loc,
+                        format!("variante '{}' duplicada no enum '{name}'.", variant.name),
+                    );
+                    ok = false;
+                    continue;
+                }
+                // Construção de variante se escreve `ExpInteger(42)`, sem
+                // dizer de que enum ela vem (T75) — então o nome tem de ser
+                // único no programa inteiro, ou `check_call` não teria como
+                // escolher. Pela mesma razão, uma variante não pode se
+                // chamar como uma função já declarada.
+                if let Some(dono) = self.variant_owner.get(&variant.name) {
+                    self.error(
+                        variant.loc,
+                        format!(
+                            "a variante '{}' já existe no enum '{dono}': \
+                             nomes de variante são únicos no programa, porque \
+                             a construção '{}(...)' não diz de que enum ela vem.",
+                            variant.name, variant.name
+                        ),
+                    );
+                    ok = false;
+                    continue;
+                }
+                self.variant_owner
+                    .insert(variant.name.clone(), name.clone());
+            }
+            if ok {
+                self.enum_def_locs.insert(name.clone(), *loc);
+                self.enums.insert(
+                    name.clone(),
+                    Type::Sum {
+                        name: name.clone(),
+                        variants: Vec::new(),
+                    },
+                );
+                raw.push((name.clone(), variants.clone()));
+            } else {
+                // Enum recusado: as variantes que já entraram em
+                // `variant_owner` sairiam roubando o nome de uma construção
+                // que nunca vai existir.
+                for variant in variants {
+                    if self.variant_owner.get(&variant.name) == Some(name) {
+                        self.variant_owner.remove(&variant.name);
+                    }
+                }
+            }
+        }
+        raw
+    }
+
+    /// Segunda etapa da coleta de enums (T76): resolve o tipo de cada campo
+    /// de cada variante, trocando os placeholders de
+    /// [`Checker::collect_enum_names`] pelo [`Type::Sum`] definitivo.
+    ///
+    /// Roda **depois** dos records, e só então, porque uma variante pode
+    /// carregar um record (`No(Ponto)`) — e um record pode carregar um enum,
+    /// que os placeholders já cobriram.
+    fn resolve_enum_fields(&mut self, raw: Vec<(String, Vec<ast::Variant>)>) {
+        for (name, variants) in raw {
+            let mut typed_variants = Vec::with_capacity(variants.len());
+            let mut ok = true;
+            for variant in &variants {
+                let mut fields = Vec::with_capacity(variant.fields.len());
+                for field in &variant.fields {
+                    match self.resolve_type(field) {
+                        Some(ty) => fields.push(ty),
+                        None => ok = false,
+                    }
+                }
+                typed_variants.push((variant.name.clone(), fields));
+            }
+            if ok {
+                let enum_ty = Type::Sum {
+                    name: name.clone(),
+                    variants: typed_variants,
+                };
+                // Hover sobre o próprio nome do enum na declaração (T49),
+                // como o record já fazia.
+                if let Some(&def_loc) = self.enum_def_locs.get(&name) {
+                    self.record_use(def_loc, def_loc, &name, &enum_ty);
+                }
+                self.enums.insert(name.clone(), enum_ty);
+            } else {
+                // Mesma disciplina do record: nada de tipo fantasma de
+                // variantes vazias sobrando para o resto do checker.
+                self.enums.remove(&name);
+                for variant in &variants {
+                    self.variant_owner.remove(&variant.name);
+                }
+            }
+        }
     }
 
     /// Ordem pós-ordem de uma DFS sobre o grafo de dependência de records —
@@ -1113,6 +1410,19 @@ impl Checker {
                     self.error(*loc, format!("'{name}' já foi declarado antes."));
                     return;
                 }
+                // Uma função com nome de variante tornaria `Nome(...)`
+                // ambíguo em `check_call`, que decide pelo nome (T76).
+                if let Some(dono) = self.variant_owner.get(name) {
+                    self.error(
+                        *loc,
+                        format!(
+                            "'{name}' é uma variante do enum '{dono}': \
+                             uma função não pode ter o mesmo nome, porque \
+                             '{name}(...)' ficaria ambíguo."
+                        ),
+                    );
+                    return;
+                }
                 let param_types = match self.resolve_param_types(params) {
                     Some(types) => types,
                     None => return,
@@ -1141,12 +1451,10 @@ impl Checker {
             // Já processado por `collect_records`, que roda antes (T29 —
             // duas sub-passadas: records primeiro, funções depois).
             TopLevel::TopLevelRecord { .. } => {}
-            // `enum` (T74): a AST e o `Type::Sum` já existem, mas a coleta
-            // (`self.enums`), a desambiguação de construção de variante e a
-            // exaustividade do `match` são da T76. Até lá nada chega aqui: o
-            // parser ainda não produz este nó (T75). Braço explícito, e não
-            // um `_`, para que a próxima variante de `TopLevel` volte a dar
-            // erro de compilação em vez de passar em silêncio.
+            // Já processado por `collect_enum_names`/`resolve_enum_fields`
+            // (T76), que rodam dentro de `collect_records` — antes de
+            // qualquer função, porque uma assinatura pode citar um `enum`
+            // declarado adiante no arquivo.
             TopLevel::TopLevelEnum { .. } => {}
             // `import data` e `import data as d` (T72). O nome que colide,
             // que vira símbolo e que chaveia `self.modules` é sempre o
@@ -1397,20 +1705,29 @@ impl Checker {
                     }),
                 }
             }
-            ast::Type::TypeName { loc, name } => match self.records.get(name).cloned() {
-                Some(ty) => {
+            // Um `TypeName` é um record ou um `enum` (T76) — os dois
+            // ocupam o mesmo espaço de nomes, e `collect_enum_names`/
+            // `collect_record_names` já recusaram qualquer colisão, então a
+            // ordem da consulta não decide nada.
+            ast::Type::TypeName { loc, name } => {
+                if let Some(ty) = self.records.get(name).cloned() {
                     // Go-to-definition (T49): anotação `x: Nome` salta para
                     // o `record Nome ... end`.
                     if let Some(&def_loc) = self.record_def_locs.get(name) {
                         self.record_use(*loc, def_loc, name, &ty);
                     }
-                    Some(ty)
+                    return Some(ty);
                 }
-                None => {
-                    self.error(*loc, format!("tipo '{name}' desconhecido."));
-                    None
+                if let Some(ty) = self.enums.get(name).cloned() {
+                    // Idem para o `enum Nome ... end`.
+                    if let Some(&def_loc) = self.enum_def_locs.get(name) {
+                        self.record_use(*loc, def_loc, name, &ty);
+                    }
+                    return Some(ty);
                 }
-            },
+                self.error(*loc, format!("tipo '{name}' desconhecido."));
+                None
+            }
             // `module` aqui é o nome **local** escrito no programa (`d` em
             // `import data as d`, T72); `Type::Opaque::module` guarda o nome
             // real do módulo, que é o que o codegen resolve contra
@@ -1499,6 +1816,9 @@ impl Checker {
 
                 self.st.open_block();
                 for (param, ty) in params.iter().zip(param_types.iter()) {
+                    if self.reject_variant_name(param.loc, &param.name) {
+                        continue;
+                    }
                     self.st.add_symbol(
                         &param.name,
                         ty.clone(),
@@ -1545,6 +1865,19 @@ impl Checker {
                     loc: *loc,
                     name: name.clone(),
                     fields,
+                })
+            }
+            // `enum` (T76): mesma estrutura do braço de `TopLevelRecord`
+            // acima — a resolução aconteceu na passada 1, e um enum ausente
+            // de `self.enums` já saiu de lá com erro claro.
+            TopLevel::TopLevelEnum { loc, name, .. } => {
+                let Some(Type::Sum { variants, .. }) = self.enums.get(name).cloned() else {
+                    return None;
+                };
+                Some(TypedTopLevel::Enum {
+                    loc: *loc,
+                    name: name.clone(),
+                    variants,
                 })
             }
             // `foreign function` (T73): a passada 1 já resolveu e validou
@@ -1696,6 +2029,9 @@ impl Checker {
                     }
                 };
 
+                if self.reject_variant_name(decl.loc, &decl.name) {
+                    return None;
+                }
                 let decl_id = self.next_decl_id;
                 self.next_decl_id += 1;
                 self.st.add_symbol(
@@ -1891,6 +2227,58 @@ impl Checker {
                     return None;
                 }
                 Some(TypedStat::Continue { loc: *loc })
+            }
+            // `match` como comando (T76).
+            Stat::StatMatch { loc, exp, arms } => {
+                let scrutinee = self.check_match_scrutinee(exp)?;
+                let Type::Sum {
+                    name: enum_name, ..
+                } = scrutinee.ty.clone()
+                else {
+                    unreachable!("`check_match_scrutinee` só devolve `Type::Sum`")
+                };
+                let mut typed_arms = Vec::with_capacity(arms.len());
+                let mut ok = true;
+                for arm in arms {
+                    // Cada braço abre bloco próprio: os campos ligados pelo
+                    // padrão só existem dentro dele, e fechar aqui é o que
+                    // impede que vazem para o braço seguinte.
+                    let Some((pattern, bindings)) = self.resolve_pattern(&enum_name, &arm.pattern)
+                    else {
+                        ok = false;
+                        continue;
+                    };
+                    self.st.open_block();
+                    for (name, ty, loc) in &bindings {
+                        self.st
+                            .add_symbol(name, ty.clone(), SymbolKind::Param, *loc);
+                        self.record_use(*loc, *loc, name, ty);
+                    }
+                    let body = self.check_stat(&arm.body, rettypes);
+                    self.close_scope(arm.loc);
+                    match body {
+                        Some(body) => typed_arms.push(TypedMatchArm {
+                            loc: arm.loc,
+                            pattern,
+                            body,
+                        }),
+                        None => ok = false,
+                    }
+                }
+                // A exaustividade é conferida mesmo quando algum braço não
+                // tipou: são erros independentes, e reportar os dois de uma
+                // vez poupa uma rodada de compilação ao usuário.
+                if !self.check_exhaustiveness(*loc, &enum_name, arms) {
+                    ok = false;
+                }
+                if !ok {
+                    return None;
+                }
+                Some(TypedStat::Match {
+                    loc: *loc,
+                    exp: scrutinee,
+                    arms: typed_arms,
+                })
             }
         }
     }
@@ -2163,6 +2551,10 @@ impl Checker {
             },
         });
 
+        if self.reject_variant_name(decl.loc, &decl.name) {
+            return None;
+        }
+
         // A variável de controle vive num bloco próprio que não vaza para
         // fora do laço (o corpo `StatBlock` abre o seu por cima).
         self.st.open_block();
@@ -2319,6 +2711,12 @@ valor precisam de nomes diferentes.",
         // do` itera um temporário que o corpo não tem como alcançar.
         if let Some(nome) = root_exp_var_name(exp) {
             self.reject_mutacao_durante_iteracao(block, &nome);
+        }
+
+        for decl in decls {
+            if self.reject_variant_name(decl.loc, &decl.name) {
+                return None;
+            }
         }
 
         // As variáveis do laço vivem num bloco próprio que não vaza para fora
@@ -2746,6 +3144,9 @@ valor precisam de nomes diferentes.",
         // **fora** da declaração (`local x = x` lê o `x` externo).
         let mut targets = Vec::with_capacity(decls.len());
         for (i, decl) in decls.iter().enumerate() {
+            if self.reject_variant_name(decl.loc, &decl.name) {
+                return None;
+            }
             let ty = tipos[i].clone();
             let decl_id = self.next_decl_id;
             self.next_decl_id += 1;
@@ -3040,6 +3441,10 @@ valor precisam de nomes diferentes.",
             Exp::ExpExtra {
                 loc, exp, index, ..
             } => self.check_extra(*loc, exp, *index),
+            // `match` como expressão (T76) — tudo que o comando exige,
+            // mais a exigência que só faz sentido aqui: um tipo comum a
+            // todos os braços, porque o `match` inteiro é um valor.
+            Exp::ExpMatch { loc, exp, arms } => self.check_match_exp(*loc, exp, arms, context),
         }
     }
 
@@ -3735,6 +4140,19 @@ valor precisam de nomes diferentes.",
     /// fora de escopo até T39/T40.
     fn check_var(&mut self, _loc: &Loc, var: &Var) -> Option<TypedExp> {
         match var {
+            // Variante sem payload usada como valor (T76): `ExpNil` se
+            // escreve como um nome nu, e não como chamada — parênteses
+            // vazios já são erro na declaração e no padrão (T75), e seriam
+            // aqui também.
+            //
+            // Vem antes da symtab, e a ordem não esconde nada: nenhuma
+            // declaração pode tomar o nome de uma variante
+            // (`reject_variant_name`), então não há símbolo com este nome
+            // para consultar.
+            Var::VarName { loc, name } if self.variant_owner.contains_key(name) => {
+                let enum_name = self.variant_owner[name].clone();
+                self.check_variant_construction(*loc, &enum_name, name, &[])
+            }
             Var::VarName { loc, name } => match self.st.find_symbol(name).cloned() {
                 // Módulo (T38): só existe para `data.f(...)`/`data.Tipo`
                 // (T39/T40) resolverem contra a tabela de capabilities — não
@@ -4062,6 +4480,21 @@ valor precisam de nomes diferentes.",
         // `ArgsMethod` é `df:f(x)`: o receptor é o `callee` e o nome do
         // método vem nos argumentos, então a resolução vai direto ao braço
         // de método, sem passar por `resolve_callee`.
+        // Construção de variante de `enum` (T76), antes de tudo: o parser
+        // produz `ExpCall` tanto para `f(1)` quanto para `ExpInteger(1)`
+        // (decisão da T75), e quem decide é a tabela de variantes. É o mesmo
+        // espírito de `check_init_list`, que desambigua `{...}` por contexto
+        // em vez de pedir ao parser um lookahead que ele não tem.
+        if let Args::ArgsFunc { args: arg_exps, .. } = args
+            && let Exp::ExpVar { var, .. } = callee
+            && let Var::VarName { name, .. } = var.as_ref()
+            && let Some(enum_name) = self.variant_owner.get(name).cloned()
+        {
+            let typed = self.check_variant_construction(*loc, &enum_name, name, arg_exps)?;
+            let ty = typed.ty.clone();
+            return Some((typed, vec![ty]));
+        }
+
         let (callee, name, params, rettypes, arg_exps) = match args {
             Args::ArgsFunc { args: arg_exps, .. } => {
                 let (callee, name, params, rettypes) = self.resolve_callee(loc, callee)?;
@@ -4184,6 +4617,404 @@ valor precisam de nomes diferentes.",
         ))
     }
 
+    // ---- `match` (T76) -------------------------------------------------
+
+    /// Tipa o escrutinado de um `match` e exige que ele seja um tipo soma.
+    ///
+    /// Não há `match` sobre inteiro nem sobre string nesta fase: o `match`
+    /// existe para desmontar um `enum`, e um `if`/`elseif` já cobre o resto
+    /// — aceitar outros tipos aqui exigiria um segundo conceito de
+    /// exaustividade (intervalos, literais) que nada mais usa.
+    fn check_match_scrutinee(&mut self, exp: &Exp) -> Option<TypedExp> {
+        let typed = self.check_exp(exp, None)?;
+        // `match x with` com `x: Exp?` (T68): o mesmo erro de "usar sem
+        // testar" que a indexação e a condição dão, e não "precisa ser um
+        // enum, encontrado Exp?".
+        if self.reject_option(&typed) {
+            return None;
+        }
+        if !matches!(typed.ty, Type::Sum { .. }) {
+            self.error(
+                typed.loc,
+                format!(
+                    "`match` só funciona sobre um `enum`, encontrado {}.",
+                    type_name(&typed.ty)
+                ),
+            );
+            return None;
+        }
+        Some(typed)
+    }
+
+    /// Resolve um padrão de braço contra a declaração do `enum` escrutinado
+    /// (T76), devolvendo o padrão tipado e os nomes que ele liga.
+    ///
+    /// Os três erros que um padrão pode ter — variante inexistente, variante
+    /// de outro enum e aridade errada — saem **distintos**, porque levam a
+    /// correções distintas: escrever outro nome, trocar o escrutinado, ou
+    /// acertar a lista de campos.
+    #[allow(clippy::type_complexity)]
+    fn resolve_pattern(
+        &mut self,
+        enum_name: &str,
+        pattern: &ast::Pattern,
+    ) -> Option<(TypedPattern, Vec<(String, Type, Loc)>)> {
+        let ast::Pattern::Variant { loc, name, fields } = pattern else {
+            let ast::Pattern::Wildcard { loc } = pattern else {
+                unreachable!("`ast::Pattern` só tem duas formas")
+            };
+            return Some((TypedPattern::Wildcard { loc: *loc }, Vec::new()));
+        };
+
+        let Some(Type::Sum { variants, .. }) = self.enums.get(enum_name).cloned() else {
+            return None;
+        };
+        let Some((_, field_types)) = variants.iter().find(|(n, _)| n == name) else {
+            // A variante existe, mas em outro enum: dizer *qual* poupa a
+            // caçada, e o conserto é quase sempre o escrutinado, não o nome.
+            if let Some(dono) = self.variant_owner.get(name) {
+                self.error(
+                    *loc,
+                    format!("'{name}' é uma variante do enum '{dono}', não de '{enum_name}'."),
+                );
+            } else {
+                self.error(
+                    *loc,
+                    format!("o enum '{enum_name}' não tem variante '{name}'."),
+                );
+            }
+            return None;
+        };
+
+        if fields.len() != field_types.len() {
+            self.error(
+                *loc,
+                match field_types.len() {
+                    0 => format!(
+                        "a variante '{name}' não tem campos: escreva '{name}', sem parênteses."
+                    ),
+                    n => format!(
+                        "a variante '{name}' tem {n} campo(s), mas o padrão liga {}.",
+                        fields.len()
+                    ),
+                },
+            );
+            return None;
+        }
+
+        let mut bindings = Vec::with_capacity(fields.len());
+        let mut typed_fields = Vec::with_capacity(fields.len());
+        let mut seen = HashSet::new();
+        for (decl, ty) in fields.iter().zip(field_types) {
+            if !seen.insert(decl.name.clone()) {
+                self.error(
+                    decl.loc,
+                    format!("o nome '{}' é ligado duas vezes neste padrão.", decl.name),
+                );
+                return None;
+            }
+            typed_fields.push((decl.name.clone(), ty.clone()));
+            bindings.push((decl.name.clone(), ty.clone(), decl.loc));
+        }
+
+        Some((
+            TypedPattern::Variant {
+                loc: *loc,
+                enum_name: enum_name.to_string(),
+                name: name.clone(),
+                fields: typed_fields,
+            },
+            bindings,
+        ))
+    }
+
+    /// A garantia que dá nome à tarefa (decisão técnica 7 do PRD.md): todo
+    /// `match` cobre todas as variantes do `enum`, e quando não cobre, a
+    /// mensagem diz **quais** faltam — em português, sobre o código que o
+    /// usuário escreveu, e não em inglês sobre o Rust gerado.
+    ///
+    /// Devolve `false` se algum erro foi reportado. Percorre os braços na
+    /// ordem escrita porque é ela que decide o que é duplicado e o que é
+    /// inalcançável: um braço só é redundante em relação ao que veio
+    /// **antes** dele.
+    fn check_exhaustiveness<T>(
+        &mut self,
+        loc: Loc,
+        enum_name: &str,
+        arms: &[ast::MatchArm<T>],
+    ) -> bool {
+        let Some(Type::Sum { variants, .. }) = self.enums.get(enum_name).cloned() else {
+            return false;
+        };
+
+        let mut ok = true;
+        let mut cobertas: Vec<String> = Vec::new();
+        let mut curinga: Option<Loc> = None;
+
+        for arm in arms {
+            match &arm.pattern {
+                ast::Pattern::Variant { loc, name, .. } => {
+                    // Um braço depois do `_` nunca é alcançado — e, ao
+                    // contrário do `_` redundante, isto é erro: o usuário
+                    // escreveu um caso que o programa jamais executa.
+                    if let Some(curinga_loc) = curinga {
+                        self.error(
+                            *loc,
+                            format!(
+                                "o braço '{name}' vem depois do braço curinga `_` \
+                                 (linha {}) e nunca é alcançado.",
+                                curinga_loc.line
+                            ),
+                        );
+                        ok = false;
+                        continue;
+                    }
+                    if cobertas.contains(name) {
+                        self.error(*loc, format!("a variante '{name}' já tem um braço."));
+                        ok = false;
+                        continue;
+                    }
+                    // Variante inexistente já saiu por `resolve_pattern`, com
+                    // a mensagem que distingue "não existe" de "é de outro
+                    // enum"; aqui ela só não conta como cobertura.
+                    if variants.iter().any(|(n, _)| n == name) {
+                        cobertas.push(name.clone());
+                    }
+                }
+                ast::Pattern::Wildcard { loc } => {
+                    if let Some(anterior) = curinga {
+                        self.error(
+                            *loc,
+                            format!(
+                                "este `match` já tem um braço curinga `_` (linha {}).",
+                                anterior.line
+                            ),
+                        );
+                        ok = false;
+                        continue;
+                    }
+                    curinga = Some(*loc);
+                }
+            }
+        }
+
+        let faltando: Vec<&str> = variants
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| !cobertas.iter().any(|c| c == n))
+            .collect();
+
+        match curinga {
+            // `_` inalcançável (todas as variantes já cobertas antes dele) é
+            // **aviso**, não erro: o código está correto, e vira código
+            // morto se o `enum` não mudar — mas ele pode mudar, e então o
+            // `_` é justamente o que se quer. Aviso, e não erro, é o que o
+            // PRD.md fixa.
+            Some(curinga_loc) if faltando.is_empty() => {
+                self.warning(
+                    curinga_loc,
+                    format!(
+                        "o braço curinga `_` nunca é alcançado: todas as variantes \
+                         de '{enum_name}' já têm braço."
+                    ),
+                );
+            }
+            Some(_) => {}
+            None if !faltando.is_empty() => {
+                self.error(
+                    loc,
+                    format!(
+                        "`match` não cobre todas as variantes de '{enum_name}': \
+                         falta(m) {}. Acrescente um braço para cada uma, ou um `_`.",
+                        faltando.join(", ")
+                    ),
+                );
+                ok = false;
+            }
+            None => {}
+        }
+
+        ok
+    }
+
+    /// `match` como expressão (T76): o comando inteiro, mais a exigência de
+    /// um tipo comum.
+    ///
+    /// O tipo do `match` é o do **primeiro** braço que tipou, e os demais
+    /// são conferidos contra ele. O `context` — o tipo que o destino
+    /// declara, quando há um — é passado a cada corpo, o que faz
+    /// `local x: integer? = match ... with ... end` funcionar pela mesma
+    /// injeção `T → T?` de qualquer outro valor.
+    fn check_match_exp(
+        &mut self,
+        loc: Loc,
+        exp: &Exp,
+        arms: &[ast::MatchArm<Exp>],
+        context: Option<&Type>,
+    ) -> Option<TypedExp> {
+        let scrutinee = self.check_match_scrutinee(exp)?;
+        let Type::Sum {
+            name: enum_name, ..
+        } = scrutinee.ty.clone()
+        else {
+            unreachable!("`check_match_scrutinee` só devolve `Type::Sum`")
+        };
+
+        let mut typed_arms: Vec<TypedMatchArm<TypedExp>> = Vec::with_capacity(arms.len());
+        let mut ok = true;
+        for arm in arms {
+            let Some((pattern, bindings)) = self.resolve_pattern(&enum_name, &arm.pattern) else {
+                ok = false;
+                continue;
+            };
+            self.st.open_block();
+            for (name, ty, loc) in &bindings {
+                self.st
+                    .add_symbol(name, ty.clone(), SymbolKind::Param, *loc);
+                self.record_use(*loc, *loc, name, ty);
+            }
+            let body = self.check_exp(&arm.body, context);
+            self.close_scope(arm.loc);
+            match body {
+                Some(body) => typed_arms.push(TypedMatchArm {
+                    loc: arm.loc,
+                    pattern,
+                    body,
+                }),
+                None => ok = false,
+            }
+        }
+
+        if !self.check_exhaustiveness(loc, &enum_name, arms) {
+            ok = false;
+        }
+        if !ok {
+            return None;
+        }
+
+        // Todos os braços com o mesmo tipo. O primeiro braço fixa o tipo
+        // porque é o que a leitura de cima para baixo sugere — e citar os
+        // dois tipos e a linha do primeiro braço é o que torna a correção
+        // óbvia sem o usuário ter de contar braços.
+        let Some(primeiro) = typed_arms.first() else {
+            // O parser já exige ao menos um braço (T75); se todos falharam
+            // ao tipar, o `ok` acima já devolveu.
+            self.error(loc, "um `match` precisa de ao menos um braço.");
+            return None;
+        };
+        let ty = primeiro.body.ty.clone();
+        let primeiro_loc = primeiro.loc;
+        for arm in &typed_arms[1..] {
+            if !ty.compatible(&arm.body.ty) {
+                self.error(
+                    arm.body.loc,
+                    format!(
+                        "os braços do `match` têm tipos diferentes: o braço da linha {} \
+                         produz {}, e este produz {}.",
+                        primeiro_loc.line,
+                        type_name(&ty),
+                        type_name(&arm.body.ty)
+                    ),
+                );
+                return None;
+            }
+        }
+
+        Some(TypedExp {
+            loc,
+            ty,
+            kind: TypedExpKind::Match {
+                exp: Box::new(scrutinee),
+                arms: typed_arms,
+            },
+        })
+    }
+
+    /// Construção de variante de `enum` (T76): `ExpInteger(42)`, ou
+    /// `ExpNil` sem payload.
+    ///
+    /// Chamada dos dois lugares onde a forma escrita pode ser uma
+    /// construção — `check_call` (com payload, que o parser viu como
+    /// `ExpCall`) e `check_var` (sem payload, um nome nu) —, para que a
+    /// aridade e os tipos dos campos sejam conferidos por **um** código só.
+    fn check_variant_construction(
+        &mut self,
+        loc: Loc,
+        enum_name: &str,
+        variant: &str,
+        args: &[Exp],
+    ) -> Option<TypedExp> {
+        let Some(Type::Sum { variants, .. }) = self.enums.get(enum_name).cloned() else {
+            // `variant_owner` só aponta para enum aceito; se ele sumiu, o
+            // erro que o tirou de lá já foi reportado.
+            return None;
+        };
+        let (_, fields) = variants.iter().find(|(n, _)| n == variant)?;
+        let fields = fields.clone();
+
+        if args.len() != fields.len() {
+            self.error(
+                loc,
+                match fields.len() {
+                    0 => format!(
+                        "a variante '{variant}' do enum '{enum_name}' não tem campos: \
+                         escreva '{variant}', sem parênteses."
+                    ),
+                    n => format!(
+                        "a variante '{variant}' do enum '{enum_name}' tem {n} campo(s), \
+                         mas recebeu {}.",
+                        args.len()
+                    ),
+                },
+            );
+            return None;
+        }
+
+        let mut typed_args = Vec::with_capacity(args.len());
+        for (arg, expected) in args.iter().zip(&fields) {
+            // O tipo do campo é o contexto, como o do parâmetro numa
+            // chamada: é ele que desambigua um `{...}` passado a
+            // `No({1, 2})`.
+            let typed = self.check_exp(arg, Some(expected))?;
+            // `T → T?` (T68) vale no campo como vale no argumento: o tipo do
+            // destino está escrito na declaração da variante.
+            typed_args.push(Self::widen_to_option(expected, typed));
+        }
+        for (arg, expected) in typed_args.iter().zip(&fields) {
+            if !expected.compatible(&arg.ty) {
+                if self.reject_option_where_base_expected(expected, arg) {
+                    return None;
+                }
+                self.error(
+                    arg.loc,
+                    format!(
+                        "campo incompatível na construção de '{variant}': esperado {}, encontrado {}.",
+                        type_name(expected),
+                        type_name(&arg.ty)
+                    ),
+                );
+                return None;
+            }
+        }
+
+        // Go-to-definition (T49) sobre a construção salta para o `enum`, que
+        // é onde a variante está escrita.
+        if let Some(&def_loc) = self.enum_def_locs.get(enum_name) {
+            let ty = self.enums[enum_name].clone();
+            self.record_use(loc, def_loc, variant, &ty);
+        }
+
+        Some(TypedExp {
+            loc,
+            ty: self.enums[enum_name].clone(),
+            kind: TypedExpKind::VariantLit {
+                enum_name: enum_name.to_string(),
+                variant: variant.to_string(),
+                args: typed_args,
+            },
+        })
+    }
+
     /// `ExpExtra` (T65): o `index`-ésimo (base 0) valor de retorno de uma
     /// chamada. Só faz sentido sobre uma chamada, e o índice precisa existir
     /// na assinatura.
@@ -4278,6 +5109,15 @@ fn fixup_mutability(stat: &mut TypedStat, assigned: &HashSet<DeclId>) {
         | TypedStat::For { block, .. }
         | TypedStat::ForIn { block, .. } => {
             fixup_mutability(block, assigned);
+        }
+        // `match` (T76): o corpo de cada braço é um bloco como o de um
+        // ramo do `if`, e declara locais como qualquer outro. Os campos
+        // ligados pelo padrão não passam por aqui — não são `Decl`, e o
+        // codegen não lhes emite `let mut`.
+        TypedStat::Match { arms, .. } => {
+            for arm in arms {
+                fixup_mutability(&mut arm.body, assigned);
+            }
         }
         TypedStat::Call { .. }
         | TypedStat::Return { .. }
@@ -4453,6 +5293,14 @@ fn coleta_mutacoes(stat: &Stat, container: &str, ofensas: &mut Vec<Loc>) {
             }
         }
         Stat::StatBreak { .. } | Stat::StatContinue { .. } => {}
+        // `match` (T75): o escrutinado e o bloco de cada braço são código
+        // como qualquer outro, e podem muito bem mutar o container.
+        Stat::StatMatch { exp, arms, .. } => {
+            coleta_mutacoes_exp(exp, container, ofensas);
+            for arm in arms {
+                coleta_mutacoes(&arm.body, container, ofensas);
+            }
+        }
     }
 }
 
@@ -4479,6 +5327,12 @@ fn coleta_mutacoes_exp(exp: &Exp, container: &str, ofensas: &mut Vec<Loc>) {
         | Exp::ExpCast { exp, .. }
         | Exp::ExpAdjust { exp, .. }
         | Exp::ExpExtra { exp, .. } => coleta_mutacoes_exp(exp, container, ofensas),
+        Exp::ExpMatch { exp, arms, .. } => {
+            coleta_mutacoes_exp(exp, container, ofensas);
+            for arm in arms {
+                coleta_mutacoes_exp(&arm.body, container, ofensas);
+            }
+        }
         Exp::ExpBinop { lhs, rhs, .. } => {
             coleta_mutacoes_exp(lhs, container, ofensas);
             coleta_mutacoes_exp(rhs, container, ofensas);
@@ -4544,7 +5398,8 @@ fn stat_loc(stat: &Stat) -> Loc {
         | Stat::StatCall { loc, .. }
         | Stat::StatReturn { loc, .. }
         | Stat::StatBreak { loc, .. }
-        | Stat::StatContinue { loc, .. } => *loc,
+        | Stat::StatContinue { loc, .. }
+        | Stat::StatMatch { loc, .. } => *loc,
     }
 }
 
@@ -4572,7 +5427,8 @@ fn exp_loc(exp: &Exp) -> Loc {
         | Exp::ExpBinop { loc, .. }
         | Exp::ExpCast { loc, .. }
         | Exp::ExpAdjust { loc, .. }
-        | Exp::ExpExtra { loc, .. } => *loc,
+        | Exp::ExpExtra { loc, .. }
+        | Exp::ExpMatch { loc, .. } => *loc,
     }
 }
 
@@ -4659,6 +5515,7 @@ pub fn check(program: &Program) -> Result<CheckedProgram, Vec<CheckError>> {
             program: typed_program,
             uses: checker.uses,
             scopes: checker.scopes,
+            warnings: checker.warnings,
         })
     } else {
         Err(checker.errors)
@@ -4678,6 +5535,7 @@ pub fn check_partial(program: &Program) -> CheckedProgram {
         program: typed_program,
         uses: checker.uses,
         scopes: checker.scopes,
+        warnings: checker.warnings,
     }
 }
 
@@ -4716,6 +5574,20 @@ mod tests {
         let program =
             parse(&tokens).unwrap_or_else(|e| panic!("fonte não deveria ter erro sintático: {e}"));
         check(&program).map(|checked| checked.program)
+    }
+
+    /// Como [`check_source`], mas devolve os avisos (T76) — o `_`
+    /// inalcançável é o único diagnóstico do checker que **não** impede a
+    /// compilação, e testá-lo exige olhar para a lista que `check_source`
+    /// descarta.
+    fn check_source_warnings(source: &str) -> Vec<CheckError> {
+        let tokens =
+            lex(source).unwrap_or_else(|e| panic!("fonte não deveria ter erro léxico: {e}"));
+        let program =
+            parse(&tokens).unwrap_or_else(|e| panic!("fonte não deveria ter erro sintático: {e}"));
+        check(&program)
+            .unwrap_or_else(|errs| panic!("fonte não deveria ter erro de tipo: {errs:?}"))
+            .warnings
     }
 
     #[test]
@@ -8695,5 +9567,727 @@ end"#;
     fn t70_value_opcional_continua_recusado() {
         let errs = check_source(&em_main("    local x: value? = nil")).unwrap_err();
         assert!(errs[0].to_string().contains("`value?` não faz sentido"), "{}", errs[0]);
+    }
+
+    // ---- T75: `enum` e `match` chegam do parser -------------------------
+
+    /// A declaração de `enum` já atravessa o checker sem erro desde a T74 —
+    /// a diferença da T75 é que agora ela chega mesmo, escrita pelo usuário.
+    /// Virar `Type::Sum` coletado em `self.enums` é a T76.
+    #[test]
+    fn t75_declaracao_de_enum_nao_produz_erro() {
+        check_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("declarar um `enum` não deveria ser erro de checagem");
+    }
+
+    // ---- T76: tipagem de `enum`/`match` com exaustividade --------------
+
+    /// O `enum` que a fase inteira existe para permitir: recursivo, e
+    /// **aceito** — a checagem de ciclo de `collect_records`, que rejeita
+    /// record recursivo, não se aplica ao tipo soma (decisão técnica 6 do
+    /// PRD.md), porque o `Box` da emissão (T77) é quem quebra o ciclo.
+    #[test]
+    fn t76_enum_recursivo_tipa_sem_disparar_a_checagem_de_ciclo() {
+        let typed = check_source(
+            "enum Exp\n\
+             \x20   ExpInteger(integer)\n\
+             \x20   ExpBinop(string, Exp, Exp)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpBinop(\"+\", ExpInteger(1), ExpInteger(2))\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("um `enum` recursivo deveria tipar");
+        let Some(TypedTopLevel::Enum { name, variants, .. }) = typed
+            .iter()
+            .find(|t| matches!(t, TypedTopLevel::Enum { .. }))
+        else {
+            panic!("esperava um `TypedTopLevel::Enum`, obteve {typed:?}");
+        };
+        assert_eq!(name, "Exp");
+        assert_eq!(variants.len(), 2);
+        // O campo recursivo é o próprio `Type::Sum`, e não um placeholder de
+        // variantes vazias: é nominal, então guardá-lo não estoura.
+        let (_, campos) = &variants[1];
+        assert_eq!(campos[0], Type::String);
+        assert!(
+            matches!(&campos[1], Type::Sum { name, .. } if name == "Exp"),
+            "campo recursivo deveria ser o próprio enum, obteve {:?}",
+            campos[1]
+        );
+    }
+
+    /// A exigência que dá nome à tarefa: a mensagem diz **quais** variantes
+    /// faltam, não só que o `match` é não exaustivo.
+    #[test]
+    fn t76_match_nao_exaustivo_nomeia_as_variantes_que_faltam() {
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             \x20   Verde\n\
+             \x20   Azul\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Cor = Vermelho\n\
+             \x20   match c with\n\
+             \x20       Vermelho then\n\
+             \x20           return 0\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        let msg = &errs[0].message;
+        assert!(
+            msg.contains("não cobre todas as variantes"),
+            "erros: {errs:?}"
+        );
+        assert!(
+            msg.contains("Verde"),
+            "a mensagem deveria nomear 'Verde': {msg}"
+        );
+        assert!(
+            msg.contains("Azul"),
+            "a mensagem deveria nomear 'Azul': {msg}"
+        );
+        assert!(
+            !msg.contains("Vermelho"),
+            "a mensagem não deveria citar a variante coberta: {msg}"
+        );
+    }
+
+    /// `_` satisfaz a exaustividade — é o que o torna útil.
+    #[test]
+    fn t76_curinga_satisfaz_a_exaustividade() {
+        check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             \x20   Verde\n\
+             \x20   Azul\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Cor = Vermelho\n\
+             \x20   match c with\n\
+             \x20       Vermelho then\n\
+             \x20           return 0\n\
+             \x20       _ then\n\
+             \x20           return 1\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("um `_` deveria cobrir o que sobrou");
+    }
+
+    /// `_` depois de todas as variantes é **aviso**, não erro (PRD.md, T76):
+    /// o código está certo, e o `_` volta a ser útil se o `enum` crescer.
+    #[test]
+    fn t76_curinga_inalcancavel_e_aviso_nao_erro() {
+        let warnings = check_source_warnings(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             \x20   Verde\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Cor = Vermelho\n\
+             \x20   match c with\n\
+             \x20       Vermelho then\n\
+             \x20           return 0\n\
+             \x20       Verde then\n\
+             \x20           return 1\n\
+             \x20       _ then\n\
+             \x20           return 2\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert_eq!(warnings.len(), 1, "avisos: {warnings:?}");
+        assert!(
+            warnings[0].message.contains("nunca é alcançado"),
+            "aviso: {}",
+            warnings[0].message
+        );
+    }
+
+    /// Braço duplicado, variante inexistente e aridade errada dão erros
+    /// **distintos** (PRD.md, T76) — cada um leva a uma correção diferente.
+    #[test]
+    fn t76_braco_duplicado_variante_inexistente_e_aridade_dao_erros_distintos() {
+        let fonte = |bracos: &str| {
+            format!(
+                "enum Exp
+                     ExpNil
+                     ExpInteger(integer)
+                 end
+                 function main(args: {{string}}): integer
+                     local e: Exp = ExpNil
+                     match e with
+                 {bracos}                     end
+                     return 0
+                 end"
+            )
+        };
+
+        let duplicado = check_source(&fonte(
+            "        ExpNil then
+                         return 0
+                     ExpNil then
+                         return 1
+                     ExpInteger(n) then
+                         return n
+",
+        ))
+        .unwrap_err();
+        assert!(
+            duplicado
+                .iter()
+                .any(|e| e.message == "a variante 'ExpNil' já tem um braço."),
+            "erros: {duplicado:?}"
+        );
+
+        let inexistente = check_source(&fonte(
+            "        ExpNil then
+                         return 0
+                     ExpFloat(f) then
+                         return 1
+                     ExpInteger(n) then
+                         return n
+",
+        ))
+        .unwrap_err();
+        assert!(
+            inexistente
+                .iter()
+                .any(|e| e.message == "o enum 'Exp' não tem variante 'ExpFloat'."),
+            "erros: {inexistente:?}"
+        );
+
+        let aridade = check_source(&fonte(
+            "        ExpNil then
+                         return 0
+                     ExpInteger(a, b) then
+                         return a
+",
+        ))
+        .unwrap_err();
+        assert!(
+            aridade
+                .iter()
+                .any(|e| e.message.contains("tem 1 campo(s), mas o padrão liga 2")),
+            "erros: {aridade:?}"
+        );
+    }
+
+    /// Uma variante do enum errado tem mensagem própria: o conserto quase
+    /// sempre é o escrutinado, não o nome do braço.
+    #[test]
+    fn t76_variante_de_outro_enum_diz_a_qual_enum_ela_pertence() {
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             end\n\
+             enum Forma\n\
+             \x20   Circulo\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Cor = Vermelho\n\
+             \x20   match c with\n\
+             \x20       Circulo then\n\
+             \x20           return 0\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "'Circulo' é uma variante do enum 'Forma', não de 'Cor'."),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// `match` como expressão com braços de tipos diferentes dá erro claro,
+    /// citando os dois tipos e a linha do braço que fixou o primeiro.
+    #[test]
+    fn t76_match_expressao_com_bracos_de_tipos_diferentes_da_erro_claro() {
+        let errs = check_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpNil\n\
+             \x20   local x: integer = match e with\n\
+             \x20       ExpNil then 0\n\
+             \x20       ExpInteger(n) then \"texto\"\n\
+             \x20   end\n\
+             \x20   return x\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| {
+                e.message
+                    .contains("os braços do `match` têm tipos diferentes")
+                    && e.message.contains("integer")
+                    && e.message.contains("string")
+            }),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// `match` como expressão, no caso que funciona: todos os braços com o
+    /// mesmo tipo, e é esse o tipo do `match`.
+    #[test]
+    fn t76_match_expressao_com_bracos_do_mesmo_tipo_tipa() {
+        check_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpInteger(7)\n\
+             \x20   local x: integer = match e with\n\
+             \x20       ExpNil then 0\n\
+             \x20       ExpInteger(n) then n\n\
+             \x20   end\n\
+             \x20   return x\n\
+             end",
+        )
+        .expect("braços de mesmo tipo deveriam tipar");
+    }
+
+    /// Construção de variante × chamada de função: o parser produz `ExpCall`
+    /// para as duas (T75), e é a tabela de variantes que decide (T76). O
+    /// tipo do resultado é o do `enum`, não o de um retorno de função.
+    #[test]
+    fn t76_construcao_de_variante_e_desambiguada_de_chamada_de_funcao() {
+        check_source(
+            "enum Exp\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function dobro(n: integer): integer\n\
+             \x20   return n * 2\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpInteger(dobro(21))\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("`ExpInteger(dobro(21))` deveria construir a variante");
+    }
+
+    /// Aridade e tipo dos campos são conferidos como os de uma chamada.
+    #[test]
+    fn t76_construcao_de_variante_confere_aridade_e_tipos() {
+        let aridade = check_source(
+            "enum Exp\n\
+             \x20   ExpBinop(string, integer, integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpBinop(\"+\", 1)\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            aridade
+                .iter()
+                .any(|e| e.message.contains("tem 3 campo(s), mas recebeu 2")),
+            "erros: {aridade:?}"
+        );
+
+        let tipo = check_source(
+            "enum Exp\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpInteger(\"texto\")\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            tipo.iter().any(|e| {
+                e.message
+                    .contains("campo incompatível na construção de 'ExpInteger'")
+                    && e.message.contains("esperado integer")
+            }),
+            "erros: {tipo:?}"
+        );
+    }
+
+    /// Variante sem payload é um nome nu — `ExpNil()` é erro na declaração e
+    /// no padrão (T75), e escrever `ExpNil` como valor é o que a T76 aceita.
+    #[test]
+    fn t76_variante_sem_payload_e_um_nome_nu() {
+        check_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpNil\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("`ExpNil` deveria construir a variante sem payload");
+    }
+
+    /// Os campos ligados pelo padrão têm o tipo da declaração da variante, e
+    /// só existem dentro do braço.
+    #[test]
+    fn t76_campos_ligados_tem_o_tipo_da_declaracao_e_nao_vazam() {
+        let errs = check_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpNil\n\
+             \x20   match e with\n\
+             \x20       ExpNil then\n\
+             \x20           return 0\n\
+             \x20       ExpInteger(n) then\n\
+             \x20           return n\n\
+             \x20   end\n\
+             \x20   return n\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message == "'n' não foi declarado."),
+            "o campo ligado não deveria existir fora do braço: {errs:?}"
+        );
+    }
+
+    /// O campo ligado é usado com o tipo que a declaração lhe deu: somar uma
+    /// `string` com `1` é erro, e a mensagem é a de tipo, não a de escopo.
+    #[test]
+    fn t76_campo_ligado_carrega_o_tipo_da_variante() {
+        let errs = check_source(
+            "enum Exp\n\
+             \x20   ExpTexto(string)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpTexto(\"oi\")\n\
+             \x20   match e with\n\
+             \x20       ExpTexto(s) then\n\
+             \x20           return s + 1\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("string")),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// `match` sobre o que não é `enum` é recusado — não há exaustividade a
+    /// verificar sobre um `integer`, e um `if` já cobre o caso.
+    #[test]
+    fn t76_match_sobre_o_que_nao_e_enum_e_recusado() {
+        let errs = check_source(
+            "function main(args: {string}): integer\n\
+             \x20   local n: integer = 0\n\
+             \x20   match n with\n\
+             \x20       _ then\n\
+             \x20           return 0\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "`match` só funciona sobre um `enum`, encontrado integer."),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// Duas variantes de mesmo nome em enums diferentes são recusadas na
+    /// declaração: `Vermelho(...)` não teria como escolher entre elas, e a
+    /// sintaxe de construção não diz de que enum a variante vem (T75).
+    #[test]
+    fn t76_variante_de_nome_repetido_entre_enums_e_recusada() {
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             end\n\
+             enum Tinta\n\
+             \x20   Vermelho\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("já existe no enum 'Cor'")),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// Uma função com nome de variante tornaria `Nome(...)` ambíguo: a
+    /// desambiguação de `check_call` é pelo nome, e não há contexto que
+    /// desempate.
+    #[test]
+    fn t76_funcao_com_nome_de_variante_e_recusada() {
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             end\n\
+             function Vermelho(): integer\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("é uma variante do enum 'Cor'")),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// `enum` e `record` disputam o mesmo espaço de nomes de tipo, nas duas
+    /// ordens de declaração.
+    #[test]
+    fn t76_enum_e_record_nao_podem_ter_o_mesmo_nome() {
+        for fonte in [
+            "enum Ponto\n\
+             \x20   Origem\n\
+             end\n\
+             record Ponto\n\
+             \x20   x: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+            "record Ponto\n\
+             \x20   x: integer\n\
+             end\n\
+             enum Ponto\n\
+             \x20   Origem\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        ] {
+            let errs = check_source(fonte).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| e.message == "'Ponto' já foi declarado antes."),
+                "erros: {errs:?}"
+            );
+        }
+    }
+
+    /// Um `enum` pode carregar um record, e um record pode carregar um
+    /// `enum` — o que exige que os nomes dos enums entrem antes dos records
+    /// e os campos das variantes depois deles.
+    #[test]
+    fn t76_enum_e_record_se_referenciam_nos_dois_sentidos() {
+        check_source(
+            "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   forma: Forma\n\
+             end\n\
+             enum Forma\n\
+             \x20   Vazia\n\
+             \x20   Circulo(Ponto)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("enum e record deveriam poder se referenciar");
+    }
+
+    /// Um `enum` é um tipo como outro qualquer: atravessa assinatura de
+    /// função, e um valor de outro enum não é compatível com ele
+    /// (nominalidade de `Type::Sum`, T74).
+    #[test]
+    fn t76_enum_atravessa_assinatura_e_e_nominal() {
+        check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             end\n\
+             function pinta(c: Cor): integer\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return pinta(Vermelho)\n\
+             end",
+        )
+        .expect("um `enum` deveria atravessar assinatura de função");
+
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             end\n\
+             enum Forma\n\
+             \x20   Circulo\n\
+             end\n\
+             function pinta(c: Cor): integer\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return pinta(Circulo)\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("argumento incompatível")),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// Um braço depois do `_` nunca roda: é erro, e não aviso, porque o
+    /// usuário escreveu um caso que o programa jamais executa.
+    #[test]
+    fn t76_braco_depois_do_curinga_e_erro() {
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             \x20   Verde\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Cor = Vermelho\n\
+             \x20   match c with\n\
+             \x20       _ then\n\
+             \x20           return 0\n\
+             \x20       Verde then\n\
+             \x20           return 1\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("nunca é alcançado")),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// Dois braços curingas: o segundo é erro (o primeiro já cobriu tudo o
+    /// que sobrou), com mensagem própria.
+    #[test]
+    fn t76_dois_curingas_dao_erro() {
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             \x20   Verde\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Cor = Vermelho\n\
+             \x20   match c with\n\
+             \x20       _ then\n\
+             \x20           return 0\n\
+             \x20       _ then\n\
+             \x20           return 1\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("já tem um braço curinga")),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// Uma local, um parâmetro ou uma variável de laço com nome de variante
+    /// tornaria a construção inalcançável naquele escopo, em silêncio: a
+    /// declaração é recusada, como a da função homônima.
+    #[test]
+    fn t76_local_parametro_e_variavel_de_laco_com_nome_de_variante_sao_recusados() {
+        let fontes = [
+            // local simples
+            "\x20   local Vermelho: integer = 0\n",
+            // local múltipla
+            "\x20   local Vermelho, outro: integer = 0, 1\n",
+            // `for` numérico
+            "\x20   for Vermelho = 1, 2 do\n\x20   end\n",
+            // `for`-in
+            "\x20   local v: {integer} = {1}\n\x20   for Vermelho in v do\n\x20   end\n",
+        ];
+        for corpo in fontes {
+            let fonte = format!(
+                "enum Cor\n\
+                 \x20   Vermelho\n\
+                 end\n\
+                 function main(args: {{string}}): integer\n\
+                 {corpo}\
+                 \x20   return 0\n\
+                 end"
+            );
+            let errs = check_source(&fonte).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("é uma variante do enum 'Cor'")),
+                "fonte:\n{fonte}\nerros: {errs:?}"
+            );
+        }
+
+        // Parâmetro, que precisa de uma função à parte.
+        let errs = check_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             end\n\
+             function f(Vermelho: integer): integer\n\
+             \x20   return 0\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("é uma variante do enum 'Cor'")),
+            "erros: {errs:?}"
+        );
+    }
+
+    /// O mesmo nome ligado duas vezes num padrão sombrearia o primeiro campo
+    /// em silêncio: recusado com a razão.
+    #[test]
+    fn t76_nome_ligado_duas_vezes_no_mesmo_padrao_e_recusado() {
+        let errs = check_source(
+            "enum Par\n\
+             \x20   Dois(integer, integer)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Par = Dois(1, 2)\n\
+             \x20   match p with\n\
+             \x20       Dois(a, a) then\n\
+             \x20           return a\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        )
+        .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message == "o nome 'a' é ligado duas vezes neste padrão."),
+            "erros: {errs:?}"
+        );
     }
 }

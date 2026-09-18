@@ -46,14 +46,16 @@
 //!   `examples/dados.titan` — único caminho feliz desta suíte que paga o
 //!   build do Polars de propósito — conferindo stdout completo e exit code.
 //! - curadoria da Fase 4 (PRD.md, T57): `CASOS_FORA_DE_ESCOPO_FASE_4` fecha
-//!   com tipos soma (`enum`/`match`, sem sintaxe própria até a Fase 5),
+//!   com tipos soma (`enum`/`match`, que ganharam sintaxe na T75 e agora são
+//!   rejeitados pelo **checker**, à espera da tipagem da T76),
 //!   `.titan` importando `.titan` (mesma rejeição de `import` com string da
 //!   T35) e `s[i]` (indexação de string, branch própria no checker); e o
 //!   risco 5 (Cargo.toml gerado nunca depender do LSP) é conferido dentro do
 //!   build de `hello.titan` já pago pelo caminho feliz, sem custo extra.
 //! - abertura da Fase 5 (PRD.md, T59): as tabelas de fora-de-escopo mudam de
 //!   camada onde o léxico abriu e `KEYWORDS_NOVAS_DA_T59` registra a quebra
-//!   compatível das sete palavras-chave novas;
+//!   compatível das palavras-chave novas — as sete da T59 mais `with`, que
+//!   a sintaxe do `match` exigiu na T75;
 //! - tipos opcionais (PRD.md, T68/T69): `integer?` saiu de
 //!   `CASOS_FORA_DE_ESCOPO_FASE_2` — parser e checker o aceitam, e a T69
 //!   fechou a emissão, então o caso virou caminho feliz em
@@ -508,6 +510,59 @@ fn emit_rust_imprime_o_rust_gerado_sem_compilar() {
     assert!(
         !out_dir.join("build").exists(),
         "--emit-rust não deveria gerar build/"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// O `_` inalcançável é o primeiro diagnóstico do checker que **não**
+/// impede a compilação (T76): sai como aviso em stderr, e não como erro.
+///
+/// A compilação ainda para em seguida, porque a emissão de tipos soma é a
+/// T77 — mas o aviso já saiu antes, que é justamente o ponto: ele não é o
+/// que barrou o programa.
+#[test]
+fn curinga_inalcancavel_sai_como_aviso_e_nao_como_erro() {
+    let out_dir = temp_dir("aviso-curinga");
+    let fonte = write_source(
+        &out_dir,
+        "cor.titan",
+        "enum Cor\n\
+         \x20   Vermelho\n\
+         \x20   Verde\n\
+         end\n\
+         \n\
+         function main(args: {string}): integer\n\
+         \x20   local c: Cor = Vermelho\n\
+         \x20   match c with\n\
+         \x20       Vermelho then\n\
+         \x20           return 0\n\
+         \x20       Verde then\n\
+         \x20           return 1\n\
+         \x20       _ then\n\
+         \x20           return 2\n\
+         \x20   end\n\
+         \x20   return 0\n\
+         end\n",
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&fonte)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("aviso") && stderr.contains("nunca é alcançado"),
+        "esperava o aviso do `_` inalcançável em stderr, obteve: {stderr}"
+    );
+    assert!(
+        !stderr.contains("erro de tipo"),
+        "o `_` inalcançável não é erro de tipo: {stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -1228,20 +1283,42 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         trecho_esperado: "'x' não foi declarado",
     },
     CasoNegativo {
-        // `enum`/`match` (PRD.md: "tipos soma") não têm sintaxe própria: a
-        // T59 as tornou keywords, mas a declaração só chega na T62 — `enum`
-        // segue não sendo declaração de topo reconhecida.
-        nome: "tipo_soma_enum",
-        fonte: "enum Cor\n    Vermelho\n    Verde\n    Azul\nend\n\nfunction main(args: {string}): integer\n    return 0\nend",
-        trecho_esperado: "Esperava uma declaração de topo",
+        // `match` sobre o que não é `enum` (T76): não há exaustividade a
+        // verificar sobre um `integer`, e um `if` já cobre o caso.
+        nome: "tipo_soma_match_sobre_integer",
+        fonte: "enum Cor\n    Vermelho\n    Verde\nend\n\nfunction main(args: {string}): integer\n    local x: integer = 1\n    match x with\n        Vermelho then\n            return 0\n    end\n    return 0\nend",
+        trecho_esperado: "`match` só funciona sobre um `enum`, encontrado integer",
     },
     CasoNegativo {
-        nome: "tipo_soma_match",
-        // `match` virou keyword na T59 mas ainda não tem comando próprio
-        // (T62): dentro de um corpo de função, o parser não reconhece o
-        // início de comando nem de expressão.
+        // A garantia que dá nome à T76 (decisão técnica 7 do PRD.md): a
+        // exaustividade é conferida pelo checker, e a mensagem nomeia as
+        // variantes que faltam — em português, sobre o código escrito, e
+        // não em inglês sobre o Rust gerado.
+        nome: "tipo_soma_match_nao_exaustivo",
+        fonte: "enum Cor\n    Vermelho\n    Verde\n    Azul\nend\n\nfunction main(args: {string}): integer\n    local c: Cor = Vermelho\n    match c with\n        Vermelho then\n            return 0\n    end\n    return 0\nend",
+        trecho_esperado: "não cobre todas as variantes de 'Cor': falta(m) Verde, Azul",
+    },
+    CasoNegativo {
+        // Construção de variante com aridade errada (T76): o parser viu uma
+        // chamada, o checker sabe que é construção e confere os campos.
+        nome: "tipo_soma_construcao_com_aridade_errada",
+        fonte: "enum Exp\n    ExpInteger(integer)\nend\n\nfunction main(args: {string}): integer\n    local e: Exp = ExpInteger(1, 2)\n    return 0\nend",
+        trecho_esperado: "tem 1 campo(s), mas recebeu 2",
+    },
+    CasoNegativo {
+        // Tipos soma tipam desde a T76, mas a emissão (o `enum` do Rust, o
+        // `Box` dos campos recursivos e a tradução do `match`) é da T77: a
+        // recusa é do backend, em português, e não um panic.
+        nome: "tipo_soma_emissao_e_da_t77",
+        fonte: "enum Cor\n    Vermelho\n    Verde\nend\n\nfunction main(args: {string}): integer\n    local c: Cor = Vermelho\n    match c with\n        Vermelho then\n            return 0\n        Verde then\n            return 1\n    end\n    return 0\nend",
+        trecho_esperado: "a emissão de tipos soma",
+    },
+    CasoNegativo {
+        // A sintaxe do `match` é a do PRD.md (`with` + braços `padrão then`),
+        // não a de seta do Rust/ML: `1 -> ...` é erro de sintaxe claro.
+        nome: "tipo_soma_match_com_seta",
         fonte: "function main(args: {string}): integer\n    local x: integer = 1\n    match x\n        1 -> print(\"um\")\n    end\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        trecho_esperado: "Esperava 'with' após a expressão do 'match'",
     },
     CasoNegativo {
         // `.titan` importando `.titan` cairia exatamente na forma `import`
@@ -1271,10 +1348,11 @@ fn construcoes_fora_de_escopo_da_fase_4_produzem_erro_claro_sem_panic() {
 /// Quebra compatível registrada pela T59 (Fase 5): `enum`, `match`,
 /// `continue`, `repeat`, `until`, `in` e `foreign` viraram palavras-chave e
 /// deixaram de ser identificadores válidos — mesma mudança de `as` (T20),
-/// `import` (T34) e `break` (T55). Um programa que usava qualquer uma delas
+/// `import` (T34) e `break` (T55). `with` entrou depois, na T75, quando a
+/// sintaxe do `match` a exigiu. Um programa que usava qualquer uma delas
 /// como nome de variável passa a ser erro de sintaxe claro, nunca panic.
 const KEYWORDS_NOVAS_DA_T59: &[&str] = &[
-    "enum", "match", "continue", "repeat", "until", "in", "foreign",
+    "enum", "match", "continue", "repeat", "until", "in", "foreign", "with",
 ];
 
 #[test]

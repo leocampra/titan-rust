@@ -105,6 +105,12 @@ pub enum TokenKind {
     // Palavras-chave da Fase 5 (T59): tipos soma, laços e FFI
     KwEnum,
     KwMatch,
+    /// `with`, o separador de `match e with ... end` (T75).
+    ///
+    /// Não estava na lista da T59 porque só a sintaxe do `match` a exigiu:
+    /// entra pela mesma porta que as outras (a tabela [`KEYWORDS`]), com a
+    /// mesma quebra compatível — `with` deixa de ser identificador válido.
+    KwWith,
     KwContinue,
     KwRepeat,
     KwUntil,
@@ -187,6 +193,7 @@ pub const KEYWORDS: &[(&str, TokenKind)] = &[
     ("break", TokenKind::KwBreak),
     ("enum", TokenKind::KwEnum),
     ("match", TokenKind::KwMatch),
+    ("with", TokenKind::KwWith),
     ("continue", TokenKind::KwContinue),
     ("repeat", TokenKind::KwRepeat),
     ("until", TokenKind::KwUntil),
@@ -1211,12 +1218,37 @@ mod tests {
         );
     }
 
+    /// T75: `with`, o separador do `match`, entrou pela mesma porta das
+    /// outras keywords da fase — a tabela `KEYWORDS`.
+    #[test]
+    fn with_e_keyword() {
+        assert_eq!(
+            kinds("match e with"),
+            vec![
+                TokenKind::KwMatch,
+                TokenKind::Name("e".to_string()),
+                TokenKind::KwWith,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    /// `_` é identificador para o léxico: quem lhe dá o sentido de curinga é
+    /// o parser do padrão de `match` (T75).
+    #[test]
+    fn underscore_isolado_e_nome() {
+        assert_eq!(
+            kinds("_"),
+            vec![TokenKind::Name("_".to_string()), TokenKind::Eof]
+        );
+    }
+
     #[test]
     fn keyword_da_fase_5_nao_casa_prefixo_de_identificador() {
         // Mesma garantia de `keyword_nova_nao_casa_prefixo_de_identificador`:
         // `matching` não é `match` + `ing`, `continuar` não é `continue`...
         assert_eq!(
-            kinds("matching continuar enumera repetir untilx interno foreignkey"),
+            kinds("matching continuar enumera repetir untilx interno foreignkey within"),
             vec![
                 TokenKind::Name("matching".to_string()),
                 TokenKind::Name("continuar".to_string()),
@@ -1225,6 +1257,7 @@ mod tests {
                 TokenKind::Name("untilx".to_string()),
                 TokenKind::Name("interno".to_string()),
                 TokenKind::Name("foreignkey".to_string()),
+                TokenKind::Name("within".to_string()),
                 TokenKind::Eof,
             ]
         );
