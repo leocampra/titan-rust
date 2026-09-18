@@ -179,6 +179,15 @@ pub fn compile(opts: &Options) -> Result<PathBuf, CompileError> {
     let tokens = lexer::lex(&source)?;
     let program = parser::parse(&tokens)?;
     let checked = checker::check(&program).map_err(CompileError::Check)?;
+    // Avisos (T76) não impedem a compilação, mas precisam ser vistos: saem
+    // em stderr, para não se misturarem ao Rust que `--emit-rust` manda
+    // para stdout.
+    for aviso in &checked.warnings {
+        eprintln!(
+            "titanc: aviso (linha {}, coluna {}): {}",
+            aviso.loc.line, aviso.loc.col, aviso.message
+        );
+    }
     let rust_code = codegen::generate(&checked.program)?;
 
     if opts.emit_rust {

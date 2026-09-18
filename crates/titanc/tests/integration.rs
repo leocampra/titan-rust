@@ -515,6 +515,59 @@ fn emit_rust_imprime_o_rust_gerado_sem_compilar() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+/// O `_` inalcançável é o primeiro diagnóstico do checker que **não**
+/// impede a compilação (T76): sai como aviso em stderr, e não como erro.
+///
+/// A compilação ainda para em seguida, porque a emissão de tipos soma é a
+/// T77 — mas o aviso já saiu antes, que é justamente o ponto: ele não é o
+/// que barrou o programa.
+#[test]
+fn curinga_inalcancavel_sai_como_aviso_e_nao_como_erro() {
+    let out_dir = temp_dir("aviso-curinga");
+    let fonte = write_source(
+        &out_dir,
+        "cor.titan",
+        "enum Cor\n\
+         \x20   Vermelho\n\
+         \x20   Verde\n\
+         end\n\
+         \n\
+         function main(args: {string}): integer\n\
+         \x20   local c: Cor = Vermelho\n\
+         \x20   match c with\n\
+         \x20       Vermelho then\n\
+         \x20           return 0\n\
+         \x20       Verde then\n\
+         \x20           return 1\n\
+         \x20       _ then\n\
+         \x20           return 2\n\
+         \x20   end\n\
+         \x20   return 0\n\
+         end\n",
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&fonte)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("aviso") && stderr.contains("nunca é alcançado"),
+        "esperava o aviso do `_` inalcançável em stderr, obteve: {stderr}"
+    );
+    assert!(
+        !stderr.contains("erro de tipo"),
+        "o `_` inalcançável não é erro de tipo: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 /// `import_de_modulo` saiu da tabela de fora-de-escopo na T44: desde a T35 a
 /// forma de topo `import data` (sem alias, sem string) é aceita pelo parser e
 /// resolvida pelo checker (T38). Usa `--emit-rust` para não pagar o build do
@@ -1230,14 +1283,35 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         trecho_esperado: "'x' não foi declarado",
     },
     CasoNegativo {
-        // `match` (PRD.md: "tipos soma") ganhou sintaxe na T75 — `enum` é
-        // declaração de topo reconhecida e o `match` parseia —, mas a
-        // tipagem e a exaustividade são da T76: quem rejeita agora é o
-        // checker, não o parser. A mensagem nomeia a tarefa em que a
-        // construção entra, em vez de dizer só que a sintaxe não existe.
-        nome: "tipo_soma_match_ainda_nao_tipado",
+        // `match` sobre o que não é `enum` (T76): não há exaustividade a
+        // verificar sobre um `integer`, e um `if` já cobre o caso.
+        nome: "tipo_soma_match_sobre_integer",
         fonte: "enum Cor\n    Vermelho\n    Verde\nend\n\nfunction main(args: {string}): integer\n    local x: integer = 1\n    match x with\n        Vermelho then\n            return 0\n    end\n    return 0\nend",
-        trecho_esperado: "`match` não é suportado nesta fase",
+        trecho_esperado: "`match` só funciona sobre um `enum`, encontrado integer",
+    },
+    CasoNegativo {
+        // A garantia que dá nome à T76 (decisão técnica 7 do PRD.md): a
+        // exaustividade é conferida pelo checker, e a mensagem nomeia as
+        // variantes que faltam — em português, sobre o código escrito, e
+        // não em inglês sobre o Rust gerado.
+        nome: "tipo_soma_match_nao_exaustivo",
+        fonte: "enum Cor\n    Vermelho\n    Verde\n    Azul\nend\n\nfunction main(args: {string}): integer\n    local c: Cor = Vermelho\n    match c with\n        Vermelho then\n            return 0\n    end\n    return 0\nend",
+        trecho_esperado: "não cobre todas as variantes de 'Cor': falta(m) Verde, Azul",
+    },
+    CasoNegativo {
+        // Construção de variante com aridade errada (T76): o parser viu uma
+        // chamada, o checker sabe que é construção e confere os campos.
+        nome: "tipo_soma_construcao_com_aridade_errada",
+        fonte: "enum Exp\n    ExpInteger(integer)\nend\n\nfunction main(args: {string}): integer\n    local e: Exp = ExpInteger(1, 2)\n    return 0\nend",
+        trecho_esperado: "tem 1 campo(s), mas recebeu 2",
+    },
+    CasoNegativo {
+        // Tipos soma tipam desde a T76, mas a emissão (o `enum` do Rust, o
+        // `Box` dos campos recursivos e a tradução do `match`) é da T77: a
+        // recusa é do backend, em português, e não um panic.
+        nome: "tipo_soma_emissao_e_da_t77",
+        fonte: "enum Cor\n    Vermelho\n    Verde\nend\n\nfunction main(args: {string}): integer\n    local c: Cor = Vermelho\n    match c with\n        Vermelho then\n            return 0\n        Verde then\n            return 1\n    end\n    return 0\nend",
+        trecho_esperado: "a emissão de tipos soma",
     },
     CasoNegativo {
         // A sintaxe do `match` é a do PRD.md (`with` + braços `padrão then`),

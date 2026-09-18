@@ -22,9 +22,21 @@ fn point_range(source: &str, loc: &Loc) -> Range {
 }
 
 fn diagnostic_at(source: &str, loc: &Loc, message: String) -> Diagnostic {
+    diagnostic_com_severidade(source, loc, message, DiagnosticSeverity::ERROR)
+}
+
+/// O mesmo diagnóstico, com a severidade escolhida — o aviso da T76 (o `_`
+/// inalcançável) é a primeira coisa que o checker reporta sem impedir a
+/// compilação, e sublinhá-lo em vermelho diria o contrário.
+fn diagnostic_com_severidade(
+    source: &str,
+    loc: &Loc,
+    message: String,
+    severity: DiagnosticSeverity,
+) -> Diagnostic {
     Diagnostic {
         range: point_range(source, loc),
-        severity: Some(DiagnosticSeverity::ERROR),
+        severity: Some(severity),
         source: Some("titanc".to_string()),
         message,
         ..Diagnostic::default()
@@ -61,7 +73,15 @@ pub fn compute_diagnostics(source: &str) -> Vec<Diagnostic> {
     };
 
     match checker::check(&program) {
-        Ok(_typed_program) => Vec::new(),
+        // Um programa que tipa pode ainda ter avisos (T76) — eles saem como
+        // `WARNING`, porque o código compila.
+        Ok(checked) => checked
+            .warnings
+            .into_iter()
+            .map(|w| {
+                diagnostic_com_severidade(source, &w.loc, w.message, DiagnosticSeverity::WARNING)
+            })
+            .collect(),
         Err(errors) => check_diagnostics(source, errors),
     }
 }
