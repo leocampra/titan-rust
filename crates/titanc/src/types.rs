@@ -32,6 +32,22 @@ pub enum Type {
         name: String,
         fields: Vec<(String, Type)>,
     },
+    /// Tipo soma (T74): `enum Exp ExpNil ExpInteger(integer) ... end`.
+    ///
+    /// Os campos de uma variante são **posicionais** (`Vec<Type>`, sem nome),
+    /// ao contrário de [`Type::Record`] — os nomes só aparecem no braço do
+    /// `match` que os liga (T75).
+    ///
+    /// **Recursão é representável**: `ExpBinop(string, Exp, Exp)` guarda
+    /// `Type::Sum { name: "Exp", .. }` dentro de si sem estourar, porque
+    /// `equals` é nominal (compara só `name`) e não desce nas variantes —
+    /// pela mesma razão que [`Type::Record`] é nominal. O tamanho infinito
+    /// que faria o rustc recusar é resolvido com `Box` na emissão (T77), não
+    /// rejeitado no checker (decisão técnica 6 do PRD.md).
+    Sum {
+        name: String,
+        variants: Vec<(String, Vec<Type>)>,
+    },
     Option {
         base: Box<Type>,
     },
@@ -71,6 +87,10 @@ impl Type {
                 },
             ) => types_equal(p1, p2) && types_equal(r1, r2),
             (Type::Record { name: n1, .. }, Type::Record { name: n2, .. }) => n1 == n2,
+            // Nominal, como `Record` — e aqui é o que **torna a recursão
+            // possível**: comparar as variantes desceria em `Exp` dentro de
+            // `Exp` e não terminaria.
+            (Type::Sum { name: n1, .. }, Type::Sum { name: n2, .. }) => n1 == n2,
             (Type::Option { base: b1 }, Type::Option { base: b2 }) => b1.equals(b2),
             (
                 Type::Opaque {
@@ -96,8 +116,9 @@ impl Type {
     /// 4), covariância seria *unsound* — permitiria escrever uma `string`
     /// através de uma referência `{value}` apontando para um `{integer}`. Ver
     /// ADR 0008. `Record` é nominal (via `equals`) e `Option` é invariante;
-    /// ambos ganham braço explícito para deixar a intenção escrita, em vez de
-    /// cair no `_ => false`.
+    /// `Sum` é nominal e invariante como `Record`; todos ganham
+    /// braço explícito para deixar a intenção escrita, em vez de cair no
+    /// `_ => false`.
     pub fn compatible(&self, other: &Type) -> bool {
         if self.equals(other) {
             return true;
@@ -132,6 +153,11 @@ impl Type {
                     && r1.iter().zip(r2).all(|(a, b)| a.compatible(b))
             }
             (Type::Record { .. }, Type::Record { .. }) => false,
+            // `Sum` é nominal e invariante, como `Record`: dois enums de
+            // nomes diferentes nunca são compatíveis, e dois de mesmo nome já
+            // saíram por `equals` lá em cima. Braço explícito (ADR 0008) para
+            // a intenção ficar escrita, em vez de cair no `_ => false`.
+            (Type::Sum { .. }, Type::Sum { .. }) => false,
             (Type::Option { .. }, Type::Option { .. }) => false,
             (Type::Opaque { .. }, Type::Opaque { .. }) => false,
             _ => false,
@@ -258,6 +284,144 @@ mod tests {
         };
         assert!(p1.compatible(&p2));
         assert!(!p1.compatible(&q));
+    }
+
+    /// Atalho para o `enum Exp` do PRD (T74/T75), com a recursão já fechada:
+    /// os campos `Exp` de `ExpBinop` guardam o próprio tipo soma.
+    fn enum_exp() -> Type {
+        let exp = |variants| Type::Sum {
+            name: "Exp".to_string(),
+            variants,
+        };
+        // A recursão se fecha aqui: o `Exp` de dentro é construído primeiro
+        // (com a lista de variantes que já basta para a identidade nominal) e
+        // vira campo do `ExpBinop` do `Exp` de fora.
+        let interno = exp(vec![
+            ("ExpNil".to_string(), vec![]),
+            ("ExpInteger".to_string(), vec![Type::Integer]),
+        ]);
+        exp(vec![
+            ("ExpNil".to_string(), vec![]),
+            ("ExpInteger".to_string(), vec![Type::Integer]),
+            (
+                "ExpBinop".to_string(),
+                vec![Type::String, interno.clone(), interno],
+            ),
+        ])
+    }
+
+    #[test]
+    fn enums_sao_nominais_em_equals() {
+        let e1 = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![("ExpNil".to_string(), vec![])],
+        };
+        // Mesmo nome, lista de variantes diferente: iguais, porque `equals`
+        // de `Sum` é nominal como o de `Record`.
+        let e2 = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![
+                ("ExpNil".to_string(), vec![]),
+                ("ExpInteger".to_string(), vec![Type::Integer]),
+            ],
+        };
+        let outro = Type::Sum {
+            name: "Stat".to_string(),
+            variants: vec![("ExpNil".to_string(), vec![])],
+        };
+        assert!(e1.equals(&e2));
+        assert!(!e1.equals(&outro));
+    }
+
+    #[test]
+    fn enums_sao_nominais_e_invariantes_em_compatible() {
+        let e1 = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![("ExpNil".to_string(), vec![])],
+        };
+        let e2 = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![("ExpNil".to_string(), vec![])],
+        };
+        let stat = Type::Sum {
+            name: "Stat".to_string(),
+            variants: vec![("ExpNil".to_string(), vec![])],
+        };
+        assert!(e1.compatible(&e2));
+        // Dois enums de nomes diferentes não são compatíveis, nos dois
+        // sentidos — invariância, não só ausência de subtipagem.
+        assert!(!e1.compatible(&stat));
+        assert!(!stat.compatible(&e1));
+    }
+
+    #[test]
+    fn enum_de_mesmo_nome_com_variantes_diferentes_e_compativel() {
+        // Consequência direta da nominalidade: a identidade é o nome. Se
+        // `compatible` comparasse as variantes, um `Exp` recursivo nunca
+        // seria compatível consigo mesmo (a comparação não terminaria).
+        let e1 = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![("ExpNil".to_string(), vec![])],
+        };
+        let e2 = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![("ExpBinop".to_string(), vec![Type::String])],
+        };
+        assert!(e1.compatible(&e2));
+    }
+
+    #[test]
+    fn enum_recursivo_e_representavel() {
+        let exp = enum_exp();
+
+        let Type::Sum { name, variants } = &exp else {
+            panic!("esperava Type::Sum");
+        };
+        assert_eq!(name, "Exp");
+        assert_eq!(variants.len(), 3);
+
+        // Variante sem payload: lista de campos vazia.
+        assert_eq!(variants[0], ("ExpNil".to_string(), vec![]));
+
+        // `ExpBinop(string, Exp, Exp)`: os dois últimos campos são o próprio
+        // `Exp` — a recursão que a decisão técnica 6 do PRD permite.
+        let (nome_binop, campos_binop) = &variants[2];
+        assert_eq!(nome_binop, "ExpBinop");
+        assert_eq!(campos_binop.len(), 3);
+        assert!(campos_binop[0].equals(&Type::String));
+        assert!(campos_binop[1].equals(&exp));
+        assert!(campos_binop[2].equals(&exp));
+
+        // E o tipo recursivo é igual/compatível a si mesmo sem laço infinito.
+        assert!(exp.equals(&exp.clone()));
+        assert!(exp.compatible(&exp.clone()));
+    }
+
+    #[test]
+    fn value_e_compativel_com_enum() {
+        // Gradual typing no topo (critério de aceite do T74): `value` segue
+        // compatível com um `enum`, nos dois sentidos, como com qualquer
+        // outro tipo.
+        let exp = enum_exp();
+        assert!(Type::Value.compatible(&exp));
+        assert!(exp.compatible(&Type::Value));
+    }
+
+    #[test]
+    fn enum_nao_e_compativel_com_record_de_mesmo_nome() {
+        // Nominalidade não atravessa a fronteira entre `Sum` e `Record`: o
+        // nome só identifica dentro da mesma forma de tipo.
+        let sum = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![("ExpNil".to_string(), vec![])],
+        };
+        let record = Type::Record {
+            name: "Exp".to_string(),
+            fields: vec![("x".to_string(), Type::Integer)],
+        };
+        assert!(!sum.equals(&record));
+        assert!(!sum.compatible(&record));
+        assert!(!record.compatible(&sum));
     }
 
     #[test]

@@ -1141,6 +1141,13 @@ impl Checker {
             // Já processado por `collect_records`, que roda antes (T29 —
             // duas sub-passadas: records primeiro, funções depois).
             TopLevel::TopLevelRecord { .. } => {}
+            // `enum` (T74): a AST e o `Type::Sum` já existem, mas a coleta
+            // (`self.enums`), a desambiguação de construção de variante e a
+            // exaustividade do `match` são da T76. Até lá nada chega aqui: o
+            // parser ainda não produz este nó (T75). Braço explícito, e não
+            // um `_`, para que a próxima variante de `TopLevel` volte a dar
+            // erro de compilação em vez de passar em silêncio.
+            TopLevel::TopLevelEnum { .. } => {}
             // `import data` e `import data as d` (T72). O nome que colide,
             // que vira símbolo e que chaveia `self.modules` é sempre o
             // **local** (`localname`); `modname` só serve para achar a
@@ -4584,6 +4591,9 @@ pub fn type_name(ty: &Type) -> String {
         Type::Array { elem } => format!("{{{}}}", type_name(elem)),
         Type::Map { keys, values } => format!("map {{{}: {}}}", type_name(keys), type_name(values)),
         Type::Record { name, .. } => name.clone(),
+        // Nome nu, como `Record` (T74): a mensagem de erro fala do tipo
+        // `Exp`, não da lista de variantes que o usuário já escreveu.
+        Type::Sum { name, .. } => name.clone(),
         Type::Option { base } => format!("{}?", type_name(base)),
         Type::Opaque { module, name, .. } => format!("{}.{}", module, name),
     }
@@ -4716,6 +4726,34 @@ mod tests {
             rust_path: "titan_data::DataFrame".to_string(),
         };
         assert_eq!(type_name(&df), "data.DataFrame");
+    }
+
+    #[test]
+    fn type_name_de_enum_e_o_nome_nu() {
+        // T74: a mensagem de erro fala de `Exp`, não da lista de variantes —
+        // e não desce na recursão, que aqui já está fechada em `ExpBinop`.
+        let exp = Type::Sum {
+            name: "Exp".to_string(),
+            variants: vec![
+                ("ExpNil".to_string(), vec![]),
+                ("ExpInteger".to_string(), vec![Type::Integer]),
+            ],
+        };
+        assert_eq!(type_name(&exp), "Exp");
+
+        // E compostos sobre um `enum` se descrevem normalmente.
+        assert_eq!(
+            type_name(&Type::Array {
+                elem: Box::new(exp.clone())
+            }),
+            "{Exp}"
+        );
+        assert_eq!(
+            type_name(&Type::Option {
+                base: Box::new(exp)
+            }),
+            "Exp?"
+        );
     }
 
     #[test]
