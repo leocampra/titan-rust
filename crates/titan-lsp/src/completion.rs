@@ -164,7 +164,7 @@ fn expression_items(checked: &CheckedProgram, text: &str, position: Position) ->
             }
             items.push(CompletionItem {
                 label: symbol.name.clone(),
-                kind: Some(if symbol.is_module {
+                kind: Some(if symbol.module.is_some() {
                     CompletionItemKind::MODULE
                 } else {
                     CompletionItemKind::VARIABLE
@@ -200,8 +200,11 @@ fn member_items(
         return Vec::new();
     };
 
-    if symbol.is_module {
-        let Some(capability) = capabilities::lookup_module(receiver) else {
+    // O nome escrito antes do `.` pode ser um alias (`d` em `import data as
+    // d`, T72), então a capability resolve contra o nome **real** guardado
+    // em `ScopedSymbol::module`, nunca contra `receiver`.
+    if let Some(module) = &symbol.module {
+        let Some(capability) = capabilities::lookup_module(module) else {
             return Vec::new();
         };
         return module_items(capability);

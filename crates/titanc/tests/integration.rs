@@ -37,9 +37,11 @@
 //!   T30/T31; e o que segue fora de escopo depois de `import`/capabilities
 //!   serem aceitos — capability inexistente, membro inexistente em módulo ou
 //!   em tipo opaco, opaco usado como record, módulo usado como valor ou
-//!   atribuído, `import ... as ...`, `import` como expressão e método com
-//!   dois-pontos — é rejeitado com erro claro, sem pagar o build do Polars
-//!   (`--emit-rust` em todo caso negativo);
+//!   atribuído, alias de `import` colidindo com nome já declarado e
+//!   `import` como expressão — é rejeitado com erro claro, sem pagar o
+//!   build do Polars (`--emit-rust` em todo caso negativo). Desde a T72 o
+//!   alias (`import data as d`) e o método com dois-pontos
+//!   (`df:soma(...)`) são formas **aceitas**, não rejeições;
 //! - a prova ponta a ponta da Fase 3 (PRD.md, T45): compila e executa
 //!   `examples/dados.titan` — único caminho feliz desta suíte que paga o
 //!   build do Polars de propósito — conferindo stdout completo e exit code.
@@ -807,9 +809,13 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// `indexacao_de_array`, `construtor_de_array`, `operador_length` (T30/T31)
 /// e os seis de bitwise/`//` (T61) saíram desta tabela por terem virado
 /// caminho feliz — arrays e operadores têm suporte real no codegen.
-/// `chamada_de_metodo` continua rejeitado, mas por outra camada: com `.` e
-/// `[` lexados e o parser sabendo indexação, a rejeição já não vem do lexer,
-/// e sim do parser não reconhecer `:` como início de chamada de método.
+/// `chamada_de_metodo` continua rejeitado, mas desceu de camada duas vezes:
+/// com `.` e `[` lexados e o parser sabendo indexação, saiu do lexer para o
+/// parser; e na T72, que ensinou o parser a ler `:` como chamada de método,
+/// saiu do parser para o **checker**. O que segue fora de escopo não é a
+/// sintaxe do `:` — é o método sobre um tipo **do usuário**: método só
+/// existe sobre tipo opaco de capability (`df:soma(...)`), nunca sobre
+/// record declarado no programa.
 /// `tipo_option` saiu na T68 (ver o comentário no lugar dele).
 /// `break_fora_de_escopo` saiu desta tabela na T55 (Fase 4): `break` é keyword e vira caso positivo
 /// dentro de laço — os negativos de `break`/`continue` da T55 têm tabela
@@ -823,12 +829,13 @@ fn casos_negativos_de_t4_e_t5_produzem_erro_claro_sem_panic() {
 /// checker.
 const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
     CasoNegativo {
-        nome: "chamada_de_metodo",
-        // Com `.` lexado e sufixos de acesso a campo suportados desde a T23,
-        // a rejeição já não vem do lexer: o parser reconhece `ponto` e para
-        // ao encontrar `:`, que não inicia nem sufixo nem expressão válida.
-        fonte: "function main(args: {string}): integer\n    local p = ponto:dist()\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        nome: "chamada_de_metodo_sobre_record_do_usuario",
+        // Desde a T72 o parser lê `p:dist()` sem reclamar — quem rejeita é o
+        // checker, ao ver que o receptor não tem `Type::Opaque`. Método do
+        // usuário (`record` com `function Ponto:dist()`) segue fora de
+        // escopo; o que existe é método de capability.
+        fonte: "record Ponto\n    x: float\nend\n\nfunction main(args: {string}): integer\n    local p: Ponto = { x = 1.0 }\n    local d: float = p:dist()\n    return 0\nend",
+        trecho_esperado: "só é possível chamar um nome de função diretamente",
     },
     // `repeat_until` saiu desta tabela na T64: virou caso **positivo**, com
     // execução real em `compila_e_executa_repeat_until` — o mesmo movimento
@@ -863,9 +870,13 @@ const CASOS_FORA_DE_ESCOPO_FASE_2: &[CasoNegativo] = &[
         trecho_esperado: "não existe cast de string para integer",
     },
     CasoNegativo {
-        nome: "metodo_com_dois_pontos",
+        // Mesmo movimento de `chamada_de_metodo_sobre_record_do_usuario`: a
+        // T72 fez o parser aceitar `:`, então a rejeição passou a ser do
+        // checker — aqui sobre um composto (`{string}`), que também não tem
+        // métodos.
+        nome: "metodo_com_dois_pontos_sobre_composto",
         fonte: "function main(args: {string}): integer\n    args:foo()\n    return 0\nend",
-        trecho_esperado: "Esperava um comando",
+        trecho_esperado: "só é possível chamar um nome de função diretamente",
     },
     // `multi_assign` saiu desta tabela na T67: `a, b = b, a` é caminho
     // feliz, provado por execução real em
@@ -1071,7 +1082,9 @@ fn usar_tipo_option_sem_testar_produz_erro_claro() {
 /// Fora de escopo da Fase 3 (PRD.md, T44): a Fase 3 ensinou o pipeline a
 /// aceitar `import data` e as duas formas de chamada de capability
 /// (`data.f(...)` e `df.f(...)`) — esta tabela garante que ela não afrouxou
-/// nada além do pretendido. Todos os casos falham no checker ou no parser,
+/// nada além do pretendido. A T72 acrescentou o alias (`import data as d`)
+/// e a chamada com dois-pontos (`df:soma(...)`) ao que é aceito; o que
+/// sobra aqui das duas formas são só as suas malformações. Todos os casos falham no checker ou no parser,
 /// antes de o driver chegar a invocar `cargo build`, então nenhum deles paga
 /// o build do Polars.
 const CASOS_FORA_DE_ESCOPO_FASE_3: &[CasoNegativo] = &[
@@ -1106,11 +1119,6 @@ const CASOS_FORA_DE_ESCOPO_FASE_3: &[CasoNegativo] = &[
         trecho_esperado: "não é possível atribuir ao módulo 'data'",
     },
     CasoNegativo {
-        nome: "import_data_as_d",
-        fonte: "import data as d\n\nfunction main(args: {string}): integer\n    return 0\nend",
-        trecho_esperado: "'import ... as ...' não é suportado",
-    },
-    CasoNegativo {
         nome: "local_m_igual_import_data",
         // `import` é palavra-chave desde a T34 — não é mais um `Name` válido
         // à direita de `=`, então o parser falha ao tentar iniciar uma
@@ -1120,10 +1128,25 @@ const CASOS_FORA_DE_ESCOPO_FASE_3: &[CasoNegativo] = &[
         fonte: "local m = import \"data\"\n\nfunction main(args: {string}): integer\n    return 0\nend",
         trecho_esperado: "Esperava uma expressão",
     },
+    // T72: as duas rejeições que saíram desta tabela (`import data as d` e
+    // `df:soma(...)`) viraram formas aceitas — cobertas pelos positivos em
+    // `checker.rs` e por `alias_e_dois_pontos_compilam_e_rodam` abaixo. O
+    // que permanece rejeitado é o alias que **colide** com um nome já
+    // declarado.
     CasoNegativo {
-        nome: "metodo_com_dois_pontos_em_df",
-        fonte: "import data\n\nfunction main(args: {string}): integer\n    local df: data.DataFrame = data.read_csv(\"v.csv\")\n    local total: float = df:soma(\"valor\")\n    return 0\nend",
-        trecho_esperado: "Esperava um nome ou '(' seguido de expressão",
+        nome: "alias_de_import_colidindo_com_funcao",
+        fonte: "import data as soma\n\nfunction soma(): integer\n    return 0\nend\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "'soma' já foi declarado antes",
+    },
+    CasoNegativo {
+        nome: "import_com_as_sem_nome_local",
+        fonte: "import data as\n\nfunction main(args: {string}): integer\n    return 0\nend",
+        trecho_esperado: "Esperava um nome local após 'as'",
+    },
+    CasoNegativo {
+        nome: "metodo_com_dois_pontos_sem_nome",
+        fonte: "import data\n\nfunction main(args: {string}): integer\n    local df: data.DataFrame = data.read_csv(\"v.csv\")\n    local total: float = df:(\"valor\")\n    return 0\nend",
+        trecho_esperado: "Esperava um nome de método após ':'",
     },
 ];
 
@@ -2327,4 +2350,117 @@ fn nenhum_argumento_produz_uso_sem_panic() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("uso:"));
+}
+
+// ---- T72: `import` com alias e `df:metodo()` ----------------------------
+
+/// Execução real do alias (PRD.md, T72): `import texto as t` seguido de
+/// `t.funcao(...)` compila e roda com o resultado correto. Usa `texto`, e
+/// não `data`, exatamente para provar o alias ponta a ponta sem pagar o
+/// build do Polars — o mecanismo do alias é o mesmo para qualquer
+/// capability (o nome local chaveia a tabela de módulos; o nome real sai de
+/// `Capability::titan_name`).
+#[test]
+fn compila_e_executa_import_com_alias() {
+    let out_dir = temp_dir("import-com-alias");
+
+    let source = concat!(
+        "import texto as t\n\n",
+        "function main(args: {string}): integer\n",
+        "    local n: integer = t.para_inteiro(\"42\")\n",
+        "    print(\"n=\" .. t.de_inteiro(n + 1))\n",
+        "    print(\"sub=\" .. t.sub(\"abcdef\", 2, 4))\n",
+        "    print(\"tam=\" .. t.tamanho(\"abcdef\"))\n",
+        "    return 0\n",
+        "end",
+    );
+    let source_path = write_source(&out_dir, "alias_exec.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar `import texto as t`: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("alias_exec");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .output()
+        .expect("executa ./alias_exec");
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "n=43\nsub=bcd\ntam=6\n"
+    );
+    assert_eq!(run_output.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// O critério central da T72: `df:soma("valor")` produz **o mesmo
+/// resultado** de `df.soma("valor")`. Provado no Rust gerado em vez de por
+/// execução: as duas formas só existem sobre o módulo `data`, e comparar o
+/// `--emit-rust` das duas prova a equivalência sem pagar o build do Polars
+/// (mesmo precedente de `emit_rust_de_import_data_compila_sem_erro`).
+///
+/// O par de testes em `checker.rs`
+/// (`metodo_com_dois_pontos_produz_o_mesmo_typedexp_que_com_ponto`) prova a
+/// mesma igualdade um nível acima, no `TypedExp`.
+#[test]
+fn emit_rust_de_dois_pontos_e_identico_ao_de_ponto() {
+    let out_dir = temp_dir("emit-rust-dois-pontos");
+
+    let com_ponto = concat!(
+        "import data\n\n",
+        "function main(args: {string}): integer\n",
+        "    local df: data.DataFrame = data.read_csv(\"v.csv\")\n",
+        "    local total: float = df.soma(\"valor\")\n",
+        "    return 0\n",
+        "end",
+    );
+    let com_dois_pontos = com_ponto.replace("df.soma", "df:soma");
+
+    let emitir = |nome: &str, fonte: &str| {
+        let source_path = write_source(&out_dir, nome, fonte);
+        let output = Command::new(titanc_bin())
+            .arg("--emit-rust")
+            .arg("--out")
+            .arg(&out_dir)
+            .arg(&source_path)
+            .output()
+            .expect("invoca titanc --emit-rust");
+        assert_never_panics(&output);
+        assert!(
+            output.status.success(),
+            "titanc --emit-rust falhou para {nome}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let rust_ponto = emitir("ponto.titan", com_ponto);
+    let rust_dois_pontos = emitir("dois_pontos.titan", &com_dois_pontos);
+
+    assert_eq!(
+        rust_ponto, rust_dois_pontos,
+        "`df:soma(...)` deve gerar exatamente o mesmo Rust que `df.soma(...)`"
+    );
+    // Sanidade: o Rust gerado é mesmo a chamada do método, não um stub vazio.
+    assert!(
+        rust_ponto.contains("titan_data::"),
+        "Rust gerado: {rust_ponto}"
+    );
+    assert!(
+        !out_dir.join("build").exists(),
+        "--emit-rust não deveria gerar build/"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
 }

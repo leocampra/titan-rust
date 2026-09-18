@@ -80,6 +80,16 @@ array Titan (exercitando a Fase 2 sobre o resultado) e agrega uma coluna
 módulo) e `df.soma("valor")` (método sobre o tipo opaco
 `data.DataFrame`, [ADR 0014](docs/adr/0014-metodo-com-ponto-nao-dois-pontos.md)).
 
+O método também pode ser chamado com dois-pontos, no idioma do Titan
+original: `df:soma("valor")` gera exatamente o mesmo Rust que
+`df.soma("valor")`. `.` é a forma preferida (é a mesma sintaxe do acesso a
+campo e da função de módulo); `:` existe para quem traz código do original.
+
+O `import` aceita alias: `import data as d` traz o módulo sob o nome `d`,
+e a partir daí é `d` que qualifica tudo (`d.DataFrame`, `d.read_csv(...)`).
+Com alias, o nome original sai de escopo — depois de `import data as d`,
+`data.read_csv(...)` é erro de módulo não importado.
+
 > **Custo de build/disco:** este é o único exemplo que invoca o `cargo
 > build --release` sobre uma dependência do Polars — leva **~2 minutos** e
 > deixa **~3GB** em `build/dados/target/` (medido antes da Fase 3 começar).
@@ -358,11 +368,8 @@ Quem precisa mutar enquanto percorre escreve um `for` numérico sobre os
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
-- `foreign import`, `import` com alias (`import data as d`),
-  `local m = import "data"` (a forma do original), módulos definidos pelo
-  usuário (um `.titan` importando outro `.titan`).
-- Chamada de método com dois-pontos (`df:soma()`, forma do original — aqui
-  só `.`).
+- `foreign import`, `local m = import "data"` (a forma do original), módulos
+  definidos pelo usuário (um `.titan` importando outro `.titan`).
 - Tipos soma (`enum`/`match`), parser e checker auto-hospedados (self-hosting
   pleno, fase 5).
 - `titan-crypto`, `titan-ai` (fases 3b/3c).

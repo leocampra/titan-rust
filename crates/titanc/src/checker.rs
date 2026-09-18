@@ -639,13 +639,19 @@ pub struct SymbolUse {
 }
 
 /// Um símbolo em escopo — o que o autocomplete de posição de expressão
-/// oferece (T50): nome, tipo formatado (para o `detail` do item) e se é
-/// módulo (`import data`, sem membro `.` de valor — completado à parte).
+/// oferece (T50): nome, tipo formatado (para o `detail` do item) e, quando
+/// é módulo (`import data`, sem membro `.` de valor — completado à parte),
+/// o **nome real** do módulo.
+///
+/// `module` guarda esse nome real em vez de um simples `is_module: bool`
+/// porque desde a T72 o nome do símbolo pode ser um alias (`d` em `import
+/// data as d`) — e é o nome real que resolve contra
+/// `capabilities::lookup_module`. `None` para tudo que não é módulo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopedSymbol {
     pub name: String,
     pub type_name: String,
-    pub is_module: bool,
+    pub module: Option<String>,
 }
 
 /// Todos os símbolos visíveis num ponto do programa — snapshot tirado ao
@@ -703,9 +709,15 @@ struct Checker {
     /// `resolve_type`.
     records: HashMap<String, Type>,
     /// Módulos importados (`import data`, T38), no molde de `records`:
-    /// nome Titan → entrada da tabela de capabilities (`capabilities.rs`,
-    /// T37), consultada por `resolve_type` (`data.DataFrame`) e por
-    /// `check_call`/`check_var` (T39/T40) para membros do módulo.
+    /// **nome local** → entrada da tabela de capabilities
+    /// (`capabilities.rs`, T37), consultada por `resolve_type`
+    /// (`data.DataFrame`) e por `check_call`/`check_var` (T39/T40) para
+    /// membros do módulo.
+    ///
+    /// A chave é o nome *local* porque é ele que o programa escreve à
+    /// esquerda do `.` — com `import data as d` (T72) a chave é `d`. O nome
+    /// real do módulo, que o codegen precisa para achar o caminho Rust, sai
+    /// de `Capability::titan_name`, nunca desta chave.
     modules: HashMap<String, &'static crate::capabilities::Capability>,
     /// Índice colateral de usos resolvidos, para hover e go-to-definition
     /// (T49) — ver [`SymbolUse`].
@@ -786,7 +798,10 @@ impl Checker {
             .visible_symbols()
             .into_iter()
             .map(|(name, symbol)| ScopedSymbol {
-                is_module: matches!(symbol.kind, SymbolKind::Module { .. }),
+                module: match &symbol.kind {
+                    SymbolKind::Module { name } => Some(name.clone()),
+                    _ => None,
+                },
                 type_name: type_name(&symbol.ty),
                 name,
             })
@@ -1093,18 +1108,27 @@ impl Checker {
             // Já processado por `collect_records`, que roda antes (T29 —
             // duas sub-passadas: records primeiro, funções depois).
             TopLevel::TopLevelRecord { .. } => {}
+            // `import data` e `import data as d` (T72). O nome que colide,
+            // que vira símbolo e que chaveia `self.modules` é sempre o
+            // **local** (`localname`); `modname` só serve para achar a
+            // capability. Sem alias os dois são iguais, e o comportamento
+            // da T38 fica idêntico.
             TopLevel::TopLevelImport {
-                loc, modname, ..
+                loc,
+                localname,
+                modname,
             } => {
-                if self.st.find_symbol(modname).is_some() || self.modules.contains_key(modname) {
-                    self.error(*loc, format!("'{modname}' já foi declarado antes."));
+                if self.st.find_symbol(localname).is_some()
+                    || self.modules.contains_key(localname)
+                {
+                    self.error(*loc, format!("'{localname}' já foi declarado antes."));
                     return;
                 }
                 match crate::capabilities::lookup_module(modname) {
                     Some(capability) => {
-                        self.modules.insert(modname.clone(), capability);
+                        self.modules.insert(localname.clone(), capability);
                         self.st.add_symbol(
-                            modname,
+                            localname,
                             Type::Invalid,
                             SymbolKind::Module {
                                 name: modname.clone(),
@@ -1250,6 +1274,10 @@ impl Checker {
                     None
                 }
             },
+            // `module` aqui é o nome **local** escrito no programa (`d` em
+            // `import data as d`, T72); `Type::Opaque::module` guarda o nome
+            // real do módulo, que é o que o codegen resolve contra
+            // `capabilities::lookup_module`.
             ast::Type::TypeQualName { loc, module, name } => {
                 let Some(capability) = self.modules.get(module) else {
                     self.error(*loc, format!("módulo '{module}' não foi importado."));
@@ -1257,7 +1285,7 @@ impl Checker {
                 };
                 match capability.find_opaque(name) {
                     Some(opaque) => Some(Type::Opaque {
-                        module: module.clone(),
+                        module: capability.titan_name.to_string(),
                         name: name.clone(),
                         rust_path: opaque.rust_path.to_string(),
                     }),
@@ -3715,84 +3743,38 @@ valor precisam de nomes diferentes.",
             // `data.read_csv(...)` (T39): base é o símbolo de um módulo
             // importado — resolve contra a tabela de capabilities em vez da
             // pilha de escopos.
+            //
+            // `local_name` é o que o programa escreveu (`d` em `import data
+            // as d`, T72) e é o que aparece nas mensagens de erro; o
+            // `Callee::Module` carrega o nome real do módulo, que é o que o
+            // codegen resolve contra `capabilities::lookup_module`.
             Var::VarDot { exp, name, .. } if self.dot_base_module(exp).is_some() => {
-                let module = self.dot_base_module(exp).expect("checado acima");
+                let local_name = self.dot_base_module(exp).expect("checado acima");
                 let capability = *self
                     .modules
-                    .get(&module)
+                    .get(&local_name)
                     .expect("dot_base_module só devolve módulo importado");
                 let Some(function) = capability.find_function(name) else {
                     self.error(
                         *loc,
-                        format!("o módulo '{module}' não tem função '{name}'."),
+                        format!("o módulo '{local_name}' não tem função '{name}'."),
                     );
                     return None;
                 };
+                let module = capability.titan_name.to_string();
                 Some((
                     Callee::Module {
                         module: module.clone(),
                         name: name.clone(),
                     },
-                    format!("{module}.{name}"),
+                    format!("{local_name}.{name}"),
                     function.params.to_vec(),
                     vec![requalify_rettype(&function.rettype, &module)],
                 ))
             }
-            // `df.soma(...)` (T40): base é uma expressão cujo *tipo* é
-            // `Opaque` — resolve o método contra a capability do módulo que
-            // originou o opaco (`Type::Opaque::module`, preenchido por
-            // `requalify_rettype` em T39). O receptor conta como uso mutável
-            // pela mesma regra de `checker.rs:2079-2110` (`is_composite`
-            // inclui `Opaque` — ver `is_composite` abaixo).
-            Var::VarDot { exp, name, .. } => {
-                let receiver = self.check_exp(exp, None)?;
-                let Type::Opaque {
-                    module,
-                    name: type_name_,
-                    ..
-                } = &receiver.ty
-                else {
-                    self.error(
-                        *loc,
-                        format!(
-                            "só é possível chamar um nome de função diretamente nesta fase, \
-                             encontrado {}.",
-                            type_name(&receiver.ty)
-                        ),
-                    );
-                    return None;
-                };
-                let capability = crate::capabilities::lookup_module(module)
-                    .expect("Opaque só é construído com módulo de capability existente");
-                let Some(method) = capability.find_method(type_name_, name) else {
-                    self.error(
-                        *loc,
-                        format!("o tipo '{module}.{type_name_}' não tem método '{name}'."),
-                    );
-                    return None;
-                };
-                let module = module.clone();
-                let recv_name = format!("{module}.{type_name_}");
-                if let Exp::ExpVar { var, .. } = exp.as_ref()
-                    && let Some(root_name) = root_var_name(var)
-                    && let Some(Symbol {
-                        kind: SymbolKind::Local { decl_id },
-                        ..
-                    }) = self.st.find_symbol(&root_name)
-                {
-                    self.assigned.insert(*decl_id);
-                }
-                Some((
-                    Callee::Method {
-                        recv: Box::new(receiver),
-                        module: module.clone(),
-                        name: name.clone(),
-                    },
-                    format!("{recv_name}.{name}"),
-                    method.params.to_vec(),
-                    vec![requalify_rettype(&method.rettype, &module)],
-                ))
-            }
+            // `df.soma(...)` (T40) — delegado a `resolve_method_callee`,
+            // que a forma com dois-pontos (`df:soma(...)`, T72) também usa.
+            Var::VarDot { exp, name, .. } => self.resolve_method_callee(loc, exp, name),
             _ => {
                 self.error(
                     *loc,
@@ -3801,6 +3783,71 @@ valor precisam de nomes diferentes.",
                 None
             }
         }
+    }
+
+    /// Resolve a chamada de método sobre um receptor de tipo `Opaque` — o
+    /// ponto em que `df.soma(...)` (T40) e `df:soma(...)` (T72) se
+    /// encontram. As duas formas diferem só em **onde o parser guarda o
+    /// nome do método** (`Var::VarDot` versus `Args::ArgsMethod`); daqui
+    /// para baixo são a mesma coisa, e produzem o mesmo `Callee::Method`.
+    ///
+    /// O método é resolvido contra a capability do módulo que originou o
+    /// opaco (`Type::Opaque::module`, preenchido por `requalify_rettype` em
+    /// T39). O receptor conta como uso mutável pela mesma regra de
+    /// `check_assign` (`is_composite` inclui `Opaque`).
+    fn resolve_method_callee(
+        &mut self,
+        loc: &Loc,
+        recv_exp: &Exp,
+        name: &str,
+    ) -> Option<(Callee, String, Vec<Type>, Vec<Type>)> {
+        let receiver = self.check_exp(recv_exp, None)?;
+        let Type::Opaque {
+            module,
+            name: type_name_,
+            ..
+        } = &receiver.ty
+        else {
+            self.error(
+                *loc,
+                format!(
+                    "só é possível chamar um nome de função diretamente nesta fase, \
+                     encontrado {}.",
+                    type_name(&receiver.ty)
+                ),
+            );
+            return None;
+        };
+        let capability = crate::capabilities::lookup_module(module)
+            .expect("Opaque só é construído com módulo de capability existente");
+        let Some(method) = capability.find_method(type_name_, name) else {
+            self.error(
+                *loc,
+                format!("o tipo '{module}.{type_name_}' não tem método '{name}'."),
+            );
+            return None;
+        };
+        let module = module.clone();
+        let recv_name = format!("{module}.{type_name_}");
+        if let Exp::ExpVar { var, .. } = recv_exp
+            && let Some(root_name) = root_var_name(var)
+            && let Some(Symbol {
+                kind: SymbolKind::Local { decl_id },
+                ..
+            }) = self.st.find_symbol(&root_name)
+        {
+            self.assigned.insert(*decl_id);
+        }
+        Some((
+            Callee::Method {
+                recv: Box::new(receiver),
+                module: module.clone(),
+                name: name.to_string(),
+            },
+            format!("{recv_name}.{name}"),
+            method.params.to_vec(),
+            vec![requalify_rettype(&method.rettype, &module)],
+        ))
     }
 
     /// Se `exp` é `ExpVar(VarName(nome))` e `nome` está registrado como
@@ -3835,12 +3882,26 @@ valor precisam de nomes diferentes.",
         callee: &Exp,
         args: &Args,
     ) -> Option<(TypedExp, Vec<Type>)> {
-        let Args::ArgsFunc { args: arg_exps, .. } = args else {
-            self.error(*loc, "chamada de método não é suportada nesta fase.");
-            return None;
+        // As duas formas de chamada (T72). `ArgsFunc` é `f(x)`,
+        // `data.f(x)` e `df.f(x)` — quem é chamado está todo em `callee`.
+        // `ArgsMethod` é `df:f(x)`: o receptor é o `callee` e o nome do
+        // método vem nos argumentos, então a resolução vai direto ao braço
+        // de método, sem passar por `resolve_callee`.
+        let (callee, name, params, rettypes, arg_exps) = match args {
+            Args::ArgsFunc { args: arg_exps, .. } => {
+                let (callee, name, params, rettypes) = self.resolve_callee(loc, callee)?;
+                (callee, name, params, rettypes, arg_exps)
+            }
+            Args::ArgsMethod {
+                method,
+                args: arg_exps,
+                ..
+            } => {
+                let (callee, name, params, rettypes) =
+                    self.resolve_method_callee(loc, callee, method)?;
+                (callee, name, params, rettypes, arg_exps)
+            }
         };
-
-        let (callee, name, params, rettypes) = self.resolve_callee(loc, callee)?;
 
         let mut typed_args = Vec::with_capacity(arg_exps.len());
         let mut ok = true;
@@ -4393,7 +4454,10 @@ fn run(program: &Program) -> (Checker, TypedProgram) {
             .visible_symbols()
             .into_iter()
             .map(|(name, symbol)| ScopedSymbol {
-                is_module: matches!(symbol.kind, SymbolKind::Module { .. }),
+                module: match &symbol.kind {
+                    SymbolKind::Module { name } => Some(name.clone()),
+                    _ => None,
+                },
                 type_name: type_name(&symbol.ty),
                 name,
             })
@@ -4967,6 +5031,221 @@ function main(args: {string}): integer
 end"#;
         let errs = check_source(source).unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("incompatível")));
+    }
+
+    // ---- T72: `import` com alias e `df:metodo()` --------------------------
+
+    /// O alias entra na symtab e resolve tipo qualificado e chamada de
+    /// módulo pelo nome local — mas o `Type::Opaque` e o `Callee::Module`
+    /// carregam o nome **real** do módulo, que é o que o codegen resolve.
+    #[test]
+    fn import_com_alias_resolve_tipo_e_chamada_pelo_nome_local() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: d.DataFrame = d.read_csv("v.csv")
+    return 0
+end"#;
+        let typed = check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava TypedTopLevel::Func, obteve {:?}", typed[0]);
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava TypedStat::Block, obteve {body:?}");
+        };
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava TypedStat::Decl, obteve {:?}", stats[0]);
+        };
+        assert_eq!(
+            value.ty,
+            Type::Opaque {
+                module: "data".to_string(),
+                name: "DataFrame".to_string(),
+                rust_path: "titan_data::DataFrame".to_string(),
+            }
+        );
+        assert!(matches!(
+            &value.kind,
+            TypedExpKind::Call {
+                callee: Callee::Module { module, name },
+                ..
+            } if module == "data" && name == "read_csv"
+        ));
+    }
+
+    /// Com alias, o nome do módulo **real** deixa de estar em escopo — quem
+    /// escreveu `as d` escolheu `d`.
+    #[test]
+    fn import_com_alias_nao_deixa_o_nome_do_modulo_em_escopo() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("módulo 'data' não foi importado"))
+        );
+    }
+
+    /// Mensagem de erro de membro inexistente cita o nome **local**, que é
+    /// o que o programa escreveu.
+    #[test]
+    fn funcao_inexistente_sob_alias_cita_o_nome_local() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: d.DataFrame = d.foo("v.csv")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("o módulo 'd' não tem função 'foo'")),
+            "obteve: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn alias_colidindo_com_nome_ja_declarado_produz_erro_claro() {
+        let source = r#"import data as soma
+
+function soma(): integer
+    return 0
+end
+
+function main(args: {string}): integer
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'soma' já foi declarado antes")),
+            "obteve: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dois_aliases_para_o_mesmo_modulo_convivem() {
+        let source = r#"import data as a
+import data as b
+
+function main(args: {string}): integer
+    local df: a.DataFrame = b.read_csv("v.csv")
+    return 0
+end"#;
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+    }
+
+    /// O critério central da T72: `df:soma(...)` produz **o mesmo**
+    /// `TypedExp` que `df.soma(...)` — mesmo `Callee::Method`, mesmo tipo.
+    #[test]
+    fn metodo_com_dois_pontos_produz_o_mesmo_typedexp_que_com_ponto() {
+        let com_ponto = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df.soma("valor")
+    return 0
+end"#;
+        let com_dois_pontos = com_ponto.replace("df.soma", "df:soma");
+
+        let typed_ponto = check_source(com_ponto).expect("forma com ponto deve tipar");
+        let typed_dois = check_source(&com_dois_pontos).expect("forma com dois-pontos deve tipar");
+
+        let valor = |typed: &[TypedTopLevel]| {
+            let TypedTopLevel::Func { body, .. } = &typed[0] else {
+                panic!("esperava TypedTopLevel::Func");
+            };
+            let TypedStat::Block { stats, .. } = body.as_ref() else {
+                panic!("esperava TypedStat::Block");
+            };
+            let TypedStat::Decl { value, .. } = &stats[1] else {
+                panic!("esperava TypedStat::Decl");
+            };
+            value.clone()
+        };
+
+        let (ponto, dois) = (valor(&typed_ponto), valor(&typed_dois));
+        // `loc` difere de propósito — as duas formas escrevem a chamada em
+        // colunas diferentes (`(` versus `:`), e é isso que o LSP deve
+        // apontar em cada uma. O que a T72 exige idêntico é o resto: mesmo
+        // tipo e mesmo `Callee::Method` com o mesmo receptor e argumentos.
+        assert_eq!(ponto.ty, dois.ty);
+        assert_eq!(ponto.kind, dois.kind);
+    }
+
+    #[test]
+    fn metodo_com_dois_pontos_sobre_nao_opaco_produz_erro_claro() {
+        let source = r#"function main(args: {string}): integer
+    local x: integer = 1
+    local y: integer = x:soma(2)
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("só é possível chamar um nome de função")),
+            "obteve: {:?}",
+            errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn metodo_inexistente_com_dois_pontos_produz_o_mesmo_erro_que_com_ponto() {
+        let source = r#"import data
+
+function main(args: {string}): integer
+    local df: data.DataFrame = data.read_csv("v.csv")
+    local total: float = df:foo("valor")
+    return 0
+end"#;
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'data.DataFrame' não tem método 'foo'"))
+        );
+    }
+
+    /// As duas formas convivem inclusive sob alias.
+    #[test]
+    fn dois_pontos_funciona_sob_alias() {
+        let source = r#"import data as d
+
+function main(args: {string}): integer
+    local df: d.DataFrame = d.read_csv("v.csv")
+    local total: float = df:soma("valor")
+    return 0
+end"#;
+        check_source(source).unwrap_or_else(|errs| {
+            panic!(
+                "esperava sucesso, obteve erros: {}",
+                errs.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
     }
 
     #[test]
