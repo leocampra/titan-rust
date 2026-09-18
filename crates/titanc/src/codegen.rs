@@ -45,8 +45,8 @@
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
 
 use crate::checker::{
-    BinOp, Callee, TypedExp, TypedExpKind, TypedLValue, TypedMultiValues, TypedProgram, TypedStat,
-    TypedThen, TypedTopLevel, UnOp,
+    BinOp, Callee, CastKind, TypedExp, TypedExpKind, TypedLValue, TypedMultiValues, TypedProgram,
+    TypedStat, TypedThen, TypedTopLevel, UnOp,
 };
 use crate::types::Type;
 use std::collections::HashSet;
@@ -370,7 +370,9 @@ fn collect_referenced_names_exp(exp: &TypedExp, names: &mut std::collections::Ha
         TypedExpKind::Adjust(inner)
         | TypedExpKind::Extra { exp: inner, .. }
         // `SomeOf` (T68) é um invólucro: quem é lido é o valor dentro dele.
-        | TypedExpKind::SomeOf(inner) => collect_referenced_names_exp(inner, names),
+        | TypedExpKind::SomeOf(inner)
+        // `Cast` (T70), idem: o `as` não lê nome nenhum por conta própria.
+        | TypedExpKind::Cast { exp: inner, .. } => collect_referenced_names_exp(inner, names),
         TypedExpKind::Nil
         | TypedExpKind::Bool(_)
         | TypedExpKind::Integer(_)
@@ -1036,6 +1038,10 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::SomeOf(inner) => {
             format!("Some({})", emit_slot_value(&inner.ty, inner, ctx))
         }
+        // Cast `as` (T70).
+        TypedExpKind::Cast { kind, exp: inner } => {
+            format!("({})", emit_cast(*kind, inner, &exp.ty, ctx))
+        }
     }
 }
 
@@ -1050,6 +1056,10 @@ fn emit_delimited_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::Binop { op: BinOp::Pow, .. } => emit_exp(exp, ctx),
         TypedExpKind::Binop { op, lhs, rhs } => emit_binop(*op, lhs, rhs, &exp.ty, ctx),
         TypedExpKind::Unop { op, exp: operand } => emit_unop(*op, operand, ctx),
+        // `x as float` (T70) vira `x as f64`, que em posição já delimitada
+        // dispensa os parênteses externos — o `unused_parens` do rustc
+        // reclamaria deles.
+        TypedExpKind::Cast { kind, exp: inner } => emit_cast(*kind, inner, &exp.ty, ctx),
         _ => emit_exp(exp, ctx),
     }
 }
@@ -1460,6 +1470,188 @@ fn emit_unop(op: UnOp, operand: &TypedExp, ctx: Ctx) -> String {
     }
 }
 
+/// Cast `as` (T70). Quatro formas, uma por [`CastKind`]:
+///
+/// - **numérica** → o `as` do próprio Rust (`as f64` / `as i64`). É a única
+///   que não passa pelo runtime: são instruções de conversão, não lógica.
+///   `float as integer` **trunca** em direção a zero, que é a semântica do
+///   `as` do Rust e a que o README documenta como diferente do `//` da T61.
+/// - **subida a `value`** → constrói o `titan_runtime::Value` da variante
+///   correspondente ao tipo de origem, recursivamente para compostos.
+/// - **descida de `value`** → chama o extrator do runtime, que aborta com
+///   mensagem em português quando a variante guardada não é a pedida.
+fn emit_cast(kind: CastKind, inner: &TypedExp, target: &Type, ctx: Ctx) -> String {
+    match kind {
+        CastKind::IntToFloat => format!("{} as f64", emit_exp(inner, ctx)),
+        CastKind::FloatToInt => format!("{} as i64", emit_exp(inner, ctx)),
+        CastKind::ToValue => emit_to_value(&inner.ty, inner, ctx),
+        CastKind::FromValue => emit_from_value(target, inner, ctx),
+    }
+}
+
+/// Empacota uma expressão de tipo `origem` num `titan_runtime::Value`.
+///
+/// Compostos são convertidos **elemento a elemento** em tempo de execução,
+/// porque um `Vec<i64>` e um `Vec<Value>` são tipos Rust distintos — não há
+/// reinterpretação possível, e o ADR 0006 já diz que a conversão copia. O
+/// `map` vira `Vec<(Value, Value)>` ordenado pela iteração do `HashMap`, que
+/// é não especificada; isso não é observável, porque a comparação de
+/// `Value::Map` do runtime é feita como conjunto.
+fn emit_to_value(origem: &Type, exp: &TypedExp, ctx: Ctx) -> String {
+    let val = |s: String| format!("titan_runtime::Value::{s}");
+    match origem {
+        Type::Nil => val("Nil".to_string()),
+        Type::Boolean => val(format!("Boolean({})", emit_delimited_exp(exp, ctx))),
+        Type::Integer => val(format!("Integer({})", emit_delimited_exp(exp, ctx))),
+        Type::Float => val(format!("Float({})", emit_delimited_exp(exp, ctx))),
+        Type::String => val(format!("String({})", emit_owned_string(exp, ctx))),
+        // `.iter()` já empresta sozinho: o receptor sai por [`emit_exp`] cru,
+        // sem o `&` de [`borrow_composite`], que aqui viraria `(&v).iter()`
+        // — legal, mas ruído — ou, pior, um `&` a mais sobre um parâmetro
+        // que já é `&mut T`.
+        Type::Array { elem } => val(format!(
+            "Array({}.iter().map(|titan_e| {}).collect())",
+            emit_exp(exp, ctx),
+            emit_to_value_of_var(elem, "titan_e")
+        )),
+        Type::Map { keys, values } => val(format!(
+            "Map({}.iter().map(|(titan_k, titan_v)| ({}, {})).collect())",
+            emit_exp(exp, ctx),
+            emit_to_value_of_var(keys, "titan_k"),
+            emit_to_value_of_var(values, "titan_v")
+        )),
+        Type::Record { name, fields } => {
+            let campos = fields
+                .iter()
+                .map(|(fname, fty)| {
+                    format!(
+                        "(\"{fname}\".to_string(), {})",
+                        emit_to_value_of_field(fty, &format!("titan_r.{fname}"))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{{ let titan_r = {}; {} }}",
+                borrow_composite(exp, ctx),
+                val(format!(
+                    "Record {{ nome: \"{name}\".to_string(), campos: vec![{campos}] }}"
+                ))
+            )
+        }
+        // `T?` preenchido vira `Option(Box<..>)`; vazio vira `Nil`, para
+        // `value` continuar com um único "ausente".
+        Type::Option { base } => format!(
+            "match {} {{ Some(titan_o) => {}, None => {} }}",
+            borrow_composite(exp, ctx),
+            val(format!(
+                "Option(Box::new({}))",
+                emit_to_value_of_var(base, "titan_o")
+            )),
+            val("Nil".to_string())
+        ),
+        // `Value as value` é identidade e `check_cast` já o devolveu sem
+        // construir nó nenhum; `Function`/`Opaque`/`Invalid` não chegam aqui
+        // porque o checker não os aceita como operando de `as`.
+        outro => unreachable!(
+            "tipo '{outro:?}' não deveria chegar a `emit_to_value` — checker deveria ter rejeitado antes"
+        ),
+    }
+}
+
+/// Como [`emit_to_value`], mas para um valor que já está numa **variável**
+/// Rust (o ligado por um `map`/`match` do código emitido acima), e sempre por
+/// referência. Recursivo: composto dentro de composto desce por aqui.
+///
+/// Existe separado porque [`emit_to_value`] trabalha sobre um `TypedExp` — há
+/// expressão Titan por trás —, e aqui só há um nome Rust que o próprio
+/// backend inventou.
+fn emit_to_value_of_var(ty: &Type, var: &str) -> String {
+    let val = |s: String| format!("titan_runtime::Value::{s}");
+    match ty {
+        Type::Nil => val("Nil".to_string()),
+        Type::Boolean => val(format!("Boolean(*{var})")),
+        Type::Integer => val(format!("Integer(*{var})")),
+        Type::Float => val(format!("Float(*{var})")),
+        Type::String => val(format!("String({var}.clone())")),
+        Type::Array { elem } => val(format!(
+            "Array({var}.iter().map(|titan_e2| {}).collect())",
+            emit_to_value_of_var(elem, "titan_e2")
+        )),
+        Type::Map { keys, values } => val(format!(
+            "Map({var}.iter().map(|(titan_k2, titan_v2)| ({}, {})).collect())",
+            emit_to_value_of_var(keys, "titan_k2"),
+            emit_to_value_of_var(values, "titan_v2")
+        )),
+        Type::Record { name, fields } => {
+            let campos = fields
+                .iter()
+                .map(|(fname, fty)| {
+                    format!(
+                        "(\"{fname}\".to_string(), {})",
+                        emit_to_value_of_field(fty, &format!("{var}.{fname}"))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            val(format!(
+                "Record {{ nome: \"{name}\".to_string(), campos: vec![{campos}] }}"
+            ))
+        }
+        Type::Option { base } => format!(
+            "match {var} {{ Some(titan_o2) => {}, None => {} }}",
+            val(format!(
+                "Option(Box::new({}))",
+                emit_to_value_of_var(base, "titan_o2")
+            )),
+            val("Nil".to_string())
+        ),
+        Type::Value => format!("{var}.clone()"),
+        outro => unreachable!(
+            "tipo '{outro:?}' não deveria chegar a `emit_to_value_of_var` — checker deveria ter rejeitado antes"
+        ),
+    }
+}
+
+/// Como [`emit_to_value_of_var`], mas para um **campo** (`titan_r.x`) em vez
+/// de um nome ligado por `map`/`match`.
+///
+/// A diferença é um `*`: o binding de um `.iter()` é uma referência, e ler o
+/// primitivo de dentro dele exige deref; um campo alcançado através de
+/// `&Ponto` já é o valor, por auto-deref do Rust, e o `*` ali seria erro de
+/// tipo. O resto das variantes é idêntico, então elas delegam.
+fn emit_to_value_of_field(ty: &Type, place: &str) -> String {
+    let val = |s: String| format!("titan_runtime::Value::{s}");
+    match ty {
+        Type::Boolean => val(format!("Boolean({place})")),
+        Type::Integer => val(format!("Integer({place})")),
+        Type::Float => val(format!("Float({place})")),
+        // Composto/opcional/`string`/`nil` não usam `*` em `_of_var` — o
+        // caminho é o mesmo, e o `&` que `.iter()`/`match` pedem sai de lá.
+        outro => emit_to_value_of_var(outro, place),
+    }
+}
+
+/// Desempacota um `value` para `alvo`, abortando em tempo de execução se a
+/// variante guardada não corresponder.
+///
+/// Só primitivas descem: `value as {integer}` seria uma conversão
+/// elemento a elemento com falha no meio — metade do array já convertido
+/// quando o erro aparece —, e o checker a recusa antes de chegar aqui, o que
+/// mantém a descida com um ponto de falha só.
+fn emit_from_value(alvo: &Type, exp: &TypedExp, ctx: Ctx) -> String {
+    let func = match alvo {
+        Type::Boolean => "value_to_boolean",
+        Type::Integer => "value_to_integer",
+        Type::Float => "value_to_float",
+        Type::String => "value_to_string",
+        outro => unreachable!(
+            "tipo '{outro:?}' não deveria chegar a `emit_from_value` — checker deveria ter rejeitado antes"
+        ),
+    };
+    format!("titan_runtime::{func}(&{})", emit_exp(exp, ctx))
+}
+
 /// Literais float sempre carregam `.0` (ou expoente) para nascer como `f64`
 /// mesmo quando o valor é matematicamente inteiro (`1.0`, não `1`).
 fn format_float_literal(v: f64) -> String {
@@ -1712,6 +1904,10 @@ fn rust_type_name(ty: &Type) -> String {
         // composto dentro de opcional sai `Option<Vec<i64>>` e segue o ADR
         // 0006/0007 como qualquer outro composto.
         Type::Option { base } => format!("Option<{}>", rust_type_name(base)),
+        // `value` (T70) → o enum boxado do runtime. A T25 rejeitava o tipo no
+        // checker justamente porque este braço não existia e o
+        // `unreachable!` abaixo viraria panic.
+        Type::Value => "titan_runtime::Value".to_string(),
         // Tipo opaco de capability (T42): o caminho Rust totalmente
         // qualificado que o checker já resolveu via `requalify_rettype`
         // (`titan_data::DataFrame`), nunca o `name` Titan cru.
@@ -3448,5 +3644,193 @@ end"#;
             "achou-2\nnao-achou\nstr-oi\nacc-6\n"
         );
         assert_eq!(output.status.code(), Some(0));
+    }
+
+    // ---- T70: cast `as` --------------------------------------------------
+
+    /// O critério de aceite da T70, por **execução real**: `1 as float` é
+    /// 1.0, `3.9 as integer` é 3 e `-3.9 as integer` é -3 — truncagem em
+    /// direção a zero, não piso. O `//` da T61 daria -4 para o mesmo número,
+    /// e é justamente essa diferença que o README documenta.
+    #[test]
+    fn t70_cast_numerico_executa_e_trunca_em_direcao_a_zero() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local a: float = 1 as float\n\
+             \x20   local b: integer = 3.9 as integer\n\
+             \x20   local c: integer = -3.9 as integer\n\
+             \x20   local d: integer = -3 // 2\n\
+             \x20   print(\"a-\" .. a)\n\
+             \x20   print(\"b-\" .. b)\n\
+             \x20   print(\"c-\" .. c)\n\
+             \x20   print(\"d-\" .. d)\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t70_numerico");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        // `c` trunca (-3) enquanto `d`, que é o `//`, faz piso (-2 seria
+        // truncagem; -2 é o piso de -1.5). Os dois lado a lado provam que as
+        // duas operações não são a mesma.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "a-1\nb-3\nc--3\nd--2\n"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// Subida e descida de `value` com primitivas, ponta a ponta.
+    #[test]
+    fn t70_value_sobe_e_desce_com_primitivas() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local i: value = 42 as value\n\
+             \x20   local s: value = \"oi\" as value\n\
+             \x20   local f: value = 2.5 as value\n\
+             \x20   local b: value = true as value\n\
+             \x20   print(\"i-\" .. (i as integer))\n\
+             \x20   print(\"s-\" .. (s as string))\n\
+             \x20   print(\"f-\" .. (f as float))\n\
+             \x20   if (b as boolean) then\n\
+             \x20       print(\"b-sim\")\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t70_value_primitivas");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "i-42\ns-oi\nf-2.5\nb-sim\n"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// Composto e record sobem para `value` copiando elemento a elemento — e
+    /// o original continua utilizável depois (ADR 0006: converter copia).
+    #[test]
+    fn t70_composto_e_record_sobem_para_value() {
+        let rust = generate_source(
+            "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   y: integer\n\
+             end\n\
+             function usa(v: value): integer\n\
+             \x20   return 1\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local a: {integer} = {1, 2, 3}\n\
+             \x20   local m: {string: integer} = {[\"a\"] = 1}\n\
+             \x20   local p: Ponto = {x = 1, y = 2}\n\
+             \x20   local n: integer = usa(a as value) + usa(m as value) + usa(p as value)\n\
+             \x20   print(\"n-\" .. n)\n\
+             \x20   print(\"a-\" .. a[1])\n\
+             \x20   print(\"p-\" .. p.x)\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t70_value_composto");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "n-3\na-1\np-1\n");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// Descer para o tipo errado aborta em português, com código 1 e **sem**
+    /// `panic!` cru do Rust vazando para o usuário.
+    #[test]
+    fn t70_descida_de_value_errada_aborta_em_portugues() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local s: value = \"oi\" as value\n\
+             \x20   print(\"n-\" .. (s as integer))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (_, output) = compila_e_executa(&rust, "t70_value_descida_errada");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`value` não guarda um integer: guarda um string"),
+            "stderr inesperado: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "vazou panic do Rust: {stderr}");
+        assert_eq!(output.status.code(), Some(1));
+    }
+
+    /// `value` atravessa parâmetro e retorno, e o cast encadeia sem
+    /// parênteses.
+    #[test]
+    fn t70_value_atravessa_funcao_e_cast_encadeia() {
+        let rust = generate_source(
+            "function embrulha(n: integer): value\n\
+             \x20   return n as value\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local r: integer = embrulha(9) as integer\n\
+             \x20   local e: value = 3 as float as value\n\
+             \x20   print(\"r-\" .. r)\n\
+             \x20   print(\"e-\" .. (e as float))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t70_value_funcao");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "r-9\ne-3\n");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// `T?` sobe para `value` nos dois estados: preenchido vira
+    /// `Value::Option`, vazio vira `Value::Nil` — `value` tem um "ausente" só.
+    #[test]
+    fn t70_opcional_sobe_para_value_nos_dois_estados() {
+        let rust = generate_source(
+            "function usa(v: value): integer\n\
+             \x20   return 1\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local cheio: integer? = 7\n\
+             \x20   local vazio: integer? = nil\n\
+             \x20   local n: integer = usa(cheio as value) + usa(vazio as value)\n\
+             \x20   print(\"n-\" .. n)\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t70_value_opcional");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "n-2\n");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// O cast de identidade não emite conversão nenhuma — nem `as i64`, nem
+    /// chamada de runtime.
+    #[test]
+    fn t70_cast_de_identidade_nao_emite_conversao() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local x: integer = 5 as integer\n\
+             \x20   return x\n\
+             end",
+        );
+        assert!(rust.contains("let x: i64 = 5;"), "{rust}");
     }
 }

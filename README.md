@@ -259,6 +259,43 @@ compostos) + Fase 3 (capability runtimes) + Fase 4 (self-hosting / LSP):
 - `examples/lexer.titan`: lexer do Titan escrito em Titan, sobre `texto` e
   `io` — prova de self-hosting parcial
   ([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)).
+- Tipos opcionais (`T?`), com estreitamento por `if x ~= nil then`.
+- Cast de tipo (`exp as T`) e o tipo `value` — veja a seção abaixo.
+
+### Cast `as` e o tipo `value`
+
+`exp as T` converte entre números e de/para `value`. **Cast não é parsing**:
+`"3" as integer` é erro de compilação, não a leitura do número dentro da
+string.
+
+```lua
+local a: float = 1 as float        -- 1.0
+local b: integer = 3.9 as integer  -- 3
+local c: integer = -3.9 as integer -- -3
+```
+
+> **`as integer` trunca, `//` faz piso.** `-3.9 as integer` é **-3** (corta a
+> parte fracionária, indo em direção a zero), enquanto `-7 // 2` é **-4**
+> (arredonda para menos infinito, como no Lua). São duas operações
+> diferentes, e a diferença só aparece com número negativo — é a pegadinha
+> que vale ler duas vezes.
+
+`value` é o topo do gradual typing: **qualquer** tipo sobe para ele, e a
+subida **copia** (um `{integer}` convertido para `value` não fica aliasado ao
+array de origem, seguindo o
+[ADR 0006](docs/adr/0006-semantica-de-valor-clone-na-atribuicao.md)).
+
+```lua
+local v: value = 42 as value
+local n: integer = v as integer    -- 42
+```
+
+A descida é checada **em tempo de execução** e só vai a tipo primitivo
+(`boolean`, `integer`, `float`, `string`): se o `value` guardar outro tipo, o
+programa aborta com mensagem em português e código 1, nunca com um panic do
+Rust. Ela também **não converte nem formata** — um `integer` guardado não
+desce como `float` nem como `"42"`; para isso, escreva os dois passos
+(`v as integer as float`), e aí a conversão fica visível no fonte.
 
 ## O que não está implementado ainda
 
@@ -272,7 +309,6 @@ Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
   usuário (um `.titan` importando outro `.titan`).
 - Chamada de método com dois-pontos (`df:soma()`, forma do original — aqui
   só `.`).
-- `Option`/`?` e cast de tipo (`as`).
 - Tipos soma (`enum`/`match`), parser e checker auto-hospedados (self-hosting
   pleno, fase 5).
 - `titan-crypto`, `titan-ai` (fases 3b/3c).

@@ -296,6 +296,198 @@ where
     }
 }
 
+// ---- `value`: o tipo dinâmico do gradual typing (T70) -------------------
+
+/// O tipo `value` do Titan — o topo do gradual typing, para onde **qualquer**
+/// tipo pode ser convertido com `as` (PRD.md, T70).
+///
+/// É um `enum` boxado, e não um ponteiro cru ou um `Box<dyn Any>`, por três
+/// razões que se sustentam juntas:
+///
+/// - **`PartialEq` estrutural sai de graça** — `value` precisa comparar
+///   valores, não endereços, e `dyn Any` não dá isso sem downcast manual
+///   variante a variante.
+/// - **A conversão de volta erra com mensagem em português.** Um downcast de
+///   `Any` falha com `None` e sem contexto; aqui a variante errada vira texto
+///   que diz qual tipo estava guardado.
+/// - **O conjunto de tipos é fechado.** Titan não tem tipos abertos em tempo
+///   de execução, então enumerar as variantes é fiel à linguagem e ainda
+///   deixa o `match` do runtime exaustivo.
+///
+/// Os compostos entram **por valor** (`Vec<Value>`, `HashMap<..>`,
+/// `Box<Value>`), homogeneizados para `Value` em vez de genéricos sobre `T`:
+/// um `{integer}` e um `{string}` precisam caber no mesmo `value`, e um
+/// `Value` genérico não seria um tipo só. Isso é coerente com o ADR 0006 —
+/// converter para `value` **copia** o composto, não o aliasa.
+///
+/// `Record` guarda o nome do tipo ao lado dos campos porque o `equals` de
+/// records é nominal (`types.rs`), então dois records de campos iguais e
+/// nomes diferentes não podem sair iguais aqui.
+#[derive(Clone, Debug)]
+pub enum Value {
+    Nil,
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Array(Vec<Value>),
+    Map(Vec<(Value, Value)>),
+    Record {
+        nome: String,
+        campos: Vec<(String, Value)>,
+    },
+    /// `T?` já preenchido. O `nil` de um opcional vazio é [`Value::Nil`], e
+    /// não `Option(None)`: `value` já tem um "ausente" só, e ter dois
+    /// faria `nil as value` diferir de `(nil as integer?) as value`.
+    Option(Box<Value>),
+}
+
+/// Igualdade **estrutural**, com um cuidado que o `derive` não teria:
+/// `Value::Map` guarda os pares num `Vec` e a ordem em que eles saíram do
+/// `HashMap` de origem é não especificada, então dois maps iguais podem ter
+/// vetores em ordens diferentes. A comparação é feita como **conjunto de
+/// pares** — mesmo tamanho e cada par do primeiro presente no segundo.
+///
+/// É quadrática, e de propósito: a chave é um `Value`, que não é `Hash` (um
+/// `f64` dentro impediria), e maps convertidos para `value` são pequenos por
+/// natureza — comparar dois deles não é caminho quente.
+///
+/// `Record` compara **nominalmente** primeiro (o `nome`), fiel ao `equals` de
+/// records do checker: dois records de campos idênticos e nomes diferentes
+/// não são iguais.
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => {
+                a.len() == b.len() && a.iter().all(|par| b.contains(par))
+            }
+            (
+                Value::Record {
+                    nome: n1,
+                    campos: c1,
+                },
+                Value::Record {
+                    nome: n2,
+                    campos: c2,
+                },
+            ) => n1 == n2 && c1 == c2,
+            (Value::Option(a), Value::Option(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Nome Titan do tipo guardado — o mesmo texto que `checker::type_name`
+/// usa, para a mensagem de erro falar a língua do programa e não a do Rust.
+pub fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Nil => "nil",
+        Value::Boolean(_) => "boolean",
+        Value::Integer(_) => "integer",
+        Value::Float(_) => "float",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Map(_) => "map",
+        Value::Record { .. } => "record",
+        Value::Option(_) => "opcional",
+    }
+}
+
+/// Erro padrão de descida de `value`: diz o tipo pedido e o guardado, em
+/// português, como toda falha de execução do Titan.
+fn erro_de_value(esperado: &str, v: &Value) -> String {
+    format!(
+        "`value` não guarda um {esperado}: guarda um {}",
+        value_type_name(v)
+    )
+}
+
+/// `v as boolean` sobre um `value`. Base checada de [`value_to_boolean`].
+pub fn value_to_boolean_checked(v: &Value) -> Result<bool, String> {
+    match v {
+        Value::Boolean(b) => Ok(*b),
+        outro => Err(erro_de_value("boolean", outro)),
+    }
+}
+
+/// `v as boolean`. Aborta com mensagem em português se o `value` guardar
+/// outro tipo.
+pub fn value_to_boolean(v: &Value) -> bool {
+    match value_to_boolean_checked(v) {
+        Ok(b) => b,
+        Err(msg) => abortar(&msg),
+    }
+}
+
+/// `v as integer` sobre um `value`. Base checada de [`value_to_integer`].
+///
+/// **Não** aceita um `Value::Float` guardado: `value` preserva o tipo que
+/// entrou, e converter float→integer aqui em silêncio esconderia a truncagem
+/// atrás de um cast que o programador escreveu como se fosse seguro. Quem
+/// quer os dois passos escreve os dois: `v as float as integer`.
+pub fn value_to_integer_checked(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Integer(i) => Ok(*i),
+        outro => Err(erro_de_value("integer", outro)),
+    }
+}
+
+/// `v as integer`. Aborta com mensagem em português se o `value` guardar
+/// outro tipo.
+pub fn value_to_integer(v: &Value) -> i64 {
+    match value_to_integer_checked(v) {
+        Ok(i) => i,
+        Err(msg) => abortar(&msg),
+    }
+}
+
+/// `v as float` sobre um `value`. Base checada de [`value_to_float`].
+///
+/// Simétrico a [`value_to_integer_checked`]: um `Value::Integer` guardado
+/// **não** vira float sozinho.
+pub fn value_to_float_checked(v: &Value) -> Result<f64, String> {
+    match v {
+        Value::Float(f) => Ok(*f),
+        outro => Err(erro_de_value("float", outro)),
+    }
+}
+
+/// `v as float`. Aborta com mensagem em português se o `value` guardar outro
+/// tipo.
+pub fn value_to_float(v: &Value) -> f64 {
+    match value_to_float_checked(v) {
+        Ok(f) => f,
+        Err(msg) => abortar(&msg),
+    }
+}
+
+/// `v as string` sobre um `value`. Base checada de [`value_to_string`].
+///
+/// **Não** formata o valor guardado: `value` não é `tostring`. Um
+/// `Value::Integer` aqui é erro, não `"42"` — converter em silêncio faria o
+/// cast mentir sobre o que aconteceu (ADR 0010: `string` é sempre `string`).
+pub fn value_to_string_checked(v: &Value) -> Result<String, String> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        outro => Err(erro_de_value("string", outro)),
+    }
+}
+
+/// `v as string`. Aborta com mensagem em português se o `value` guardar outro
+/// tipo.
+pub fn value_to_string(v: &Value) -> String {
+    match value_to_string_checked(v) {
+        Ok(s) => s,
+        Err(msg) => abortar(&msg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +814,115 @@ mod tests {
         assert_eq!(
             idiv_checked(1, 0),
             Err("divisão inteira por zero".to_string())
+        );
+    }
+
+    // --- `value` (T70) ----------------------------------------------------
+
+    #[test]
+    fn value_desce_para_a_variante_guardada() {
+        assert_eq!(value_to_integer_checked(&Value::Integer(42)), Ok(42));
+        assert_eq!(value_to_float_checked(&Value::Float(2.5)), Ok(2.5));
+        assert_eq!(value_to_boolean_checked(&Value::Boolean(true)), Ok(true));
+        assert_eq!(
+            value_to_string_checked(&Value::String("oi".to_string())),
+            Ok("oi".to_string())
+        );
+    }
+
+    /// A mensagem nomeia os dois tipos em português — é o que o programa
+    /// imprime antes de abortar, e sem ela o usuário só saberia que "deu
+    /// errado".
+    #[test]
+    fn value_de_variante_errada_erra_em_portugues() {
+        assert_eq!(
+            value_to_integer_checked(&Value::String("oi".to_string())),
+            Err("`value` não guarda um integer: guarda um string".to_string())
+        );
+        assert_eq!(
+            value_to_string_checked(&Value::Nil),
+            Err("`value` não guarda um string: guarda um nil".to_string())
+        );
+    }
+
+    /// Descer não converte: um `integer` guardado **não** sai como float, nem
+    /// vice-versa. Quem quer a conversão escreve os dois passos, e aí a
+    /// truncagem fica visível no fonte.
+    #[test]
+    fn value_nao_converte_numero_na_descida() {
+        assert!(value_to_float_checked(&Value::Integer(3)).is_err());
+        assert!(value_to_integer_checked(&Value::Float(3.0)).is_err());
+    }
+
+    /// `value` não é `tostring`: um número guardado não vira texto sozinho
+    /// (ADR 0010).
+    #[test]
+    fn value_nao_formata_numero_como_string() {
+        assert_eq!(
+            value_to_string_checked(&Value::Integer(42)),
+            Err("`value` não guarda um string: guarda um integer".to_string())
+        );
+    }
+
+    /// A ordem do `Vec` de pares de um `Value::Map` vem da iteração de um
+    /// `HashMap`, que é não especificada — comparar como lista daria falsos
+    /// negativos dependentes do acaso.
+    #[test]
+    fn value_map_compara_como_conjunto_ignorando_a_ordem() {
+        let a = Value::Map(vec![
+            (Value::String("a".to_string()), Value::Integer(1)),
+            (Value::String("b".to_string()), Value::Integer(2)),
+        ]);
+        let b = Value::Map(vec![
+            (Value::String("b".to_string()), Value::Integer(2)),
+            (Value::String("a".to_string()), Value::Integer(1)),
+        ]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn value_map_de_tamanhos_diferentes_nao_e_igual() {
+        let a = Value::Map(vec![(Value::String("a".to_string()), Value::Integer(1))]);
+        let b = Value::Map(vec![
+            (Value::String("a".to_string()), Value::Integer(1)),
+            (Value::String("b".to_string()), Value::Integer(2)),
+        ]);
+        assert_ne!(a, b);
+    }
+
+    /// Record é **nominal**, como o `equals` do checker: mesmos campos com
+    /// nome de tipo diferente não são o mesmo valor.
+    #[test]
+    fn value_record_compara_pelo_nome_do_tipo() {
+        let campos = vec![("x".to_string(), Value::Integer(1))];
+        let p = Value::Record {
+            nome: "Ponto".to_string(),
+            campos: campos.clone(),
+        };
+        let q = Value::Record {
+            nome: "Outro".to_string(),
+            campos,
+        };
+        assert_ne!(p, q);
+    }
+
+    /// Array continua **ordenado** — diferente do map, a ordem é parte do
+    /// valor.
+    #[test]
+    fn value_array_respeita_a_ordem() {
+        assert_ne!(
+            Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+            Value::Array(vec![Value::Integer(2), Value::Integer(1)])
+        );
+    }
+
+    #[test]
+    fn value_type_name_cobre_as_variantes() {
+        assert_eq!(value_type_name(&Value::Nil), "nil");
+        assert_eq!(value_type_name(&Value::Integer(1)), "integer");
+        assert_eq!(
+            value_type_name(&Value::Option(Box::new(Value::Integer(1)))),
+            "opcional"
         );
     }
 }

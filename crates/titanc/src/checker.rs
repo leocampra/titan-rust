@@ -486,6 +486,37 @@ pub enum TypedExpKind {
     /// por aqui: continua `TypedExpKind::Nil`, só que com `ty` opcional, e
     /// vira `None`.
     SomeOf(Box<TypedExp>),
+    /// Cast `as` (T70). O `ty` do `TypedExp` que envolve este nó já é o tipo
+    /// **de destino**; `exp` carrega o de origem, que o codegen ainda precisa
+    /// para saber o que empacotar ao subir para `value`.
+    ///
+    /// O cast de identidade não chega aqui: `check_cast` devolve o operando
+    /// intacto, então o backend nunca emite conversão à toa.
+    Cast {
+        kind: CastKind,
+        exp: Box<TypedExp>,
+    },
+}
+
+/// Qual das conversões de [`TypedExpKind::Cast`] o backend deve emitir (T70).
+///
+/// Enum, e não um par de tipos que o codegen reinspecionaria: a decisão já foi
+/// tomada em `check_cast`, com os tipos em mãos, e reduzi-la a quatro casos
+/// deixa o `match` da emissão exaustivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastKind {
+    /// `integer as float` — sempre exato para as magnitudes que um `i64`
+    /// representa em `f64` sem perda, e arredondado para o `f64` mais próximo
+    /// acima disso, que é o comportamento do `as` do Rust.
+    IntToFloat,
+    /// `float as integer` — **trunca** em direção a zero (`3.9` → `3`,
+    /// `-3.9` → `-3`), não arredonda para baixo como o `//` da T61.
+    FloatToInt,
+    /// `x as value` — empacota no `titan_runtime::Value` correspondente.
+    ToValue,
+    /// `v as T` com `v: value` — desempacota, abortando em tempo de execução
+    /// se o `value` guardar outro tipo.
+    FromValue,
 }
 
 /// Operador binário já resolvido (T13). Enum, não `String`, para o `match`
@@ -1100,14 +1131,12 @@ impl Checker {
             ast::Type::TypeInteger { .. } => Some(Type::Integer),
             ast::Type::TypeFloat { .. } => Some(Type::Float),
             ast::Type::TypeString { .. } => Some(Type::String),
-            // T22 fez `value` chegar ao parser/checker, mas o codegen não
-            // sabe emiti-lo (cairia no `unreachable!` de
-            // `rust_type_name:625`, que é panic e violaria a convenção).
-            // Rejeitado explicitamente até uma fase futura dar suporte.
-            ast::Type::TypeValue { loc } => {
-                self.error(*loc, "tipo `value` não é suportado nesta fase.");
-                None
-            }
+            // `value`, o topo do gradual typing (T70). A T25 o rejeitava
+            // aqui porque o codegen não sabia emiti-lo; desde a T70 ele tem
+            // representação de verdade (`titan_runtime::Value`, um enum
+            // boxado), então `rust_type_name` o emite como qualquer outro
+            // tipo e a rejeição deixa de existir.
+            ast::Type::TypeValue { .. } => Some(Type::Value),
             ast::Type::TypeArray { subtype, .. } => {
                 let elem = self.resolve_type(subtype)?;
                 Some(Type::Array {
@@ -2522,10 +2551,7 @@ impl Checker {
             Exp::ExpInitList { loc, fields } => self.check_init_list(*loc, fields, context),
             Exp::ExpUnop { loc, op, exp } => self.check_unop(*loc, op, exp),
             Exp::ExpBinop { loc, lhs, op, rhs } => self.check_binop(*loc, op, lhs, rhs),
-            Exp::ExpCast { loc, .. } => {
-                self.error(*loc, "cast de tipo (`as`) não é suportado nesta fase.");
-                None
-            }
+            Exp::ExpCast { loc, exp, target } => self.check_cast(*loc, exp, target),
             // `ExpAdjust`/`ExpExtra` (T65): nós de ajuste de retorno
             // múltiplo. O parser não os produz a partir do fonte — quem
             // monta o `Adjust` é o próprio `check_exp` no braço de
@@ -3052,6 +3078,88 @@ impl Checker {
             }
         }
         ok
+    }
+
+    /// Regras de tipo do cast `as` (T70).
+    ///
+    /// **Cast não é parsing.** Só três famílias de conversão passam:
+    ///
+    /// - `integer ↔ float` — numérica, a única que muda a representação de um
+    ///   primitivo. `3.9 as integer` **trunca** para `3` (e `-3.9` para `-3`),
+    ///   porque é o `as` do Rust por baixo; isso difere do `//` da T61, que
+    ///   arredonda para baixo e daria `-4`. A divergência é deliberada e está
+    ///   documentada no README.
+    /// - **qualquer tipo → `value`** — a subida ao topo do gradual typing,
+    ///   sempre permitida.
+    /// - **`value` → qualquer tipo** — a descida, checada em tempo de
+    ///   execução: se o `value` não guardar aquele tipo, o programa aborta com
+    ///   mensagem em português, como toda falha de runtime do Titan.
+    ///
+    /// Tudo o mais é erro de compilação com mensagem que diz o que o `as`
+    /// **não** faz: `"a" as integer` não parseia a string, e quem quer isso
+    /// está pedindo outra operação, não um cast.
+    ///
+    /// O cast para o próprio tipo (`x as integer` com `x: integer`) é aceito e
+    /// vira identidade — recusá-lo só criaria atrito em código genérico sem
+    /// proteger nada.
+    fn check_cast(&mut self, loc: Loc, exp: &Exp, target: &ast::Type) -> Option<TypedExp> {
+        // O alvo é resolvido **antes** do operando para que `x as {inexistente}`
+        // reclame do tipo, que é o erro mais próximo do que o programador
+        // escreveu.
+        let target_ty = self.resolve_type(target)?;
+        let typed = self.check_exp(exp, Some(&target_ty))?;
+        let origem = typed.ty.clone();
+
+        let kind = match (&origem, &target_ty) {
+            // Identidade: o operando já é do tipo pedido.
+            (o, t) if o.equals(t) => return Some(typed),
+            // Numérica, nos dois sentidos.
+            (Type::Integer, Type::Float) => CastKind::IntToFloat,
+            (Type::Float, Type::Integer) => CastKind::FloatToInt,
+            // Subida ao topo do gradual typing.
+            (_, Type::Value) => CastKind::ToValue,
+            // Descida do topo, checada em tempo de execução. Só primitiva:
+            // `v as {integer}` teria de converter elemento a elemento e
+            // poderia falhar no meio, com metade do array já construído —
+            // um ponto de falha por cast é o contrato mais simples de
+            // explicar, e quem precisa do composto desce campo a campo.
+            (Type::Value, Type::Boolean | Type::Integer | Type::Float | Type::String) => {
+                CastKind::FromValue
+            }
+            (Type::Value, alvo) => {
+                self.error(
+                    loc,
+                    format!(
+                        "`value` só desce para tipo primitivo (`boolean`, `integer`, \
+                         `float`, `string`), não para {}.",
+                        type_name(alvo)
+                    ),
+                );
+                return None;
+            }
+            _ => {
+                self.error(
+                    loc,
+                    format!(
+                        "não existe cast de {} para {}: `as` converte entre números \
+                         (`integer`/`float`) e de/para `value`, não interpreta texto \
+                         nem reinterpreta compostos.",
+                        type_name(&origem),
+                        type_name(&target_ty)
+                    ),
+                );
+                return None;
+            }
+        };
+
+        Some(TypedExp {
+            loc,
+            ty: target_ty,
+            kind: TypedExpKind::Cast {
+                kind,
+                exp: Box::new(typed),
+            },
+        })
     }
 
     /// Regras de tipo dos operadores unários (T13/T29): `-` numérico preserva
@@ -7037,5 +7145,159 @@ end"#;
                 .any(|s| s.name == "x" && s.type_name == "integer")),
             "nenhum escopo reportou `x: integer`"
         );
+    }
+
+    // ---- T70: cast `as` --------------------------------------------------
+
+    /// Extrai o `TypedExp` do `local x = ...` do corpo.
+    fn t70_valor_do_decl(source: &str) -> TypedExp {
+        let stats = typed_body_stats(source);
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava Decl, obteve {:?}", stats[0]);
+        };
+        value.clone()
+    }
+
+    #[test]
+    fn t70_cast_numerico_tipa_nos_dois_sentidos() {
+        let v = t70_valor_do_decl(&em_main("    local x: float = 1 as float"));
+        assert!(v.ty.equals(&Type::Float));
+        assert!(matches!(
+            v.kind,
+            TypedExpKind::Cast {
+                kind: CastKind::IntToFloat,
+                ..
+            }
+        ));
+
+        let v = t70_valor_do_decl(&em_main("    local x: integer = 3.9 as integer"));
+        assert!(v.ty.equals(&Type::Integer));
+        assert!(matches!(
+            v.kind,
+            TypedExpKind::Cast {
+                kind: CastKind::FloatToInt,
+                ..
+            }
+        ));
+    }
+
+    /// Qualquer tipo sobe para `value` — inclusive composto e record.
+    #[test]
+    fn t70_qualquer_tipo_sobe_para_value() {
+        for corpo in [
+            "    local x: value = 1 as value",
+            "    local x: value = \"a\" as value",
+            "    local x: value = true as value",
+            "    local x: value = nil as value",
+        ] {
+            let v = t70_valor_do_decl(&em_main(corpo));
+            assert!(v.ty.equals(&Type::Value), "{corpo}");
+            assert!(
+                matches!(
+                    v.kind,
+                    TypedExpKind::Cast {
+                        kind: CastKind::ToValue,
+                        ..
+                    }
+                ),
+                "{corpo}"
+            );
+        }
+    }
+
+    #[test]
+    fn t70_value_desce_para_primitiva() {
+        let stats = typed_body_stats(&em_main(
+            "    local v: value = 1 as value\n\
+             \x20   local x: integer = v as integer",
+        ));
+        let TypedStat::Decl { value, .. } = &stats[1] else {
+            panic!("esperava Decl, obteve {:?}", stats[1]);
+        };
+        assert!(value.ty.equals(&Type::Integer));
+        assert!(matches!(
+            value.kind,
+            TypedExpKind::Cast {
+                kind: CastKind::FromValue,
+                ..
+            }
+        ));
+    }
+
+    /// O critério de aceite da T70: `"a" as integer` é erro claro — cast não
+    /// é parsing.
+    #[test]
+    fn t70_cast_de_string_para_integer_e_erro_claro() {
+        let errs = check_source(&em_main("    local x: integer = \"a\" as integer")).unwrap_err();
+        let msg = errs[0].to_string();
+        assert!(msg.contains("não existe cast de string para integer"), "{msg}");
+        assert!(msg.contains("não interpreta texto"), "{msg}");
+    }
+
+    /// Cast entre compostos não existe: nem por elemento, nem por
+    /// reinterpretação.
+    #[test]
+    fn t70_cast_entre_compostos_e_erro() {
+        let errs = check_source(&em_main(
+            "    local a: {integer} = {1}\n\
+             \x20   local b: {float} = a as {float}",
+        ))
+        .unwrap_err();
+        assert!(
+            errs[0].to_string().contains("não existe cast"),
+            "{}",
+            errs[0]
+        );
+    }
+
+    /// A descida de `value` só vai a primitiva: para composto, a conversão
+    /// falharia no meio do caminho.
+    #[test]
+    fn t70_value_nao_desce_para_composto() {
+        let errs = check_source(&em_main(
+            "    local v: value = 1 as value\n\
+             \x20   local a: {integer} = v as {integer}",
+        ))
+        .unwrap_err();
+        assert!(
+            errs[0].to_string().contains("só desce para tipo primitivo"),
+            "{}",
+            errs[0]
+        );
+    }
+
+    /// Cast para o próprio tipo é identidade: passa, e sem nó de conversão.
+    #[test]
+    fn t70_cast_de_identidade_nao_gera_no() {
+        let v = t70_valor_do_decl(&em_main("    local x: integer = 5 as integer"));
+        assert!(v.ty.equals(&Type::Integer));
+        assert!(
+            matches!(v.kind, TypedExpKind::Integer(5)),
+            "esperava o literal intacto, obteve {:?}",
+            v.kind
+        );
+    }
+
+    /// `value` deixou de ser rejeitado como anotação (a T25 o recusava porque
+    /// o codegen não sabia emiti-lo).
+    #[test]
+    fn t70_value_e_tipo_valido_em_anotacao_parametro_e_retorno() {
+        check_source(
+            "function f(v: value): value\n\
+             \x20   return v\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   return 0\n\
+             end",
+        )
+        .expect("`value` deveria ser tipo válido em parâmetro e retorno");
+    }
+
+    /// `value?` continua sem sentido — `value` já aceita `nil` (regra que a
+    /// T68 escreveu e a T70 não afrouxa).
+    #[test]
+    fn t70_value_opcional_continua_recusado() {
+        let errs = check_source(&em_main("    local x: value? = nil")).unwrap_err();
+        assert!(errs[0].to_string().contains("`value?` não faz sentido"), "{}", errs[0]);
     }
 }

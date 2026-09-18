@@ -703,7 +703,8 @@ impl<'a> Parser<'a> {
     // add_exp    : mul_exp ((+ -) mul_exp)*                    — assoc. esquerda
     // mul_exp    : unary_exp ((* / // %) unary_exp)*           — assoc. esquerda
     // unary_exp  : (not | - | # | ~)* pow_exp
-    // pow_exp    : simple_exp (^ unary_exp)?                   — assoc. direita
+    // pow_exp    : cast_exp (^ unary_exp)?                     — assoc. direita
+    // cast_exp   : simple_exp (as tipo)*                       — assoc. esquerda
     // ```
     //
     // O `~` é ambíguo por natureza: binário é XOR (nível `bxor_exp`),
@@ -878,7 +879,7 @@ impl<'a> Parser<'a> {
     /// `simple (^ unary)?` — associativo à direita (`2 ^ 3 ^ 2` = `2 ^ (3 ^ 2)`).
     /// O expoente volta ao nível unário para aceitar `2 ^ -3`.
     fn parse_pow_exp(&mut self) -> Result<Exp, ParseError> {
-        let base = self.parse_simple_exp()?;
+        let base = self.parse_cast_exp()?;
         if !self.check(&TokenKind::Caret) {
             return Ok(base);
         }
@@ -891,6 +892,36 @@ impl<'a> Parser<'a> {
             op: "^".to_string(),
             rhs: Box::new(expoente),
         })
+    }
+
+    /// `simple (as tipo)*` — o cast do Titan (T70), mais forte que todos os
+    /// operadores e mais fraco que os sufixos de `parse_suffixed_exp`.
+    ///
+    /// O lugar na cascata decide três leituras, todas iguais às do original:
+    ///
+    /// - `-x as float` é `-(x as float)`: o unário fica **acima**, então o
+    ///   cast morde primeiro. Para inteiro isso dá no mesmo, mas para
+    ///   `i64::MIN` a ordem é observável.
+    /// - `a + b as float` é `a + (b as float)`, não `(a + b) as float` —
+    ///   binário nenhum chega a competir com `as`.
+    /// - `f() as integer` converte o **retorno** da chamada: o `(` é sufixo
+    ///   de `parse_suffixed_exp`, que já rodou por dentro de `simple`.
+    ///
+    /// O laço (`*`, não `?`) aceita `x as float as value` sem parênteses;
+    /// cada `as` embrulha o anterior, então a associatividade é à esquerda.
+    fn parse_cast_exp(&mut self) -> Result<Exp, ParseError> {
+        let mut exp = self.parse_simple_exp()?;
+        while self.check(&TokenKind::KwAs) {
+            let loc = self.loc();
+            self.advance();
+            let target = self.parse_type()?;
+            exp = Exp::ExpCast {
+                loc,
+                exp: Box::new(exp),
+                target,
+            };
+        }
+        Ok(exp)
     }
 
     fn parse_simple_exp(&mut self) -> Result<Exp, ParseError> {
@@ -2700,5 +2731,87 @@ end"#;
         };
         assert!(matches!(params[0].r#type, Some(Type::TypeOption { .. })));
         assert!(matches!(rettypes[0], Type::TypeOption { .. }));
+    }
+
+    // ---- T70: cast `as` --------------------------------------------------
+
+    #[test]
+    fn parse_cast_simples() {
+        let exp = parse_exp_source("1 as float").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpCast { exp, target, .. } = exp else {
+            panic!("esperava ExpCast, obteve {exp:?}");
+        };
+        assert!(matches!(*exp, Exp::ExpInteger { value: 1, .. }));
+        assert!(matches!(target, Type::TypeFloat { .. }));
+    }
+
+    /// O cast é mais forte que qualquer binário: `a + b as float` converte
+    /// só o `b`.
+    #[test]
+    fn parse_cast_morde_antes_do_binario() {
+        let exp =
+            parse_exp_source("a + b as float").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpBinop { op, rhs, .. } = exp else {
+            panic!("esperava ExpBinop, obteve {exp:?}");
+        };
+        assert_eq!(op, "+");
+        assert!(matches!(*rhs, Exp::ExpCast { .. }));
+    }
+
+    /// E mais forte que o unário: `-x as float` é `-(x as float)`.
+    #[test]
+    fn parse_cast_fica_abaixo_do_unario() {
+        let exp =
+            parse_exp_source("-x as float").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpUnop { op, exp, .. } = exp else {
+            panic!("esperava ExpUnop, obteve {exp:?}");
+        };
+        assert_eq!(op, "-");
+        assert!(matches!(*exp, Exp::ExpCast { .. }));
+    }
+
+    /// Mas mais fraco que os sufixos: `f() as integer` converte o retorno da
+    /// chamada, não chama o resultado do cast.
+    #[test]
+    fn parse_cast_recebe_a_chamada_ja_sufixada() {
+        let exp =
+            parse_exp_source("f() as integer").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpCast { exp, .. } = exp else {
+            panic!("esperava ExpCast, obteve {exp:?}");
+        };
+        assert!(matches!(*exp, Exp::ExpCall { .. }));
+    }
+
+    /// `x as float as value` encadeia sem parênteses, associando à esquerda.
+    #[test]
+    fn parse_cast_encadeia_associando_a_esquerda() {
+        let exp = parse_exp_source("x as float as value")
+            .unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpCast { exp, target, .. } = exp else {
+            panic!("esperava ExpCast, obteve {exp:?}");
+        };
+        assert!(matches!(target, Type::TypeValue { .. }));
+        let Exp::ExpCast { target: dentro, .. } = *exp else {
+            panic!("esperava ExpCast aninhado");
+        };
+        assert!(matches!(dentro, Type::TypeFloat { .. }));
+    }
+
+    /// O alvo é um tipo completo, não só uma primitiva: `as {integer}` e
+    /// `as integer?` parseiam pelo mesmo `parse_type` de sempre.
+    #[test]
+    fn parse_cast_aceita_tipo_composto_como_alvo() {
+        let exp =
+            parse_exp_source("x as {integer}").unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let Exp::ExpCast { target, .. } = exp else {
+            panic!("esperava ExpCast, obteve {exp:?}");
+        };
+        assert!(matches!(target, Type::TypeArray { .. }));
+    }
+
+    #[test]
+    fn parse_cast_sem_tipo_erra() {
+        let err = parse_exp_source("x as").unwrap_err();
+        assert!(!err.message.is_empty());
     }
 }
