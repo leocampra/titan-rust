@@ -109,10 +109,19 @@ pub enum TopLevel {
         localname: String,
         modname: String,
     },
-    TopLevelForeignImport {
+    /// `foreign function abs(n: integer): integer` (T73) — a porta de FFI.
+    ///
+    /// Diverge do `foreign import stdio "stdio.h"` do Titan original, que
+    /// nomeava um **header C** e deixava as assinaturas implícitas: aqui a
+    /// assinatura é escrita em Titan, uma função por declaração, e nenhum
+    /// header é lido (ADR 0025). Não tem corpo — por isso nem `block` nem
+    /// `end`, e por isso `islocal` não faz sentido: o símbolo externo é do
+    /// linker, não do arquivo.
+    TopLevelForeignFunc {
         loc: Loc,
-        localname: String,
-        headername: String,
+        name: String,
+        params: Vec<Decl>,
+        rettypes: Vec<Type>,
     },
 }
 

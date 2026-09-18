@@ -488,6 +488,60 @@ pub fn value_to_string(v: &Value) -> String {
     }
 }
 
+// ---- Fronteira de FFI (T73) --------------------------------------------
+//
+// `foreign function` (ADR 0025) deixa passar escalares e `string`. Escalares
+// atravessam sem conversão nenhuma (`i64`/`f64`/`bool` já são o que a ABI C
+// espera); `string` é a única que precisa de trabalho, porque o Titan usa
+// `String` (UTF-8, tamanho conhecido) e o C usa `char*` (terminado em zero).
+// As duas direções dessa conversão moram aqui, e não inline no Rust gerado,
+// pelo mesmo motivo de `array_get`: o caso de erro tem de sair em português,
+// e não como um `panic!` cru ou uma leitura de memória inválida.
+
+/// `string` do Titan → `CString`, para passar como argumento de uma
+/// `foreign function`.
+///
+/// O valor devolvido é o **dono** dos bytes: o Rust gerado o mantém vivo numa
+/// ligação `let` durante toda a chamada, e só então passa `.as_ptr()`. Ligar
+/// o ponteiro a um temporário seria um dangling pointer clássico.
+///
+/// Uma `string` Titan com byte zero no meio não tem representação em C —
+/// o `char*` terminaria cedo, e a função externa leria menos do que o
+/// programa escreveu. Abortar é a única saída honesta.
+pub fn ffi_cstring(s: &str) -> std::ffi::CString {
+    match std::ffi::CString::new(s) {
+        Ok(c) => c,
+        Err(_) => abortar(
+            "erro: string com byte zero no meio não pode ser passada a uma `foreign function` \
+             (em C a string termina no primeiro zero).",
+        ),
+    }
+}
+
+/// `char*` devolvido por uma `foreign function` → `string` do Titan.
+///
+/// Bytes que não formam UTF-8 válido viram `U+FFFD` (`to_string_lossy`), no
+/// mesmo espírito do ADR 0010: uma `string` Titan é sempre uma `string`
+/// válida, nunca bytes crus que estouram mais adiante.
+///
+/// # Safety
+///
+/// `p` precisa ser nulo ou apontar para uma sequência de bytes terminada em
+/// zero, válida durante esta chamada. É a garantia que o programador assume
+/// ao escrever `foreign function` — o compilador não pode verificá-la, e é
+/// exatamente por isso que a declaração é explícita.
+pub unsafe fn ffi_string(p: *const std::os::raw::c_char) -> String {
+    if p.is_null() {
+        abortar(
+            "erro: `foreign function` devolveu um ponteiro nulo onde o programa esperava \
+             uma string.",
+        );
+    }
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,5 +978,40 @@ mod tests {
             value_type_name(&Value::Option(Box::new(Value::Integer(1)))),
             "opcional"
         );
+    }
+
+    // ---- T73: fronteira de FFI -------------------------------------------
+
+    #[test]
+    fn ffi_cstring_termina_em_zero() {
+        let c = ffi_cstring("titan");
+        assert_eq!(c.as_bytes(), b"titan");
+        assert_eq!(c.as_bytes_with_nul(), b"titan\0");
+    }
+
+    /// A ida e a volta compõem: o que `ffi_cstring` produz, `ffi_string`
+    /// devolve igual.
+    #[test]
+    fn ffi_string_le_de_volta_o_que_ffi_cstring_escreveu() {
+        let c = ffi_cstring("olá, mundo");
+        let de_volta = unsafe { ffi_string(c.as_ptr()) };
+        assert_eq!(de_volta, "olá, mundo");
+    }
+
+    #[test]
+    fn ffi_cstring_aceita_string_vazia() {
+        let c = ffi_cstring("");
+        assert_eq!(c.as_bytes_with_nul(), b"\0");
+        assert_eq!(unsafe { ffi_string(c.as_ptr()) }, "");
+    }
+
+    /// Bytes que não formam UTF-8 válido viram `U+FFFD` em vez de escapar
+    /// como bytes crus (ADR 0010).
+    #[test]
+    fn ffi_string_troca_byte_invalido_por_replacement() {
+        // `0xFF` nunca é UTF-8 válido; o `\0` final é o terminador do C.
+        let bytes: &[u8] = &[b'a', 0xFF, b'b', 0];
+        let s = unsafe { ffi_string(bytes.as_ptr() as *const std::os::raw::c_char) };
+        assert_eq!(s, "a\u{FFFD}b");
     }
 }

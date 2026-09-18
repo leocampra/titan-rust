@@ -21,6 +21,11 @@
 //! | `{K: V}` | `HashMap<K, V>` (`&mut HashMap<K, V>` em posição de parâmetro) |
 //! | `record Nome` | `struct Nome` (`&mut Nome` em posição de parâmetro) |
 //!
+//! A **fronteira de FFI** (T73, ADR 0025) tem uma tabela própria
+//! ([`c_abi_type_name`]), que difere desta em exatamente um ponto: `string`
+//! vira `*const c_char`, o `char*` do C, e não `String` — a conversão nos
+//! dois sentidos fica no runtime (`ffi_cstring`/`ffi_string`).
+//!
 //! Seis operadores **não** mapeiam para o símbolo de grafia igual no Rust
 //! (PRD.md, T61) — o cruzamento entre `~` e `^` é a armadilha principal:
 //!
@@ -95,6 +100,23 @@ pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
         }
     }
 
+    // `foreign function` (T73) → um bloco `unsafe extern "C"` por
+    // declaração. Um bloco por função, em vez de um só com todas: a ordem
+    // do fonte Titan é preservada, cada declaração fica ao lado do que a
+    // originou, e o `extern` nunca vira uma lista distante do resto.
+    for top in program {
+        if let TypedTopLevel::ForeignFunc {
+            name,
+            params,
+            rettypes,
+            ..
+        } = top
+        {
+            emit_foreign_extern(&mut out, name, params, rettypes);
+            out.push('\n');
+        }
+    }
+
     for top in program {
         if matches!(top, TypedTopLevel::Func { .. }) {
             emit_toplevel(&mut out, top);
@@ -125,6 +147,78 @@ fn emit_record_struct(out: &mut String, name: &str, fields: &[(String, Type)]) {
         out.push_str(",\n");
     }
     out.push_str("}\n");
+}
+
+/// `foreign function abs(n: integer): integer` (T73) → o bloco `extern "C"`
+/// que declara o símbolo para o linker.
+///
+/// Os nomes dos parâmetros entram na declaração só por legibilidade do Rust
+/// gerado (o `extern` não os usa); o que importa é a lista de tipos, que sai
+/// por [`c_abi_type_name`] — e **não** por [`rust_type_name`], porque a
+/// fronteira C não conhece `String`.
+///
+/// Sem mangling no nome (ao contrário de [`mangle_fn_name`]): este é o
+/// símbolo que o linker vai procurar em libc, e renomeá-lo faria a busca
+/// falhar. Colisão com o `fn main` do shim não é possível — o checker recusa
+/// redeclarar um nome já declarado, e `main` em Titan é uma `function`
+/// comum, que o mangling afasta.
+fn emit_foreign_extern(out: &mut String, name: &str, params: &[(String, Type)], rettypes: &[Type]) {
+    out.push_str("unsafe extern \"C\" {\n");
+    out.push_str(INDENT);
+    out.push_str("fn ");
+    out.push_str(name);
+    out.push('(');
+    let param_list: Vec<String> = params
+        .iter()
+        .map(|(pname, ty)| format!("{pname}: {}", c_abi_type_name(ty)))
+        .collect();
+    out.push_str(&param_list.join(", "));
+    out.push(')');
+    if let Some(ret) = c_abi_rettype_name(rettypes) {
+        out.push_str(" -> ");
+        out.push_str(&ret);
+    }
+    out.push_str(";\n}\n");
+}
+
+/// Tipo Rust de um valor **na fronteira C** (T73) — o mapeamento que difere
+/// de [`rust_type_name`] em exatamente um ponto: `string`.
+///
+/// Um `String` do Rust é ponteiro + tamanho + capacidade, layout que nenhuma
+/// função C sabe ler; na fronteira ele vira `*const c_char`, o `char*`
+/// terminado em zero que o C espera, e a conversão nos dois sentidos fica no
+/// runtime (`ffi_cstring`/`ffi_string`). Os escalares atravessam como são:
+/// `i64` é o `int64_t` do C, `f64` é `double`, e `bool` tem `repr(C)`
+/// garantido como o `_Bool` do C99.
+///
+/// Todo tipo fora dessa lista já foi recusado por
+/// `check_foreign_boundary_type` (`checker.rs`) com erro em português — daí
+/// o `unreachable!` do braço final, no molde de [`rust_type_name`].
+fn c_abi_type_name(ty: &Type) -> String {
+    match ty {
+        Type::Integer => "i64".to_string(),
+        Type::Float => "f64".to_string(),
+        Type::Boolean => "bool".to_string(),
+        Type::String => "*const std::os::raw::c_char".to_string(),
+        other => unreachable!(
+            "tipo '{other:?}' não atravessa a fronteira de FFI — checker deveria ter rejeitado antes"
+        ),
+    }
+}
+
+/// Retorno de uma `foreign function` na fronteira C. `None` é o `void` do C
+/// — ou a lista vazia, ou o único retorno `nil` —, mesmo critério de
+/// [`rust_rettype_name`]. Mais de um retorno nem chega aqui: o checker já
+/// recusa, porque a ABI C devolve um valor só.
+fn c_abi_rettype_name(rettypes: &[Type]) -> Option<String> {
+    match rettypes {
+        [] | [Type::Nil] => None,
+        [único] => Some(c_abi_type_name(único)),
+        vários => unreachable!(
+            "`foreign function` com {} retornos — checker deveria ter rejeitado antes",
+            vários.len()
+        ),
+    }
 }
 
 /// Shim de entrada (PRD.md, T6): o `fn main` real do binário gerado — separado
@@ -1143,7 +1237,7 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::String(v) => format_string_literal(v),
         TypedExpKind::Var(name) => name.clone(),
         TypedExpKind::Concat(exps) => emit_concat(exps, ctx),
-        TypedExpKind::Call { callee, args } => emit_call(callee, args, ctx),
+        TypedExpKind::Call { callee, args } => emit_call(callee, args, &exp.ty, ctx),
         // `^` vira chamada de método (`.powf`), que já se delimita sozinha —
         // não precisa dos parênteses externos em nenhuma posição.
         TypedExpKind::Binop {
@@ -1848,7 +1942,7 @@ fn emit_concat(exps: &[TypedExp], ctx: Ctx) -> String {
 /// verdade — nunca o valor clonado que `array_get` devolveria — faz a
 /// mutação de `f` alcançar `mat`). O resto segue a posição delimitada
 /// normal.
-fn emit_call(callee: &Callee, args: &[TypedExp], ctx: Ctx) -> String {
+fn emit_call(callee: &Callee, args: &[TypedExp], ret: &Type, ctx: Ctx) -> String {
     match callee {
         Callee::Direct(name) => {
             if let Some(builtin) = crate::builtins::lookup(name) {
@@ -1869,6 +1963,21 @@ fn emit_call(callee: &Callee, args: &[TypedExp], ctx: Ctx) -> String {
                 .collect();
             format!("{}({})", mangle_fn_name(name), rendered_args.join(", "))
         }
+        // `abs(-7)` com `abs` declarada por `foreign function` (T73). Três
+        // diferenças em relação a `Callee::Direct`, todas de emissão:
+        //
+        // 1. **sem mangling** — o nome é o símbolo que o linker procura;
+        // 2. **`unsafe`** — o rustc exige, e é o ponto do desenho: a
+        //    responsabilidade pela assinatura é de quem escreveu a
+        //    declaração, e o Rust gerado diz isso em voz alta;
+        // 3. **`string` vira `CString`** — e a `CString` precisa continuar
+        //    viva durante a chamada, daí a ligação `let` num bloco em vez de
+        //    um `.as_ptr()` sobre um temporário, que seria um ponteiro
+        //    pendurado assim que a expressão do argumento terminasse.
+        //
+        // Sem nenhum argumento `string`, o bloco não aparece: a chamada sai
+        // como `unsafe { abs(-7) }`, sem ruído.
+        Callee::Foreign(name) => emit_foreign_call(name, args, ret, ctx),
         // `data.read_csv(...)` (T39): chamada de função de módulo — sem
         // receptor, argumentos por posição contra a assinatura da
         // capability (mesma ABI por-parâmetro do builtin/função Titan).
@@ -1905,6 +2014,54 @@ fn emit_call(callee: &Callee, args: &[TypedExp], ctx: Ctx) -> String {
             format!("{}({})", method.rust_path, all_args.join(", "))
         }
     }
+}
+
+/// Chamada a uma `foreign function` (T73) — ver o braço `Callee::Foreign`
+/// de [`emit_call`] para o porquê de cada parte.
+///
+/// O nome das ligações temporárias leva o prefixo `__titan_ffi_`, que nenhum
+/// identificador Titan pode ter (o lexer não aceita `_` inicial seguido do
+/// resto, e mesmo que aceitasse o mangling de `mangle_fn_name` afastaria a
+/// colisão) — então a ligação nunca sombreia um nome do programa.
+fn emit_foreign_call(name: &str, args: &[TypedExp], ret: &Type, ctx: Ctx) -> String {
+    let mut bindings: Vec<String> = Vec::new();
+    let rendered_args: Vec<String> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if a.ty == Type::String {
+                let temp = format!("__titan_ffi_{i}");
+                bindings.push(format!(
+                    "let {temp} = titan_runtime::ffi_cstring(&{});",
+                    emit_owned_string(a, ctx)
+                ));
+                format!("{temp}.as_ptr()")
+            } else {
+                emit_delimited_exp(a, ctx)
+            }
+        })
+        .collect();
+
+    // Retorno `string` chega como `*const c_char` e vira `String` dentro do
+    // mesmo `unsafe` — desreferenciar o ponteiro é tão inseguro quanto a
+    // chamada, e separá-los em dois blocos não acrescentaria garantia
+    // nenhuma. `ffi_string` checa o nulo e aborta em português (o resto do
+    // runtime faz igual com índice fora de faixa).
+    let chamada = if *ret == Type::String {
+        format!(
+            "unsafe {{ titan_runtime::ffi_string({name}({})) }}",
+            rendered_args.join(", ")
+        )
+    } else {
+        format!("unsafe {{ {name}({}) }}", rendered_args.join(", "))
+    };
+    if bindings.is_empty() {
+        return chamada;
+    }
+    // Parênteses em volta do bloco: em posição de statement (`f(s);`) um
+    // `{ ... }` cru seria lido como bloco-statement, e o `;` que vem depois
+    // viraria statement vazio — o valor da chamada se perderia em silêncio.
+    format!("({{ {} {chamada} }})", bindings.join(" "))
 }
 
 /// Renderiza os argumentos de uma chamada **contra a assinatura declarada**
@@ -4154,5 +4311,224 @@ end"#;
              end",
         );
         assert!(rust.contains("let x: i64 = 5;"), "{rust}");
+    }
+
+    // ---- T73: `foreign function` -----------------------------------------
+
+    #[test]
+    fn t73_foreign_function_emite_bloco_extern_c() {
+        let rust = generate_source(
+            "foreign function abs(n: integer): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   return abs(-7)\n\
+             end",
+        );
+        assert!(
+            rust.contains("unsafe extern \"C\" {\n    fn abs(n: i64) -> i64;\n}"),
+            "{rust}"
+        );
+    }
+
+    /// O nome externo **não** passa pelo mangling: é o símbolo que o linker
+    /// procura em libc. O `titan_` só vale para funções escritas em Titan.
+    #[test]
+    fn t73_foreign_function_nao_sofre_mangling() {
+        let rust = generate_source(
+            "foreign function abs(n: integer): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   return abs(-7)\n\
+             end",
+        );
+        assert!(rust.contains("fn abs(n: i64) -> i64;"), "{rust}");
+        assert!(!rust.contains("titan_abs"), "{rust}");
+        // A função Titan ao lado continua manglada, para o contraste ficar
+        // registrado em vez de subentendido.
+        assert!(rust.contains("pub fn titan_main"), "{rust}");
+    }
+
+    #[test]
+    fn t73_chamada_a_foreign_function_sai_dentro_de_unsafe() {
+        let rust = generate_source(
+            "foreign function abs(n: integer): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   return abs(-7)\n\
+             end",
+        );
+        assert!(rust.contains("unsafe { abs(-7) }"), "{rust}");
+    }
+
+    /// Sem argumento `string`, nenhuma ligação temporária aparece — o
+    /// `unsafe { ... }` sai limpo.
+    #[test]
+    fn t73_chamada_sem_string_nao_gera_ligacao_temporaria() {
+        let rust = generate_source(
+            "foreign function abs(n: integer): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   return abs(-7)\n\
+             end",
+        );
+        assert!(!rust.contains("__titan_ffi_"), "{rust}");
+    }
+
+    /// `string` na fronteira vira `*const c_char` no `extern`, e a `CString`
+    /// que o alimenta fica presa a uma ligação `let` — um `.as_ptr()` sobre
+    /// temporário seria ponteiro pendurado.
+    #[test]
+    fn t73_string_na_fronteira_vira_c_char_com_cstring_viva() {
+        let rust = generate_source(
+            "foreign function strlen(s: string): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   return strlen(\"titan\")\n\
+             end",
+        );
+        assert!(
+            rust.contains("fn strlen(s: *const std::os::raw::c_char) -> i64;"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("let __titan_ffi_0 = titan_runtime::ffi_cstring("),
+            "{rust}"
+        );
+        assert!(rust.contains("strlen(__titan_ffi_0.as_ptr())"), "{rust}");
+    }
+
+    /// Retorno `string` volta como ponteiro e é convertido dentro do mesmo
+    /// `unsafe` — `ffi_string` checa o nulo e aborta em português.
+    #[test]
+    fn t73_retorno_string_passa_por_ffi_string() {
+        let rust = generate_source(
+            "foreign function getenv(nome: string): string\n\n\
+             function main(args: {string}): integer\n\
+             \x20   print(getenv(\"PATH\"))\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(
+            rust.contains(
+                "fn getenv(nome: *const std::os::raw::c_char) -> *const std::os::raw::c_char;"
+            ),
+            "{rust}"
+        );
+        assert!(rust.contains("titan_runtime::ffi_string(getenv("), "{rust}");
+    }
+
+    /// Retorno omitido é o `void` do C: nenhum `->` no `extern`.
+    #[test]
+    fn t73_foreign_function_sem_retorno_nao_emite_seta() {
+        let rust = generate_source(
+            "foreign function sync()\n\n\
+             function main(args: {string}): integer\n\
+             \x20   sync()\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("fn sync();"), "{rust}");
+    }
+
+    /// O critério de aceite da T73: um `.titan` que chama a libc compila com
+    /// `rustc` de verdade e imprime o valor certo. `abs(-7)` é `7`.
+    #[test]
+    fn t73_chamada_a_libc_compila_e_roda_com_o_valor_correto() {
+        let rust = generate_source(
+            "foreign function abs(n: integer): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   print(\"abs=\" .. abs(-7))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t73_abs");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "abs=7\n");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// A ponta `string` da fronteira, ida e volta, também contra a libc de
+    /// verdade: `strlen("titan")` é `5`.
+    #[test]
+    fn t73_string_na_fronteira_compila_e_roda_contra_a_libc() {
+        let rust = generate_source(
+            "foreign function strlen(s: string): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   print(\"n=\" .. strlen(\"titan\"))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t73_strlen");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "n=5\n");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// `float` na fronteira é o `double` do C — `sqrt` da libm prova os dois
+    /// sentidos de uma vez (argumento e retorno).
+    #[test]
+    fn t73_float_na_fronteira_compila_e_roda_contra_a_libm() {
+        let rust = generate_source(
+            "foreign function sqrt(x: float): float\n\n\
+             function main(args: {string}): integer\n\
+             \x20   print(\"r=\" .. sqrt(9.0))\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("fn sqrt(x: f64) -> f64;"), "{rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t73_sqrt");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "r=3\n");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// Chamadas aninhadas, as duas com argumento `string`: os dois blocos
+    /// nomeiam a ligação `__titan_ffi_0`, e isso é correto — a ligação
+    /// interna vive só dentro do bloco que é o inicializador da externa, e
+    /// morre antes de a externa nascer. O caso existe como teste porque a
+    /// colisão *parece* um problema à primeira leitura.
+    #[test]
+    fn t73_chamadas_aninhadas_com_string_compilam_e_rodam() {
+        let rust = generate_source(
+            "foreign function strlen(s: string): integer\n\
+             foreign function getenv(nome: string): string\n\n\
+             function main(args: {string}): integer\n\
+             \x20   print(\"n=\" .. strlen(getenv(\"PATH\")))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (_, output) = compila_e_executa(&rust, "t73_aninhada");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).starts_with("n="),
+            "obteve: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Uma chamada em posição de statement (valor descartado) com argumento
+    /// `string`: é o caso que os parênteses em volta do bloco protegem — sem
+    /// eles o `{ ... };` seria lido como bloco-statement seguido de statement
+    /// vazio.
+    #[test]
+    fn t73_chamada_com_string_em_posicao_de_statement_compila() {
+        let rust = generate_source(
+            "foreign function strlen(s: string): integer\n\n\
+             function main(args: {string}): integer\n\
+             \x20   strlen(\"titan\")\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        let (_, output) = compila_e_executa(&rust, "t73_strlen_stmt");
+        assert_eq!(output.status.code(), Some(0));
     }
 }

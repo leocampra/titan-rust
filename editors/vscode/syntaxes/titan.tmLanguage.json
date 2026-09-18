@@ -83,7 +83,7 @@
         },
         {
           "name": "keyword.other.titan",
-          "match": "\\b(function|local|end|record|as|import)\\b"
+          "match": "\\b(function|local|end|record|as|import|foreign)\\b"
         },
         {
           "name": "keyword.operator.logical.titan",

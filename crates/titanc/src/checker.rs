@@ -48,7 +48,14 @@
 //!   dentro do ramo. `T?` é invariante em `compatible` (ADR 0008) e
 //!   continua sendo: o que a T68 acrescenta é injeção, não variância.
 //!
-//! Tudo fora do subconjunto (`foreign import`, métodos com `:`, cast `as`)
+//! A T73 acrescenta `foreign function`: a assinatura de uma função externa é
+//! resolvida como a de qualquer função top-level, e o que é próprio dela é a
+//! **fronteira** — só escalares e `string` atravessam
+//! ([`Checker::check_foreign_boundary_type`]), e o nome vai para
+//! `Checker::foreigns`, de onde `resolve_callee` o converte em
+//! [`Callee::Foreign`] para o codegen emitir `unsafe extern "C"` (ADR 0025).
+//!
+//! Tudo fora do subconjunto (métodos de `record`, módulos de usuário)
 //! produz um erro semântico claro — nunca panic.
 
 use std::collections::{HashMap, HashSet};
@@ -206,6 +213,15 @@ pub enum TypedTopLevel {
         loc: Loc,
         name: String,
         fields: Vec<(String, Type)>,
+    },
+    /// `foreign function abs(n: integer): integer` (T73) — vira um bloco
+    /// `unsafe extern "C"` no Rust gerado. Não tem corpo, e por isso não
+    /// carrega `body` nem `islocal`: o símbolo vem do linker.
+    ForeignFunc {
+        loc: Loc,
+        name: String,
+        params: Vec<(String, Type)>,
+        rettypes: Vec<Type>,
     },
 }
 
@@ -439,6 +455,12 @@ pub struct TypedExp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Callee {
     Direct(String),
+    /// Chamada a uma função declarada por `foreign function` (T73). Só o
+    /// codegen diferencia de [`Callee::Direct`] — a tipagem dos argumentos é
+    /// a mesma —, e a diferença é toda de emissão: sem mangling (o nome é do
+    /// símbolo do linker), envolta em `unsafe`, e com `string` convertida
+    /// para `CString` na chamada.
+    Foreign(String),
     Module {
         module: String,
         name: String,
@@ -740,6 +762,16 @@ struct Checker {
     /// checagem. Incrementada/decrementada em `check_stat` ao entrar/sair do
     /// bloco do laço.
     loop_depth: usize,
+    /// Nomes declarados por `foreign function` (T73), no molde de `modules`.
+    ///
+    /// Um símbolo externo é, para escopo e atribuição, idêntico a uma função
+    /// top-level — daí continuar sendo [`SymbolKind::Global`] em vez de
+    /// ganhar uma variante que forçaria um braço a mais em todo `match` de
+    /// `SymbolKind` sem dizer nada de novo. O que **é** diferente é só a
+    /// emissão (`unsafe`, `extern "C"`, `CString`), e é isso que este
+    /// conjunto carrega até `resolve_callee`, que o converte em
+    /// [`Callee::Foreign`].
+    foreigns: HashSet<String>,
 }
 
 /// Loc sentinela para símbolos sem declaração em arquivo Titan (builtins da
@@ -771,6 +803,7 @@ impl Checker {
             assigned: HashSet::new(),
             records: HashMap::new(),
             modules: HashMap::new(),
+            foreigns: HashSet::new(),
             uses: Vec::new(),
             scopes: Vec::new(),
             last_loc: Loc { line: 0, col: 0 },
@@ -1147,13 +1180,110 @@ impl Checker {
                     }
                 }
             }
-            TopLevel::TopLevelForeignImport { loc, .. } => {
-                self.error(*loc, "`foreign import` não é suportado nesta fase.");
+            // `foreign function abs(n: integer): integer` (T73). A
+            // assinatura é resolvida como a de qualquer função top-level —
+            // a diferença toda está na **fronteira**: só escalares e
+            // `string` atravessam (ADR 0025), e cada violação sai com erro
+            // em português aqui, antes de o rustc ver o `extern "C"`.
+            TopLevel::TopLevelForeignFunc {
+                loc,
+                name,
+                params,
+                rettypes,
+            } => {
+                if self.st.find_symbol(name).is_some() {
+                    self.error(*loc, format!("'{name}' já foi declarado antes."));
+                    return;
+                }
+                let param_types = match self.resolve_param_types(params) {
+                    Some(types) => types,
+                    None => return,
+                };
+                let ret_types = match self.resolve_types(rettypes) {
+                    Some(types) => types,
+                    None => return,
+                };
+
+                // Erros de fronteira são acumulados, não abortam no
+                // primeiro: uma assinatura com dois tipos inválidos deve
+                // apontar os dois, como o resto do checker faz.
+                let mut ok = true;
+                for (param, ty) in params.iter().zip(param_types.iter()) {
+                    if !self.check_foreign_boundary_type(
+                        param.loc,
+                        ty,
+                        &format!("o parâmetro '{}' de `foreign function {name}`", param.name),
+                    ) {
+                        ok = false;
+                    }
+                }
+                // Retorno `nil` é a função externa sem valor de retorno
+                // (`void` em C) — vale, e só nessa posição.
+                if ret_types.len() > 1 {
+                    self.error(
+                        *loc,
+                        format!(
+                            "`foreign function {name}` não pode ter mais de um retorno: \
+                             a fronteira C devolve um valor só."
+                        ),
+                    );
+                    ok = false;
+                } else if let Some(ret) = ret_types.first()
+                    && *ret != Type::Nil
+                    && !self.check_foreign_boundary_type(
+                        *loc,
+                        ret,
+                        &format!("o retorno de `foreign function {name}`"),
+                    )
+                {
+                    ok = false;
+                }
+                if !ok {
+                    return;
+                }
+
+                let fn_ty = Type::Function {
+                    params: param_types,
+                    rettypes: ret_types,
+                };
+                self.st
+                    .add_symbol(name, fn_ty.clone(), SymbolKind::Global, *loc);
+                self.foreigns.insert(name.clone());
+                self.record_use(*loc, *loc, name, &fn_ty);
             }
             TopLevel::TopLevelMethod { loc, .. } | TopLevel::TopLevelStatic { loc, .. } => {
                 self.error(*loc, "métodos não são suportados nesta fase.");
             }
         }
+    }
+
+    /// Tipos que atravessam a fronteira de FFI (T73, ADR 0025): escalares
+    /// (`integer`, `float`, `boolean`) e `string`. Devolve `true` quando o
+    /// tipo passa; senão registra o erro e devolve `false`.
+    ///
+    /// A lista é curta de propósito. `{T}`, `{K:V}` e `record` têm layout
+    /// escolhido pelo Rust (`Vec`, `HashMap`, `struct` sem `#[repr(C)]`),
+    /// que nenhuma função C sabe ler; `value` é um enum boxado do runtime;
+    /// `T?` é `Option<T>`, cujo layout só é garantido em casos que não vale
+    /// a pena enumerar aqui; `nil` só faz sentido como "sem retorno". Passar
+    /// qualquer um deles compilaria e leria memória errada — por isso a
+    /// recusa é do checker, com mensagem em português, e não do rustc.
+    fn check_foreign_boundary_type(&mut self, loc: Loc, ty: &Type, onde: &str) -> bool {
+        if matches!(
+            ty,
+            Type::Integer | Type::Float | Type::Boolean | Type::String
+        ) {
+            return true;
+        }
+        self.error(
+            loc,
+            format!(
+                "{onde} é {}, que não atravessa a fronteira de FFI; \
+                 só integer, float, boolean e string atravessam.",
+                type_name(ty)
+            ),
+        );
+        false
     }
 
     fn resolve_param_types(&mut self, params: &[ast::Decl]) -> Option<Vec<Type>> {
@@ -1408,6 +1538,39 @@ impl Checker {
                     loc: *loc,
                     name: name.clone(),
                     fields,
+                })
+            }
+            // `foreign function` (T73): a passada 1 já resolveu e validou
+            // a assinatura inteira (inclusive a fronteira de FFI). Não há
+            // corpo para checar, então aqui só reaproveitamos o símbolo —
+            // se ele não está em `self.foreigns`, já foi rejeitado lá.
+            TopLevel::TopLevelForeignFunc {
+                loc, name, params, ..
+            } => {
+                if !self.foreigns.contains(name) {
+                    return None;
+                }
+                let Some(Symbol {
+                    ty:
+                        Type::Function {
+                            params: param_types,
+                            rettypes: ret_types,
+                        },
+                    ..
+                }) = self.st.find_symbol(name).cloned()
+                else {
+                    return None;
+                };
+                let named_params = params
+                    .iter()
+                    .zip(param_types)
+                    .map(|(p, t)| (p.name.clone(), t))
+                    .collect();
+                Some(TypedTopLevel::ForeignFunc {
+                    loc: *loc,
+                    name: name.clone(),
+                    params: named_params,
+                    rettypes: ret_types,
                 })
             }
             // Já reportado como erro na passada 1.
@@ -3738,7 +3901,12 @@ valor precisam de nomes diferentes.",
                         rettypes: rettypes.clone(),
                     },
                 );
-                Some((Callee::Direct(name.clone()), name.clone(), params, rettypes))
+                let callee = if self.foreigns.contains(name) {
+                    Callee::Foreign(name.clone())
+                } else {
+                    Callee::Direct(name.clone())
+                };
+                Some((callee, name.clone(), params, rettypes))
             }
             // `data.read_csv(...)` (T39): base é o símbolo de um módulo
             // importado — resolve contra a tabela de capabilities em vez da
@@ -4701,28 +4869,225 @@ mod tests {
         }
     }
 
-    #[test]
-    fn foreign_import_produz_erro_de_construcao_nao_suportada() {
-        // Mesmo espírito de um arquivo `.titan` do Titan original:
-        // `foreign import` não faz parte do subconjunto desta fase. `record`
-        // passou a ser aceito a partir da T29 — coberto por
-        // `record_vazio_e_aceito_pelo_checker` mais abaixo.
-        let loc = Loc { line: 1, col: 1 };
-        let program: Program = vec![
-            TopLevel::TopLevelForeignImport {
-                loc,
-                localname: "stdio".to_string(),
-                headername: "stdio.h".to_string(),
-            },
-            TopLevel::TopLevelRecord {
-                loc,
-                name: "Ponto".to_string(),
-                fields: vec![],
-            },
-        ];
+    // ---- T73: `foreign function` ------------------------------------------
 
-        let errs = check(&program).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("foreign import")));
+    /// Junta as mensagens de erro num texto só, para os `assert!(contains)`
+    /// abaixo não dependerem de qual erro saiu primeiro.
+    fn mensagens(errs: &[CheckError]) -> String {
+        errs.iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn foreign_function_registra_o_simbolo_e_a_chamada_tipa() {
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return abs(-7)\n\
+                      end";
+        let typed = check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+
+        // A declaração externa sobrevive até a AST tipada — é dela que o
+        // codegen tira o bloco `extern "C"`.
+        let foreign = typed
+            .iter()
+            .find_map(|t| match t {
+                TypedTopLevel::ForeignFunc {
+                    name,
+                    params,
+                    rettypes,
+                    ..
+                } => Some((name, params, rettypes)),
+                _ => None,
+            })
+            .expect("esperava um TypedTopLevel::ForeignFunc");
+        assert_eq!(foreign.0, "abs");
+        assert_eq!(foreign.1, &vec![("n".to_string(), Type::Integer)]);
+        assert_eq!(foreign.2, &vec![Type::Integer]);
+    }
+
+    #[test]
+    fn chamada_a_foreign_function_produz_callee_foreign() {
+        // O que separa `Callee::Foreign` de `Callee::Direct` é só a emissão
+        // (`unsafe`, sem mangling) — mas a distinção tem de chegar ao
+        // codegen, e é isso que este teste fixa.
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return abs(-7)\n\
+                      end";
+        let typed = check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+
+        let mut achou = false;
+        for top in &typed {
+            let TypedTopLevel::Func { body, .. } = top else {
+                continue;
+            };
+            let TypedStat::Block { stats, .. } = body.as_ref() else {
+                continue;
+            };
+            for stat in stats {
+                let TypedStat::Return { exps, .. } = stat else {
+                    continue;
+                };
+                let TypedExpKind::Call { callee, .. } = &exps[0].kind else {
+                    continue;
+                };
+                assert_eq!(*callee, Callee::Foreign("abs".to_string()));
+                achou = true;
+            }
+        }
+        assert!(achou, "esperava encontrar a chamada a `abs` no corpo de main");
+    }
+
+    #[test]
+    fn foreign_function_sem_retorno_e_aceita() {
+        // Retorno omitido é `nil`, o `void` do C — a única posição em que
+        // `nil` atravessa a fronteira.
+        let source = "foreign function sync()\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   sync()\n\
+                      \x20   return 0\n\
+                      end";
+        check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+    }
+
+    #[test]
+    fn foreign_function_com_string_na_fronteira_e_aceita() {
+        let source = "foreign function strlen(s: string): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return strlen(\"abc\")\n\
+                      end";
+        check_source(source)
+            .unwrap_or_else(|errs| panic!("esperava sucesso, obteve: {}", mensagens(&errs)));
+    }
+
+    #[test]
+    fn foreign_function_com_array_na_fronteira_da_erro_claro() {
+        let source = "foreign function soma(xs: {integer}): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let msg = mensagens(&errs);
+        assert!(
+            msg.contains("fronteira de FFI") && msg.contains("{integer}"),
+            "mensagem devia citar a fronteira e o tipo recusado: {msg}"
+        );
+    }
+
+    #[test]
+    fn foreign_function_com_record_na_fronteira_da_erro_claro() {
+        // O caso do critério de aceite: "tipo composto na fronteira dá erro
+        // claro". `record` é o composto mais tentador, porque em C existe
+        // `struct` — mas o layout do Rust não é o do C sem `#[repr(C)]`.
+        let source = "record Ponto\n\x20   x: integer\n\x20   y: integer\nend\n\n\
+                      foreign function dist(p: Ponto): float\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let msg = mensagens(&errs);
+        assert!(
+            msg.contains("fronteira de FFI") && msg.contains("Ponto"),
+            "mensagem devia citar a fronteira e o record recusado: {msg}"
+        );
+    }
+
+    #[test]
+    fn foreign_function_com_retorno_composto_da_erro_claro() {
+        let source = "foreign function nomes(): {string}\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let msg = mensagens(&errs);
+        assert!(
+            msg.contains("fronteira de FFI") && msg.contains("o retorno"),
+            "mensagem devia citar o retorno: {msg}"
+        );
+    }
+
+    #[test]
+    fn foreign_function_com_value_na_fronteira_da_erro_claro() {
+        // `value` compila e tem representação (T70), mas é um enum boxado do
+        // runtime — nenhuma função C sabe lê-lo.
+        let source = "foreign function f(v: value): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(mensagens(&errs).contains("fronteira de FFI"));
+    }
+
+    #[test]
+    fn foreign_function_com_opcional_na_fronteira_da_erro_claro() {
+        let source = "foreign function f(n: integer?): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(mensagens(&errs).contains("fronteira de FFI"));
+    }
+
+    #[test]
+    fn foreign_function_com_dois_retornos_da_erro_claro() {
+        // A ABI C devolve um valor só; retorno múltiplo (T66) para no
+        // checker, não no rustc.
+        let source = "foreign function divmod(a: integer, b: integer): integer, integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(
+            mensagens(&errs).contains("não pode ter mais de um retorno"),
+            "obteve: {}",
+            mensagens(&errs)
+        );
+    }
+
+    #[test]
+    fn foreign_function_acumula_os_erros_de_fronteira() {
+        // Dois parâmetros inválidos devem render dois erros, não parar no
+        // primeiro — é o que o resto do checker faz.
+        let source = "foreign function f(xs: {integer}, ys: {string}): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        let fronteira = errs
+            .iter()
+            .filter(|e| e.message.contains("fronteira de FFI"))
+            .count();
+        assert_eq!(fronteira, 2, "obteve: {}", mensagens(&errs));
+    }
+
+    #[test]
+    fn foreign_function_colidindo_com_funcao_titan_da_erro_claro() {
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function abs(n: integer): integer\n\
+                      \x20   return n\n\
+                      end\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return 0\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(mensagens(&errs).contains("já foi declarado antes"));
+    }
+
+    #[test]
+    fn chamada_a_foreign_function_com_argumento_de_tipo_errado_da_erro_claro() {
+        // A fronteira não relaxa a tipagem: os argumentos são checados
+        // contra a assinatura como os de qualquer função Titan.
+        let source = "foreign function abs(n: integer): integer\n\n\
+                      function main(args: {string}): integer\n\
+                      \x20   return abs(\"x\")\n\
+                      end";
+        let errs = check_source(source).unwrap_err();
+        assert!(!errs.is_empty(), "esperava erro de tipo no argumento");
     }
 
     // ---- T38: `import data` registra o módulo -----------------------------

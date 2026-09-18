@@ -2290,10 +2290,13 @@ fn arquivos_que_a_fase_2_espera_compilar_compilam_de_verdade() {
 /// exatamente o cenário citado no PRD.md (T5) como caso negativo de
 /// "construção não suportada" — usamos um trecho representativo em vez do
 /// arquivo real do Titan (que depende de módulos externos não relevantes
-/// aqui). Desde a T29 o `record` em si é aceito pelo checker; `foreign
-/// import` segue fora de escopo e garante a falha aqui.
+/// aqui). Desde a T29 o `record` em si é aceito pelo checker; a T73 abriu a
+/// porta de FFI, mas com a grafia `foreign function` (ADR 0025) — a forma do
+/// original, que nomeia um header C, segue recusada, e agora com uma
+/// mensagem que aponta a grafia que existe em vez de só dizer "não
+/// suportado".
 #[test]
-fn arquivo_com_foreign_import_e_record_produz_erro_de_construcao_nao_suportada() {
+fn arquivo_com_foreign_import_do_original_produz_erro_que_aponta_a_grafia_nova() {
     let out_dir = temp_dir("foreign-import-record");
     let source = r#"foreign import stdio "stdio.h"
 
@@ -2317,7 +2320,108 @@ end"#;
     assert_never_panics(&output);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.trim().is_empty());
+    assert!(
+        stderr.contains("foreign function"),
+        "o erro devia apontar a grafia que existe: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// T73, o critério de aceite ponta a ponta: um `.titan` que chama funções da
+/// libc (`abs`, `strlen`, `getenv`) compila pelo `titanc` de verdade — cargo
+/// incluso — e roda com os valores corretos.
+///
+/// `abs` prova o escalar; `strlen` prova a `string` na ida (`CString`);
+/// `getenv` prova a `string` na volta (`ffi_string`). Nenhum crate extra
+/// entra no `Cargo.toml` gerado: a libc já vem linkada com a std.
+#[test]
+fn t73_compila_e_executa_chamada_a_libc_por_foreign_function() {
+    let out_dir = temp_dir("t73-ffi-libc");
+    let source = r#"foreign function abs(n: integer): integer
+foreign function strlen(s: string): integer
+foreign function getenv(nome: string): string
+
+function main(args: {string}): integer
+    print("abs=" .. abs(-7))
+    print("strlen=" .. strlen("titan"))
+    print("var=" .. getenv("TITAN_T73"))
+    return 0
+end"#;
+    let source_path = write_source(&out_dir, "ffi.titan", source);
+
+    let compile_output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compile_output);
+    assert!(
+        compile_output.status.success(),
+        "titanc falhou ao compilar ffi.titan: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let binary = out_dir.join("ffi");
+    assert!(binary.exists(), "esperava executável em {binary:?}");
+
+    let run_output = Command::new(&binary)
+        .env("TITAN_T73", "ok")
+        .output()
+        .expect("executa ./ffi");
+    assert_eq!(
+        String::from_utf8_lossy(&run_output.stdout),
+        "abs=7\nstrlen=5\nvar=ok\n"
+    );
+    assert_eq!(run_output.status.code(), Some(0));
+
+    // A FFI não arrasta dependência nenhuma: a libc já vem com a std.
+    let cargo_toml = std::fs::read_to_string(out_dir.join("build").join("ffi").join("Cargo.toml"))
+        .expect("lê o Cargo.toml gerado");
+    assert!(
+        cargo_toml.contains("titan-runtime"),
+        "Cargo.toml gerado deveria depender de titan-runtime:\n{cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains("libc"),
+        "`foreign function` não deveria acrescentar o crate libc:\n{cargo_toml}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// O outro lado do critério de aceite: tipo composto na fronteira dá erro
+/// claro em português, do checker — nunca do rustc, e nunca com panic.
+#[test]
+fn t73_tipo_composto_na_fronteira_produz_erro_claro_do_checker() {
+    let out_dir = temp_dir("t73-fronteira-composta");
+    let source = r#"record Ponto
+    x: integer
+    y: integer
+end
+
+foreign function dist(p: Ponto): float
+
+function main(args: {string}): integer
+    return 0
+end"#;
+    let source_path = write_source(&out_dir, "fronteira.titan", source);
+
+    let output = Command::new(titanc_bin())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&source_path)
+        .output()
+        .expect("invoca titanc");
+
+    assert_never_panics(&output);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fronteira de FFI") && stderr.contains("Ponto"),
+        "esperava erro de fronteira citando o record: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }

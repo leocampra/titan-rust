@@ -607,3 +607,81 @@ fn completar_em_posicao_de_expressao_lista_escopo_builtins_e_keywords() {
 
     client.shutdown_and_exit();
 }
+
+/// T73: um `.titan` com `foreign function` não gera diagnóstico nenhum — o
+/// LSP reusa o mesmo pipeline do `titanc`
+/// ([ADR 0018](../../../docs/adr/0018-titanc-lib-lsp-reusa-pipeline.md)),
+/// então a construção nova chega ao editor sem trabalho no servidor.
+#[test]
+fn foreign_function_valida_nao_gera_diagnostico() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    let source = "foreign function abs(n: integer): integer\n\nfunction main(args: {string}): integer\n    return abs(-7)\nend";
+    let uri = "file:///teste_foreign_ok.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publish = client.wait_for_publish_diagnostics();
+    let diagnostics = publish["params"]["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics.is_empty(),
+        "`foreign function` válida não deveria gerar diagnósticos: {diagnostics:?}"
+    );
+
+    client.shutdown_and_exit();
+}
+
+/// T73: tipo composto na fronteira de FFI aparece como diagnóstico no editor,
+/// em português — o mesmo erro que o `titanc` dá na linha de comando.
+#[test]
+fn foreign_function_com_tipo_composto_na_fronteira_gera_diagnostico() {
+    let mut client = LspClient::start();
+
+    client.request(
+        "initialize",
+        json!({"processId": null, "rootUri": null, "capabilities": {}}),
+    );
+    client.notify("initialized", json!({}));
+
+    let source = "foreign function soma(xs: {integer}): integer\n\nfunction main(args: {string}): integer\n    return 0\nend";
+    let uri = "file:///teste_foreign_erro.titan";
+
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "titan",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let publish = client.wait_for_publish_diagnostics();
+    let diagnostics = publish["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "obteve: {diagnostics:?}");
+    let message = diagnostics[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("fronteira de FFI"),
+        "diagnóstico devia citar a fronteira: {message}"
+    );
+
+    client.shutdown_and_exit();
+}

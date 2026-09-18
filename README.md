@@ -282,6 +282,9 @@ compostos) + Fase 3 (capability runtimes) + Fase 4 (self-hosting / LSP):
   ([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)).
 - Tipos opcionais (`T?`), com estreitamento por `if x ~= nil then`.
 - Cast de tipo (`exp as T`) e o tipo `value` — veja a seção abaixo.
+- `foreign function` (Fase 5, T73): chamada a funções C, com assinatura
+  escrita em Titan — veja a seção abaixo
+  ([ADR 0025](docs/adr/0025-foreign-function-com-assinatura-titan.md)).
 
 ### Cast `as` e o tipo `value`
 
@@ -364,12 +367,70 @@ end            --       que itera sobre ele
 Quem precisa mutar enquanto percorre escreve um `for` numérico sobre os
 índices, que não passa por essa restrição.
 
+### `foreign function` — a porta de FFI
+
+`foreign function` declara uma função externa, com a assinatura escrita em
+Titan. Não tem corpo, e por isso não tem `end`.
+
+```lua
+foreign function abs(n: integer): integer
+foreign function strlen(s: string): integer
+
+function main(args: {string}): integer
+    print("abs(-7) = " .. abs(-7))       -- 7
+    print("strlen = " .. strlen("titan")) -- 5
+    return 0
+end
+```
+
+O símbolo é resolvido pelo linker; a libc já vem linkada com a std, então
+**nenhuma dependência nova entra no `Cargo.toml` gerado**. No Rust emitido,
+cada declaração vira um bloco `unsafe extern "C"` e cada chamada sai envolta
+em `unsafe` — o código gerado diz em voz alta o que a declaração assumiu.
+
+A grafia do Titan original (`foreign import stdio "stdio.h"`) **não existe
+aqui**: ela nomeia um header C e deixa as assinaturas implícitas, o que
+exigiria parsear C — um gerador de bindings, que esta porta deliberadamente
+não é ([ADR 0025](docs/adr/0025-foreign-function-com-assinatura-titan.md)).
+Escrevê-la dá erro que aponta a grafia que existe.
+
+> **Só escalares e `string` atravessam a fronteira.** `integer`, `float`,
+> `boolean` e `string`; `nil` vale só como retorno (o `void` do C). `{T}`,
+> `{K: V}`, `record`, `value` e `T?` são recusados pelo **checker**, com
+> mensagem em português, antes de o `rustc` ver o `extern "C"` — o layout
+> deles é escolhido pelo Rust, e nenhuma função C sabe lê-lo. Retorno
+> múltiplo também: a ABI C devolve um valor só.
+
+```lua
+record Ponto
+    x: integer
+    y: integer
+end
+
+foreign function dist(p: Ponto): float
+-- erro: o parâmetro 'p' de `foreign function dist` é Ponto, que não
+--       atravessa a fronteira de FFI; só integer, float, boolean e
+--       string atravessam.
+```
+
+`string` é a única que custa conversão: na ida vira `CString` (uma `string`
+com byte zero no meio aborta em português — em C a string termina no primeiro
+zero), e na volta vira `string` a partir do `char*`, com o ponteiro nulo
+checado.
+
+**A assinatura errada continua sendo erro de quem escreve.** O compilador
+garante que os tipos declarados atravessam a fronteira; não garante que eles
+são os tipos que a função externa realmente tem — declarar `foreign function
+abs(n: float): float` para a `abs` da libc compila e produz lixo. É o mesmo
+contrato de qualquer FFI, e é por isso que a declaração é explícita em vez de
+gerada.
+
 ## O que não está implementado ainda
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
-- `foreign import`, `local m = import "data"` (a forma do original), módulos
-  definidos pelo usuário (um `.titan` importando outro `.titan`).
+- `local m = import "data"` (a forma do original), módulos definidos pelo
+  usuário (um `.titan` importando outro `.titan`).
 - Tipos soma (`enum`/`match`), parser e checker auto-hospedados (self-hosting
   pleno, fase 5).
 - `titan-crypto`, `titan-ai` (fases 3b/3c).
