@@ -109,6 +109,27 @@ pub enum TopLevel {
         localname: String,
         modname: String,
     },
+    /// `enum Exp ... end` (T74) — o tipo soma, item central da Fase 6.
+    ///
+    /// Diverge do Titan original, que **não tem** tipos soma
+    /// (`titan/titan-compiler/ast.lua` só conhece `TopLevelRecord`): é o
+    /// terceiro nó realmente novo do projeto, depois de [`Stat::StatBreak`]
+    /// e [`Stat::StatContinue`].
+    ///
+    /// Ao contrário de [`TopLevel::TopLevelRecord`], cujos campos são
+    /// [`Decl`] (nome **e** tipo), uma variante carrega uma lista
+    /// **posicional** de tipos: `ExpBinop(string, Exp, Exp)` liga os campos a
+    /// nomes só no braço do `match` (T75), nunca na declaração. Por isso
+    /// [`Variant::fields`] é `Vec<Type>`, e não `Vec<Decl>`.
+    ///
+    /// Recursão é **permitida** aqui (decisão técnica 6 do PRD.md): a
+    /// checagem de ciclo que rejeita record recursivo não se aplica a `enum`,
+    /// porque o codegen resolve o ciclo com `Box` na emissão (T77).
+    TopLevelEnum {
+        loc: Loc,
+        name: String,
+        variants: Vec<Variant>,
+    },
     /// `foreign function abs(n: integer): integer` (T73) — a porta de FFI.
     ///
     /// Diverge do `foreign import stdio "stdio.h"` do Titan original, que
@@ -135,6 +156,17 @@ pub struct Decl {
     pub name: String,
     pub r#type: Option<Type>,
     pub option: bool,
+}
+
+/// Uma variante de [`TopLevel::TopLevelEnum`] (T74).
+///
+/// `fields` vazio é a variante **sem payload** (`ExpNil`), que na sintaxe
+/// (T75) se escreve sem parênteses — parênteses vazios são erro, não sinônimo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Variant {
+    pub loc: Loc,
+    pub name: String,
+    pub fields: Vec<Type>,
 }
 
 /// Comandos (`ast.lua`: `Stat`).
@@ -392,6 +424,53 @@ mod tests {
 
         assert_ne!(posicional.name, nomeado.name);
         assert_ne!(nomeado.name, chave.name);
+    }
+
+    /// Monta o `enum Exp` do PRD (T74) — o caso central da fase, com variante
+    /// sem payload, variante com payload primitivo e variante **recursiva**.
+    #[test]
+    fn monta_enum_exp_recursivo() {
+        let loc = Loc { line: 1, col: 1 };
+
+        let tipo_exp = || Type::TypeName {
+            loc,
+            name: "Exp".to_string(),
+        };
+
+        let decl = TopLevel::TopLevelEnum {
+            loc,
+            name: "Exp".to_string(),
+            variants: vec![
+                // Sem payload: `fields` vazio (e, na sintaxe, sem parênteses).
+                Variant {
+                    loc,
+                    name: "ExpNil".to_string(),
+                    fields: vec![],
+                },
+                Variant {
+                    loc,
+                    name: "ExpInteger".to_string(),
+                    fields: vec![Type::TypeInteger { loc }],
+                },
+                // Recursiva: dois campos do próprio `Exp` — permitida aqui
+                // (decisão técnica 6), com o `Box` ficando para a emissão.
+                Variant {
+                    loc,
+                    name: "ExpBinop".to_string(),
+                    fields: vec![Type::TypeString { loc }, tipo_exp(), tipo_exp()],
+                },
+            ],
+        };
+
+        let TopLevel::TopLevelEnum { name, variants, .. } = &decl else {
+            panic!("esperava TopLevelEnum");
+        };
+        assert_eq!(name, "Exp");
+        assert_eq!(variants.len(), 3);
+        assert!(variants[0].fields.is_empty());
+        assert_eq!(variants[1].fields, vec![Type::TypeInteger { loc }]);
+        assert_eq!(variants[2].fields.len(), 3);
+        assert_eq!(variants[2].fields[1], tipo_exp());
     }
 
     /// Monta a `Program` equivalente a `examples/hello.titan`, para provar que
