@@ -6,8 +6,9 @@
 //!    ou os módulos declarados no `titan.toml` em ordem topológica — e passa
 //!    cada um pelo checker;
 //! 2. gera `<out_dir>/<nome>/src/main.rs` e `<out_dir>/<nome>/Cargo.toml`
-//!    (com `titan-runtime` e uma entrada por módulo importado, cada um
-//!    referenciado por caminho absoluto, T43);
+//!    (com `titan-runtime` e uma entrada por capability importada por
+//!    **qualquer** módulo do grafo, cada uma referenciada por caminho
+//!    absoluto, T43 e T83);
 //! 3. invoca `cargo build --release` nesse diretório;
 //! 4. copia o executável para o diretório atual como `<nome>`.
 //!
@@ -157,8 +158,8 @@ struct CrateDep {
 /// `Cargo.toml` do projeto gerado: `[workspace]` vazio (para não ser anexado
 /// ao workspace pai) e uma entrada `[dependencies]` por `deps`, cada uma por
 /// caminho absoluto. `deps` sempre inclui `titan-runtime`, mais uma por
-/// módulo importado pelo programa (T43) — programa sem `import` não paga o
-/// build das capabilities que não usa.
+/// capability importada por algum módulo do programa (T43, T83) — programa
+/// sem `import` não paga o build das capabilities que não usa.
 fn generate_cargo_toml(name: &str, deps: &[CrateDep]) -> String {
     let mut out = format!(
         "[workspace]\n\n[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"
@@ -185,17 +186,41 @@ fn runtime_crate_path() -> PathBuf {
 }
 
 /// Monta a lista de dependências do `Cargo.toml` gerado: `titan-runtime`
-/// sempre primeiro, mais uma por módulo importado pelo programa (T43).
-fn collect_deps(program: &crate::ast::Program) -> Vec<CrateDep> {
+/// sempre primeiro, mais uma por capability importada — pelo programa
+/// principal **ou por qualquer módulo do grafo** (T83).
+///
+/// Um único crate Cargo por programa (decisão 5 da fase) tem uma
+/// consequência direta aqui: o `Cargo.toml` é um só, então ele precisa
+/// carregar a união das capabilities de todos os módulos. Olhar só o
+/// principal — como até a T82 — deixaria `import texto` feito dentro de
+/// `lexer.titan` sem o `titan-texto` no `Cargo.toml`, e o erro chegaria em
+/// inglês, do `rustc`, sobre o `main.rs` gerado que o usuário não escreveu.
+///
+/// A união é por **capability**, não por módulo que a importa: dois módulos
+/// com `import data` geram **uma** entrada, porque duas linhas iguais em
+/// `[dependencies]` são um `Cargo.toml` inválido.
+///
+/// A ordem é determinística — os módulos vêm em ordem topológica do grafo e,
+/// dentro de cada um, os `import` saem na ordem do fonte. O mesmo programa
+/// gera sempre o mesmo `Cargo.toml`, e um programa de arquivo único gera
+/// exatamente o que gerava antes da T83: um só módulo para percorrer, na
+/// ordem de sempre.
+fn collect_deps(grafo: &Grafo) -> Vec<CrateDep> {
     let mut deps = vec![CrateDep {
         name: "titan-runtime",
         path: runtime_crate_path(),
     }];
-    for capability in checker::imported_capabilities(program) {
-        deps.push(CrateDep {
-            name: capability.crate_name,
-            path: workspace_crate_path(capability.crate_path),
-        });
+    let mut vistas = std::collections::HashSet::new();
+    for modulo in &grafo.modulos {
+        for capability in checker::imported_capabilities(&modulo.programa) {
+            if !vistas.insert(capability.titan_name) {
+                continue;
+            }
+            deps.push(CrateDep {
+                name: capability.crate_name,
+                path: workspace_crate_path(capability.crate_path),
+            });
+        }
     }
     deps
 }
@@ -374,7 +399,7 @@ pub fn compile(opts: &Options) -> Result<PathBuf, CompileError> {
         "não foi possível escrever o main.rs gerado".to_string(),
     ))?;
 
-    let cargo_toml = generate_cargo_toml(&name, &collect_deps(&grafo.principal().programa));
+    let cargo_toml = generate_cargo_toml(&name, &collect_deps(&grafo));
     std::fs::write(project_dir.join("Cargo.toml"), cargo_toml).map_err(io_err(
         "não foi possível escrever o Cargo.toml gerado".to_string(),
     ))?;
@@ -463,13 +488,31 @@ mod tests {
         assert!(toml.contains(&format!("path = {runtime_path:?}")));
     }
 
+    /// Grafo de um arquivo só a partir de um fonte em memória, para os
+    /// testes de dependência que não precisam de um projeto em disco.
+    /// Desde a T83 `collect_deps` recebe o grafo, e não o `Program` — é o
+    /// grafo que sabe de todos os módulos.
+    fn grafo_de_fonte(nome: &str, fonte: &str) -> Grafo {
+        let tokens = lexer::lex(fonte).unwrap();
+        let programa = parser::parse(&tokens).unwrap();
+        Grafo {
+            nome: nome.to_string(),
+            modulos: vec![grafo::Modulo {
+                nome: nome.to_string(),
+                caminho: PathBuf::from(format!("{nome}.titan")),
+                fonte: fonte.to_string(),
+                programa,
+                dependencias: Vec::new(),
+            }],
+            principal: 0,
+        }
+    }
+
     #[test]
     fn programa_sem_import_so_depende_do_titan_runtime() {
         let source = "function main(args: {string}): integer\n    print(\"oi\")\n    return 0\nend";
-        let tokens = lexer::lex(source).unwrap();
-        let program = parser::parse(&tokens).unwrap();
 
-        let deps = collect_deps(&program);
+        let deps = collect_deps(&grafo_de_fonte("sem_import", source));
 
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "titan-runtime");
@@ -478,10 +521,8 @@ mod tests {
     #[test]
     fn programa_com_import_ganha_dependencia_do_modulo() {
         let source = "import data\n\nfunction main(args: {string}): integer\n    return 0\nend";
-        let tokens = lexer::lex(source).unwrap();
-        let program = parser::parse(&tokens).unwrap();
 
-        let deps = collect_deps(&program);
+        let deps = collect_deps(&grafo_de_fonte("com_data", source));
 
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "titan-runtime");
@@ -1108,12 +1149,18 @@ mod tests {
         let rust = rust_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
 
         // Um `mod` por módulo declarado, mais o principal.
-        assert!(rust.contains("pub mod lexer {"), "faltou o mod lexer:\n{rust}");
+        assert!(
+            rust.contains("pub mod lexer {"),
+            "faltou o mod lexer:\n{rust}"
+        );
         assert!(
             rust.contains("pub mod parser {"),
             "faltou o mod parser:\n{rust}"
         );
-        assert!(rust.contains("pub mod p {"), "faltou o mod principal:\n{rust}");
+        assert!(
+            rust.contains("pub mod p {"),
+            "faltou o mod principal:\n{rust}"
+        );
 
         // O `record` sai **uma vez**, dentro do módulo que o declara.
         assert_eq!(
@@ -1346,5 +1393,238 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&out_dir);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // T83 — dependências do build multi-módulo
+    // ------------------------------------------------------------------
+
+    /// As dependências do `Cargo.toml` de um projeto em disco, sem invocar
+    /// o cargo: resolve o grafo e chama `collect_deps`. É o que separa o
+    /// critério de aceite da T83 (o que entra no `Cargo.toml`) do custo de
+    /// compilar de verdade cada capability.
+    fn deps_de(opts: &Options) -> Vec<CrateDep> {
+        let grafo = resolver_grafo(opts).unwrap_or_else(|e| panic!("o grafo resolve: {e}"));
+        collect_deps(&grafo)
+    }
+
+    fn nomes(deps: &[CrateDep]) -> Vec<&'static str> {
+        deps.iter().map(|d| d.name).collect()
+    }
+
+    #[test]
+    fn t83_capability_importada_so_por_modulo_interno_entra_no_cargo_toml() {
+        // O critério central da tarefa: quem faz `import texto` é
+        // `util.titan`, e o principal não importa nada. Até a T82
+        // `collect_deps` olhava só o principal, e o `titan-texto` ficava de
+        // fora — o `main.rs` gerado chamaria `titan_texto::` sem a
+        // dependência, e o erro chegaria em inglês, do rustc.
+        let dir = projeto(
+            "t83-interno",
+            &[
+                (
+                    "src/util.titan",
+                    "import texto\n\
+                     function largura(s: string): integer\n    return texto.tamanho(s)\nend\n",
+                ),
+                ("src/main.titan", MAIN_VAZIA),
+                ("titan.toml", &manifesto_de(&[("util", "src/util.titan")])),
+            ],
+        );
+
+        let deps = deps_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
+
+        assert_eq!(nomes(&deps), vec!["titan-runtime", "titan-texto"]);
+
+        let toml = generate_cargo_toml("p", &deps);
+        assert!(
+            toml.contains("titan-texto = "),
+            "o 'titan-texto' do módulo interno precisa estar no Cargo.toml:\n{toml}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t83_dois_modulos_importando_a_mesma_capability_geram_uma_entrada() {
+        // Duas linhas `titan-texto = ...` em `[dependencies]` são um
+        // `Cargo.toml` inválido; a união é por capability, não por módulo
+        // que a importa.
+        let dir = projeto(
+            "t83-duplicada",
+            &[
+                (
+                    "src/a.titan",
+                    "import texto\n\
+                     function la(s: string): integer\n    return texto.tamanho(s)\nend\n",
+                ),
+                (
+                    "src/b.titan",
+                    "import texto\n\
+                     function lb(s: string): integer\n    return texto.tamanho(s)\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import texto\n\
+                     function main(args: {string}): integer\n\
+                     \x20   print(texto.de_inteiro(1))\n    return 0\nend\n",
+                ),
+                (
+                    "titan.toml",
+                    &manifesto_de(&[("a", "src/a.titan"), ("b", "src/b.titan")]),
+                ),
+            ],
+        );
+
+        let deps = deps_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
+
+        assert_eq!(nomes(&deps), vec!["titan-runtime", "titan-texto"]);
+
+        let toml = generate_cargo_toml("p", &deps);
+        assert_eq!(
+            toml.matches("titan-texto = ").count(),
+            1,
+            "o 'titan-texto' aparece uma vez só:\n{toml}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t83_capabilities_de_modulos_diferentes_se_somam() {
+        // A união não é "a do principal ou a de um módulo": é a de todos.
+        // Aqui cada vértice traz a sua, e as três têm de sair juntas.
+        let dir = projeto(
+            "t83-uniao",
+            &[
+                (
+                    "src/leitura.titan",
+                    "import io\n\
+                     function ler(c: string): string\n    return io.ler_arquivo(c)\nend\n",
+                ),
+                (
+                    "src/tabela.titan",
+                    "import data\n\
+                     function carregar(c: string): data.DataFrame\n\
+                     \x20   return data.read_csv(c)\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import texto\n\
+                     function main(args: {string}): integer\n\
+                     \x20   print(texto.de_inteiro(1))\n    return 0\nend\n",
+                ),
+                (
+                    "titan.toml",
+                    &manifesto_de(&[
+                        ("leitura", "src/leitura.titan"),
+                        ("tabela", "src/tabela.titan"),
+                    ]),
+                ),
+            ],
+        );
+
+        let deps = deps_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
+
+        // A ordem é a topológica do grafo, e dentro de cada módulo a do
+        // fonte — determinística, para o mesmo programa gerar sempre o
+        // mesmo `Cargo.toml`. Aqui o principal não depende de ninguém, e a
+        // DFS de `grafo::ordenar` começa por ele: o `texto` dele sai antes
+        // dos órfãos `leitura` e `tabela`, que entram em ordem de
+        // declaração no manifesto.
+        assert_eq!(
+            nomes(&deps),
+            vec!["titan-runtime", "titan-texto", "titan-io", "titan-data"]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t83_programa_multi_modulo_sem_import_so_depende_do_titan_runtime() {
+        // O contrapeso: a união não pode transformar "nenhum import" em
+        // dependência nova. Três módulos, nenhum `import` de capability, e
+        // o `Cargo.toml` continua com só o `titan-runtime`.
+        let dir = projeto(
+            "t83-sem-import",
+            &[
+                ("src/a.titan", "function fa(): integer\n    return 1\nend\n"),
+                ("src/b.titan", "function fb(): integer\n    return 2\nend\n"),
+                ("src/main.titan", MAIN_VAZIA),
+                (
+                    "titan.toml",
+                    &manifesto_de(&[("a", "src/a.titan"), ("b", "src/b.titan")]),
+                ),
+            ],
+        );
+
+        let deps = deps_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
+
+        assert_eq!(nomes(&deps), vec!["titan-runtime"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t83_deps_do_arquivo_unico_seguem_vindo_do_proprio_arquivo() {
+        // O caminho que a T80 precisa preservar: sem manifesto, o grafo tem
+        // um vértice só, e percorrê-lo dá exatamente o que `collect_deps`
+        // dava quando recebia o `Program` do principal.
+        for (exemplo, esperadas) in [
+            ("hello", vec!["titan-runtime"]),
+            ("dados", vec!["titan-runtime", "titan-data"]),
+        ] {
+            let out_dir = temp_out_dir(&format!("t83-unico-{exemplo}"));
+            let caminho = examples_dir().join(format!("{exemplo}.titan"));
+
+            let deps = deps_de(&opts_de(&out_dir, None, caminho));
+
+            assert_eq!(nomes(&deps), esperadas, "deps de '{exemplo}.titan'");
+
+            let _ = std::fs::remove_dir_all(&out_dir);
+        }
+    }
+
+    #[test]
+    fn t83_build_real_de_modulo_interno_que_importa_capability() {
+        // A prova de ponta a ponta da tarefa: o `Cargo.toml` gerado tem de
+        // bastar para o cargo. `main` não importa nada; quem usa `texto` é
+        // `util`, e sem a T83 esta build falharia no rustc.
+        let dir = projeto(
+            "t83-build",
+            &[
+                (
+                    "src/util.titan",
+                    "import texto\n\
+                     function rotulo(n: integer): string\n\
+                     \x20   return texto.de_inteiro(n)\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import util\n\
+                     function main(args: {string}): integer\n\
+                     \x20   print(util.rotulo(42))\n    return 0\nend\n",
+                ),
+                ("titan.toml", &manifesto_de(&[("util", "src/util.titan")])),
+            ],
+        );
+
+        let mut opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        opts.emit_rust = false;
+
+        let binario = compile(&opts).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+
+        let toml = std::fs::read_to_string(dir.join("build/p/Cargo.toml"))
+            .expect("lê o Cargo.toml gerado");
+        assert!(
+            toml.contains("titan-texto = "),
+            "o Cargo.toml gerado precisa do 'titan-texto':\n{toml}"
+        );
+
+        let saida = executar(&binario);
+        assert_eq!(String::from_utf8_lossy(&saida.stdout), "42\n");
+        assert_eq!(saida.status.code(), Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
