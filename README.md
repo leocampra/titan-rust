@@ -425,14 +425,87 @@ abs(n: float): float` para a `abs` da libc compila e produz lixo. É o mesmo
 contrato de qualquer FFI, e é por isso que a declaração é explícita em vez de
 gerada.
 
+## Tipos soma: `enum` e `match`
+
+Um `enum` declara um tipo com variantes, cada uma com zero ou mais campos
+posicionais. Variante sem campo não leva parênteses, na declaração nem na
+construção.
+
+```lua
+enum Exp
+    ExpInteger(integer)
+    ExpBinop(string, Exp, Exp)
+end
+```
+
+**A recursão é o ponto.** `ExpBinop` carrega dois `Exp`, e é isso que faz o
+tipo servir para uma AST — a do parser do Titan escrito em Titan, inclusive.
+Em Rust esse tipo precisaria de indireção para ter tamanho finito; o
+compilador a insere sozinho, e `Box` nunca aparece no fonte Titan
+([ADR 0026](docs/adr/0026-enum-recursivo-com-box-na-emissao.md)). É a
+diferença em relação a `record`, que segue rejeitando recursão: um `enum`
+expressa a base do recursivo numa variante sem payload, um `record` não teria
+como.
+
+`match` desmonta o valor, como comando ou como expressão. Os braços ligam os
+campos a nomes locais, que só existem dentro do braço, e `_` é o curinga.
+
+```lua
+function avalia(e: Exp): integer
+    local r: integer = match e with
+        ExpInteger(n) then
+            n
+        ExpBinop(op, l, d) then
+            aplica(op, avalia(l), avalia(d))
+    end
+    return r
+end
+```
+
+> **A exaustividade é conferida pelo checker, em português.** Um `match` que
+> deixa variante de fora não compila, e a mensagem diz **quais** faltam — em
+> vez de o `rustc` reclamar em inglês sobre o `match` gerado, que o usuário não
+> escreveu. Braço duplicado, variante inexistente, variante de outro `enum` e
+> aridade errada dão erros distintos, porque levam a correções distintas. Um
+> `_` que vem **depois** de todas as variantes é **aviso**, não erro: o código
+> está correto, e o `_` é justamente o que se quer se o `enum` crescer. Já um
+> braço de variante depois do `_` é **erro** — ele jamais executa.
+
+```lua
+enum Cor
+    Vermelho
+    Verde
+    Azul
+end
+
+match c with
+    Vermelho then
+        return 0
+end
+-- erro: `match` não cobre todas as variantes de 'Cor': falta(m) Verde, Azul.
+--       Acrescente um braço para cada uma, ou um `_`.
+```
+
+Nomes de variante são **únicos no programa inteiro**: a construção
+`ExpInteger(42)` se escreve igual a uma chamada de função e não diz de que
+`enum` ela vem, então é o nome que decide. Pela mesma razão, uma variante não
+pode se chamar como uma função já declarada.
+
+Um valor de tipo soma tem semântica de valor como qualquer composto
+([ADR 0006](docs/adr/0006-semantica-de-valor-clone-na-atribuicao.md)): `local
+b = a` copia, e mutar o que um braço ligou não alcança o valor escrutinado.
+Mas ele **não** é passado por `&mut` como array/map/record — vai por valor,
+como um escalar. Duas coisas que um `enum` não faz: subir para `value` (o
+`value` guarda primitiva, array, map, record e opcional — extraia o conteúdo
+com `match` primeiro) e atravessar a fronteira de FFI.
+
 ## O que não está implementado ainda
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
 - `local m = import "data"` (a forma do original), módulos definidos pelo
   usuário (um `.titan` importando outro `.titan`).
-- Tipos soma (`enum`/`match`), parser e checker auto-hospedados (self-hosting
-  pleno, fase 5).
+- Parser e checker auto-hospedados (self-hosting pleno, fase 5).
 - `titan-crypto`, `titan-ai` (fases 3b/3c).
 
 Qualquer construção fora desse subconjunto é rejeitada pelo `checker` (ou

@@ -27,3 +27,4 @@
 | [0023](0023-continue-entra-com-o-incremento-no-topo.md) | `continue` entra na linguagem, com o mesmo desenho de `break` (supera o "não" do 0017) |
 | [0024](0024-for-in-nativo-sem-mutacao-do-container.md) | `for`-in como `for` nativo do Rust sobre `.iter()`; mutar o container durante a iteração é erro do checker; ordem de map não especificada |
 | [0025](0025-foreign-function-com-assinatura-titan.md) | `foreign function` com assinatura Titan (diverge do `foreign import` de header do original); só escalares e `string` na fronteira |
+| [0026](0026-enum-recursivo-com-box-na-emissao.md) | `enum` recursivo com `Box` inserido na emissão (revisita o 0009 para tipo soma); tipo soma clona como record mas não passa por `&mut`, e não sobe para `value` |

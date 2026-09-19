@@ -518,9 +518,8 @@ fn emit_rust_imprime_o_rust_gerado_sem_compilar() {
 /// O `_` inalcançável é o primeiro diagnóstico do checker que **não**
 /// impede a compilação (T76): sai como aviso em stderr, e não como erro.
 ///
-/// A compilação ainda para em seguida, porque a emissão de tipos soma é a
-/// T77 — mas o aviso já saiu antes, que é justamente o ponto: ele não é o
-/// que barrou o programa.
+/// Desde a T77 o programa segue até o fim e o Rust sai — o que fecha o
+/// argumento que a T76 só pôde deixar em aberto: o aviso não barra nada.
 #[test]
 fn curinga_inalcancavel_sai_como_aviso_e_nao_como_erro() {
     let out_dir = temp_dir("aviso-curinga");
@@ -564,6 +563,70 @@ fn curinga_inalcancavel_sai_como_aviso_e_nao_como_erro() {
         !stderr.contains("erro de tipo"),
         "o `_` inalcançável não é erro de tipo: {stderr}"
     );
+    assert!(
+        output.status.success(),
+        "o aviso não deveria barrar a compilação: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// O critério de aceite da T77 visto de fora, pelo binário: um `.titan` com
+/// tipo soma recursivo atravessa o pipeline inteiro e sai como Rust.
+///
+/// Usa `--emit-rust` (e não o build completo) pelo mesmo motivo dos casos de
+/// array/record da T30: o que importa aqui é o backend produzir o `enum`, o
+/// `Box` e o `match`, e a execução de verdade já é coberta pelos testes de
+/// `codegen.rs`, que compilam o gerado com o `rustc` e conferem a saída.
+#[test]
+fn emit_rust_de_enum_recursivo_sai_com_box_e_match() {
+    let out_dir = temp_dir("emit-rust-enum-recursivo");
+    let fonte = write_source(
+        &out_dir,
+        "exp.titan",
+        "enum Exp\n\
+         \x20   ExpInteger(integer)\n\
+         \x20   ExpSoma(Exp, Exp)\n\
+         end\n\
+         \n\
+         function avalia(e: Exp): integer\n\
+         \x20   local r: integer = match e with\n\
+         \x20       ExpInteger(n) then\n\
+         \x20           n\n\
+         \x20       ExpSoma(l, d) then\n\
+         \x20           avalia(l) + avalia(d)\n\
+         \x20   end\n\
+         \x20   return r\n\
+         end\n\
+         \n\
+         function main(args: {string}): integer\n\
+         \x20   print(\"soma: \" .. avalia(ExpSoma(ExpInteger(1), ExpInteger(2))))\n\
+         \x20   return 0\n\
+         end\n",
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg(&fonte)
+        .output()
+        .expect("invoca titanc --emit-rust");
+    assert_never_panics(&output);
+    assert!(
+        output.status.success(),
+        "titanc --emit-rust falhou para `enum` recursivo: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("pub enum Exp {"), "gerado: {stdout}");
+    // O `Box` dos dois campos recursivos — a armadilha central da fase.
+    assert!(
+        stdout.contains("ExpSoma(Box<Exp>, Box<Exp>)"),
+        "gerado: {stdout}"
+    );
+    assert!(stdout.contains("match &e {"), "gerado: {stdout}");
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }
@@ -1304,14 +1367,6 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         nome: "tipo_soma_construcao_com_aridade_errada",
         fonte: "enum Exp\n    ExpInteger(integer)\nend\n\nfunction main(args: {string}): integer\n    local e: Exp = ExpInteger(1, 2)\n    return 0\nend",
         trecho_esperado: "tem 1 campo(s), mas recebeu 2",
-    },
-    CasoNegativo {
-        // Tipos soma tipam desde a T76, mas a emissão (o `enum` do Rust, o
-        // `Box` dos campos recursivos e a tradução do `match`) é da T77: a
-        // recusa é do backend, em português, e não um panic.
-        nome: "tipo_soma_emissao_e_da_t77",
-        fonte: "enum Cor\n    Vermelho\n    Verde\nend\n\nfunction main(args: {string}): integer\n    local c: Cor = Vermelho\n    match c with\n        Vermelho then\n            return 0\n        Verde then\n            return 1\n    end\n    return 0\nend",
-        trecho_esperado: "a emissão de tipos soma",
     },
     CasoNegativo {
         // A sintaxe do `match` é a do PRD.md (`with` + braços `padrão then`),

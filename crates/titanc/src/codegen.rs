@@ -49,25 +49,65 @@
 //! semântica de valor de arrays/maps/records vem de clonar explicitamente na
 //! atribuição ([`precisa_clone`]), nunca de derivar `Copy`.
 
-use crate::ast::Loc;
 use crate::checker::{
     BinOp, Callee, CastKind, TypedExp, TypedExpKind, TypedForInKind, TypedLValue, TypedMultiValues,
-    TypedProgram, TypedStat, TypedThen, TypedTopLevel, UnOp,
+    TypedMatchArm, TypedPattern, TypedProgram, TypedStat, TypedThen, TypedTopLevel, UnOp,
 };
 use crate::types::Type;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const INDENT: &str = "    ";
 
-/// Nomes de parâmetro composto (`array`/`map`/`record`) da função **atual**
-/// — dentro do corpo, esses nomes já são uma referência Rust (`&mut T`,
-/// [`rust_param_type_name`]), então emprestá-los de novo (`&x`/`&mut x`)
-/// duplicaria a referência (`&mut &mut Vec<_>`) e o rustc recusaria o
-/// reborrow sem `mut` na ligação. Toda função de emissão que decide entre
-/// "nome cru" e "nome emprestado" (T30) recebe este conjunto para saber
-/// distinguir os dois casos; variável local composta não entra aqui — ela é
-/// dona do valor e precisa do empréstimo normal.
-type Ctx<'a> = &'a HashSet<String>;
+/// O que toda função de emissão precisa saber sobre o **contexto** em que
+/// escreve, além da própria expressão: os parâmetros compostos da função
+/// atual e o mapa de campos encaixotados dos enums do programa.
+///
+/// Era só o conjunto de parâmetros compostos até a T77; virou struct quando
+/// a emissão de tipos soma passou a precisar, no mesmo ponto, de saber quais
+/// campos de variante saem `Box<T>` — a alternativa seria um segundo
+/// parâmetro em trinta assinaturas.
+struct EmitCtx {
+    /// Nomes de parâmetro composto (`array`/`map`/`record`) da função
+    /// **atual** — dentro do corpo, esses nomes já são uma referência Rust
+    /// (`&mut T`, [`rust_param_type_name`]), então emprestá-los de novo
+    /// (`&x`/`&mut x`) duplicaria a referência (`&mut &mut Vec<_>`) e o
+    /// rustc recusaria o reborrow sem `mut` na ligação. Toda função de
+    /// emissão que decide entre "nome cru" e "nome emprestado" (T30) consulta
+    /// este conjunto para saber distinguir os dois casos; variável local
+    /// composta não entra aqui — ela é dona do valor e precisa do empréstimo
+    /// normal.
+    params: HashSet<String>,
+    /// Campos de variante que saem `Box<T>` (T77) — ver [`campos_boxeados`].
+    /// Vale para o programa inteiro, não só para a função atual: a decisão é
+    /// da **declaração** do enum, e construção e padrão precisam concordar
+    /// com ela em qualquer função.
+    boxed: BoxedFields,
+}
+
+impl EmitCtx {
+    /// Atalho de leitura para os nomes de parâmetro composto, que é como os
+    /// três pontos de decisão de empréstimo (T30) sempre consultaram o
+    /// contexto.
+    fn e_parametro_composto(&self, name: &str) -> bool {
+        self.params.contains(name)
+    }
+
+    /// `true` se o campo de índice `field` da variante `variant` sai
+    /// `Box<T>` na declaração do enum.
+    fn e_boxeado(&self, variant: &str, field: usize) -> bool {
+        self.boxed.contains(&(variant.to_string(), field))
+    }
+}
+
+type Ctx<'a> = &'a EmitCtx;
+
+/// Quais campos de variante saem `Box<T>` no `enum` do Rust, identificados
+/// por `(nome da variante, índice do campo)`.
+///
+/// A variante basta como chave sem o nome do enum: o checker (T76) exige que
+/// nomes de variante sejam **únicos no programa inteiro**, justamente porque
+/// a construção `ExpInteger(42)` não diz de que enum ela vem.
+type BoxedFields = HashSet<(String, usize)>;
 
 /// Uma construção que o checker já tipa, mas que este backend ainda não sabe
 /// emitir. Nunca indica erro do programa Titan em si (o checker já validou
@@ -85,137 +125,136 @@ impl std::fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-/// A guarda que separa a T76 da T77: devolve o erro se o programa tipado
-/// usa tipo soma em qualquer forma — declaração de `enum`, construção de
-/// variante ou `match`.
+/// Decide quais campos de variante saem `Box<T>` no `enum` do Rust — **a
+/// armadilha central da fase** (PRD.md, T77).
 ///
-/// Existe para que a emissão não precise de um braço "isto não deveria
-/// acontecer" que **poderia** acontecer. Some inteira na T77, junto com os
-/// `unreachable!` que ela protege.
-fn enum_ainda_nao_emitido(program: &TypedProgram) -> Option<CodegenError> {
-    fn erro(loc: Loc, o_que: &str) -> CodegenError {
-        CodegenError(format!(
-            "linha {}, coluna {}: {o_que} já tipa, mas a emissão de tipos soma \
-             (o `enum` do Rust, o `Box` dos campos recursivos e a tradução do \
-             `match`) entra na T77.",
-            loc.line, loc.col
-        ))
-    }
-
-    fn em_stat(stat: &TypedStat) -> Option<CodegenError> {
-        match stat {
-            TypedStat::Match { loc, .. } => Some(erro(*loc, "`match`")),
-            TypedStat::Block { stats, .. } => stats.iter().find_map(em_stat),
-            TypedStat::Decl { value, .. } => em_exp(value),
-            TypedStat::DeclMulti { values, .. } | TypedStat::AssignMulti { values, .. } => {
-                em_multi(values)
+/// Um `enum Exp` com um campo do próprio `Exp` seria, em Rust, um tipo de
+/// tamanho infinito, e o rustc o recusaria em inglês ("recursive type has
+/// infinite size") sobre código que o usuário não escreveu. O `Box` quebra o
+/// ciclo, e quem o insere é este backend — de propósito, e não por acidente:
+/// ao contrário de `checker.rs` (que detecta ciclo de record **para
+/// rejeitar**), aqui o ciclo é detectado **para ser suportado** (decisão
+/// técnica 6 do PRD.md).
+///
+/// A regra é "alcança o próprio enum sem passar por indireção": o campo é
+/// encaixotado se, andando pelos tipos que ficam **embutidos** no valor
+/// (outro `enum` pelo nome, os campos de um `record`), chega-se ao enum sendo
+/// declarado.
+///
+/// Os três tipos que **param** a busca são justamente os que já carregam a
+/// indireção de graça: `{Exp}` é `Vec<Exp>`, `{string: Exp}` é
+/// `HashMap<String, Exp>` e `Exp?` é `Option<Exp>` — o primeiro põe os
+/// elementos no heap, o segundo também, e o terceiro tem o tamanho do maior
+/// braço, que já é finito porque o `Exp` de dentro é o mesmo que estamos
+/// dimensionando. Encaixotar um deles compilaria e só acrescentaria uma
+/// alocação por valor.
+///
+/// A travessia atravessa `Sum` **pelo nome**, consultando a tabela do
+/// programa, e não pelas variantes embutidas no próprio tipo: um `Sum`
+/// aninhado chega do checker como placeholder de variantes vazias
+/// (`collect_enum_names`), então recursão mútua (`enum A AB(B) end` +
+/// `enum B BA(A) end`) só é visível pela tabela. Um `record`, ao contrário,
+/// chega com os campos resolvidos, e por isso o ciclo indireto
+/// `enum Exp ExpNo(Caixa) end` + `record Caixa e: Exp end` — que a checagem
+/// de ciclo de record não vê, porque `Exp` não é um record — é encontrado
+/// aqui.
+fn campos_boxeados(program: &TypedProgram) -> BoxedFields {
+    let enums: HashMap<&str, &[(String, Vec<Type>)]> = program
+        .iter()
+        .filter_map(|top| match top {
+            TypedTopLevel::Enum { name, variants, .. } => {
+                Some((name.as_str(), variants.as_slice()))
             }
-            TypedStat::Assign { value, .. } => em_exp(value),
-            TypedStat::Call { call, .. } => em_exp(call),
-            TypedStat::Return { exps, .. } => exps.iter().find_map(em_exp),
-            TypedStat::If {
-                thens, elsestat, ..
-            } => thens
-                .iter()
-                .find_map(|t| em_exp(&t.condition).or_else(|| em_stat(&t.block)))
-                .or_else(|| elsestat.as_deref().and_then(em_stat)),
-            TypedStat::While {
-                condition, block, ..
-            }
-            | TypedStat::Repeat {
-                condition, block, ..
-            } => em_exp(condition).or_else(|| em_stat(block)),
-            TypedStat::For {
-                start,
-                finish,
-                inc,
-                block,
-                ..
-            } => em_exp(start)
-                .or_else(|| em_exp(finish))
-                .or_else(|| em_exp(inc))
-                .or_else(|| em_stat(block)),
-            TypedStat::ForIn {
-                container, block, ..
-            } => em_exp(container).or_else(|| em_stat(block)),
-            TypedStat::Break { .. } | TypedStat::Continue { .. } => None,
-        }
-    }
+            _ => None,
+        })
+        .collect();
 
-    fn em_multi(values: &TypedMultiValues) -> Option<CodegenError> {
-        match values {
-            TypedMultiValues::Call(exp) => em_exp(exp),
-            TypedMultiValues::List(exps) => exps.iter().find_map(em_exp),
-        }
-    }
-
-    fn em_exp(exp: &TypedExp) -> Option<CodegenError> {
-        match &exp.kind {
-            TypedExpKind::VariantLit { variant, .. } => {
-                Some(erro(exp.loc, &format!("a construção de '{variant}'")))
-            }
-            TypedExpKind::Match { .. } => Some(erro(exp.loc, "`match`")),
-            TypedExpKind::Call { callee, args } => {
-                let recv = match callee {
-                    Callee::Method { recv, .. } => em_exp(recv),
-                    _ => None,
+    /// `true` se um valor de `ty` contém um `alvo` **embutido** — o que, em
+    /// Rust, faria o tamanho de um depender do tamanho do outro.
+    ///
+    /// `visitados` guarda os enums já abertos, e é o que faz a travessia
+    /// terminar em **todo** ciclo: o de dois enums mútuos, e também o que
+    /// passa por record (`record A e: E end` + `record B a: A end` +
+    /// `enum E EB(B) EA(A) end`), porque todo ciclo que chega aqui tem de
+    /// atravessar ao menos um `enum` — ciclo só de records o checker já
+    /// rejeitou ("o record ... é recursivo"), e é por isso que o braço de
+    /// `Record` não precisa de guarda própria.
+    fn alcanca(
+        ty: &Type,
+        alvo: &str,
+        enums: &HashMap<&str, &[(String, Vec<Type>)]>,
+        visitados: &mut HashSet<String>,
+    ) -> bool {
+        match ty {
+            Type::Sum { name, .. } => {
+                if name == alvo {
+                    return true;
+                }
+                if !visitados.insert(name.clone()) {
+                    return false;
+                }
+                let Some(variants) = enums.get(name.as_str()) else {
+                    return false;
                 };
-                recv.or_else(|| args.iter().find_map(em_exp))
+                variants
+                    .iter()
+                    .flat_map(|(_, fields)| fields)
+                    .any(|f| alcanca(f, alvo, enums, visitados))
             }
-            TypedExpKind::Concat(exps) | TypedExpKind::ArrayLit(exps) => {
-                exps.iter().find_map(em_exp)
-            }
-            TypedExpKind::Binop { lhs, rhs, .. } => em_exp(lhs).or_else(|| em_exp(rhs)),
-            TypedExpKind::Index { base, index } => em_exp(base).or_else(|| em_exp(index)),
-            TypedExpKind::Field { base, .. } => em_exp(base),
-            TypedExpKind::RecordLit { fields, .. } => fields.iter().find_map(|(_, e)| em_exp(e)),
-            TypedExpKind::MapLit(entries) => entries
+            Type::Record { fields, .. } => fields
                 .iter()
-                .find_map(|(k, v)| em_exp(k).or_else(|| em_exp(v))),
-            TypedExpKind::Unop { exp, .. }
-            | TypedExpKind::Adjust(exp)
-            | TypedExpKind::Extra { exp, .. }
-            | TypedExpKind::SomeOf(exp)
-            | TypedExpKind::Cast { exp, .. } => em_exp(exp),
-            TypedExpKind::Nil
-            | TypedExpKind::Bool(_)
-            | TypedExpKind::Integer(_)
-            | TypedExpKind::Float(_)
-            | TypedExpKind::String(_)
-            | TypedExpKind::Var(_) => None,
+                .any(|(_, f)| alcanca(f, alvo, enums, visitados)),
+            // Indireção: o tamanho do container não depende do tamanho do
+            // que ele guarda.
+            Type::Array { .. } | Type::Map { .. } | Type::Option { .. } => false,
+            _ => false,
         }
     }
 
-    program.iter().find_map(|top| match top {
-        TypedTopLevel::Enum { loc, name, .. } => Some(erro(*loc, &format!("o enum '{name}'"))),
-        TypedTopLevel::Func { body, .. } => em_stat(body),
-        TypedTopLevel::Record { .. } | TypedTopLevel::ForeignFunc { .. } => None,
-    })
+    let mut boxed = BoxedFields::new();
+    for (enum_name, variants) in &enums {
+        for (variant, fields) in variants.iter() {
+            for (i, field) in fields.iter().enumerate() {
+                let mut visitados = HashSet::new();
+                if alcanca(field, enum_name, &enums, &mut visitados) {
+                    boxed.insert((variant.clone(), i));
+                }
+            }
+        }
+    }
+    boxed
 }
 
 /// Gera o `main.rs` completo (structs de record + funções do programa + shim
 /// de entrada) a partir da AST tipada.
 ///
-/// Records saem primeiro, num laço à parte — nenhuma função os referencia
-/// antes de todos estarem declarados, mas manter a ordem "tipos antes de
-/// funções" é convenção usual do Rust gerado.
+/// Records e enums saem primeiro, num laço à parte — nenhuma função os
+/// referencia antes de todos estarem declarados, mas manter a ordem "tipos
+/// antes de funções" é convenção usual do Rust gerado. Entre os dois a ordem
+/// não importa: no Rust, um item pode referenciar outro declarado adiante.
 pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
-    // Tipos soma (T76) tipam, mas ainda não são emitidos: o `enum` do Rust,
-    // o `Box` automático dos campos recursivos e a tradução do `match` são a
-    // T77. Recusar aqui — uma vez, com a razão em português — é o que
-    // mantém a promessa de "nunca panic" enquanto as duas tarefas não se
-    // encontram: sem esta guarda, os braços de `emit_stat`/`emit_exp`
-    // seriam alcançáveis, e um programa que passou no checker abortaria no
-    // backend.
-    if let Some(erro) = enum_ainda_nao_emitido(program) {
-        return Err(erro);
-    }
+    // O mapa de campos encaixotados (T77) é calculado **uma vez**, sobre o
+    // programa inteiro, e vale para toda a emissão: a declaração do `enum`, a
+    // construção de variante e o padrão do `match` têm de concordar sobre
+    // quais campos são `Box<T>`, e a única forma de não divergirem é os três
+    // lerem a mesma resposta.
+    let ctx = EmitCtx {
+        params: HashSet::new(),
+        boxed: campos_boxeados(program),
+    };
 
     let mut out = String::new();
 
     for top in program {
         if let TypedTopLevel::Record { name, fields, .. } = top {
             emit_record_struct(&mut out, name, fields);
+            out.push('\n');
+        }
+    }
+
+    for top in program {
+        if let TypedTopLevel::Enum { name, variants, .. } = top {
+            emit_enum(&mut out, name, variants, &ctx);
             out.push('\n');
         }
     }
@@ -239,7 +278,7 @@ pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
 
     for top in program {
         if matches!(top, TypedTopLevel::Func { .. }) {
-            emit_toplevel(&mut out, top);
+            emit_toplevel(&mut out, top, &ctx.boxed);
             out.push('\n');
         }
     }
@@ -267,6 +306,48 @@ fn emit_record_struct(out: &mut String, name: &str, fields: &[(String, Type)]) {
         out.push_str(",\n");
     }
     out.push_str("}\n");
+}
+
+/// `enum Nome Variante(Tipo, ..) .. end` → o `enum` do Rust (T77), no molde
+/// de [`emit_record_struct`]: mesmos `derive`, mesmo namespace de tipos sem
+/// mangling (ADR 0009).
+///
+/// A diferença que dá nome à tarefa é o `Box`: campo cujo tipo alcança o
+/// próprio enum sai `Box<T>`, pela decisão que [`campos_boxeados`] tomou uma
+/// vez para o programa inteiro. Variante sem campo sai sem parênteses
+/// (`Vermelho`, não `Vermelho()`) — o segundo compilaria, mas o padrão
+/// `Cor::Vermelho` do `match` não casaria com ele.
+fn emit_enum(out: &mut String, name: &str, variants: &[(String, Vec<Type>)], ctx: Ctx) {
+    out.push_str("#[derive(Clone, Debug, PartialEq)]\n");
+    out.push_str("pub enum ");
+    out.push_str(name);
+    out.push_str(" {\n");
+    for (vname, fields) in variants {
+        out.push_str(INDENT);
+        out.push_str(vname);
+        if !fields.is_empty() {
+            let tipos: Vec<String> = fields
+                .iter()
+                .enumerate()
+                .map(|(i, fty)| rust_field_type_name(fty, ctx.e_boxeado(vname, i)))
+                .collect();
+            out.push('(');
+            out.push_str(&tipos.join(", "));
+            out.push(')');
+        }
+        out.push_str(",\n");
+    }
+    out.push_str("}\n");
+}
+
+/// Tipo Rust de um campo de variante: [`rust_type_name`], envolvido em
+/// `Box<..>` quando o campo foi encaixotado (T77).
+fn rust_field_type_name(ty: &Type, boxeado: bool) -> String {
+    if boxeado {
+        format!("Box<{}>", rust_type_name(ty))
+    } else {
+        rust_type_name(ty)
+    }
 }
 
 /// `foreign function abs(n: integer): integer` (T73) → o bloco `extern "C"`
@@ -357,7 +438,7 @@ fn mangle_fn_name(name: &str) -> String {
     format!("titan_{name}")
 }
 
-fn emit_toplevel(out: &mut String, top: &TypedTopLevel) {
+fn emit_toplevel(out: &mut String, top: &TypedTopLevel, boxed: &BoxedFields) {
     let TypedTopLevel::Func {
         islocal,
         name,
@@ -403,12 +484,17 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel) {
 
     // Parâmetros compostos já chegam como `&mut T` (`rust_param_type_name`)
     // — dentro do corpo, o nome é uma referência, não um valor dono. `ctx`
-    // carrega essa lista para toda a emissão do corpo saber a diferença.
-    let ctx: HashSet<String> = params
-        .iter()
-        .filter(|(_, ty)| is_composite(ty))
-        .map(|(name, _)| name.clone())
-        .collect();
+    // carrega essa lista para toda a emissão do corpo saber a diferença, ao
+    // lado do mapa de campos encaixotados (T77), que é do programa e não
+    // desta função.
+    let ctx = EmitCtx {
+        params: params
+            .iter()
+            .filter(|(_, ty)| is_composite(ty))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        boxed: boxed.clone(),
+    };
 
     out.push_str(" {\n");
     emit_block_stats(out, body, 1, &ctx);
@@ -1175,11 +1261,31 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             indent(out, depth);
             out.push_str("continue;\n");
         }
-        // T76/T77: `enum_ainda_nao_emitido` recusa o programa inteiro antes
-        // de qualquer emissão, então este braço não é alcançável enquanto a
-        // T77 não o substituir pela tradução de verdade.
-        TypedStat::Match { .. } => {
-            unreachable!("`match` ainda não é emitido — `generate` recusa o programa antes (T77)")
+        // `match e with ... end` (T77) → o `match` do Rust. O escrutinado sai
+        // **emprestado** (`match &e { .. }`), e não por valor: com valor, um
+        // padrão que liga campos moveria o escrutinado para dentro do braço, e
+        // `local a: Cor = Vermelho; local b: Cor = a; match a with` — que o
+        // checker aceita — deixaria de compilar por E0382 sobre código que o
+        // usuário não escreveu. Emprestar faz cada campo ligado chegar como
+        // referência, e [`emit_arm_bindings`] os traz de volta para valor com
+        // a mesma regra do `for`-in (ADR 0006): clone para quem tem buffer
+        // próprio, deref para escalar.
+        TypedStat::Match { exp, arms, .. } => {
+            indent(out, depth);
+            out.push_str("match &");
+            out.push_str(&emit_exp(exp, ctx));
+            out.push_str(" {\n");
+            for arm in arms {
+                indent(out, depth + 1);
+                out.push_str(&emit_pattern(&arm.pattern, &arm.body));
+                out.push_str(" => {\n");
+                emit_arm_bindings(out, &arm.pattern, &arm.body, depth + 2, ctx);
+                emit_block_stats(out, &arm.body, depth + 2, ctx);
+                indent(out, depth + 1);
+                out.push_str("}\n");
+            }
+            indent(out, depth);
+            out.push_str("}\n");
         }
     }
 }
@@ -1216,7 +1322,7 @@ fn emit_forin_binding(
     } else {
         "let"
     };
-    if is_composite(ty) || *ty == Type::String {
+    if valor_com_buffer_proprio(ty) || *ty == Type::String {
         out.push_str(&format!("{bind} {name}: {rust_ty} = {interno}.clone();\n"));
     } else {
         out.push_str(&format!("{bind} {name}: {rust_ty} = *{interno};\n"));
@@ -1233,6 +1339,194 @@ fn forin_pattern(name: &str, usado: bool) -> String {
     } else {
         "_".to_string()
     }
+}
+
+/// Padrão Rust de um braço de `match` (T77): `Enum::Variante(a, b)` ou `_`.
+///
+/// O nome de um campo que o corpo nunca usa sai como `_`, e não como o nome
+/// ligado: o escrutinado é emprestado, então a ligação não é descartável de
+/// graça — um nome sem uso dispararia `unused_variables`, e o critério da
+/// tarefa é Rust gerado **sem warnings**. O `_` no padrão também dispensa
+/// [`emit_arm_bindings`] de emitir a ligação correspondente, e as duas
+/// decisões usam a mesma pergunta ([`campo_usado`]) para não divergirem.
+fn emit_pattern(pattern: &TypedPattern, body: &impl UsaNome) -> String {
+    let TypedPattern::Variant {
+        enum_name,
+        name,
+        fields,
+        ..
+    } = pattern
+    else {
+        return "_".to_string();
+    };
+    if fields.is_empty() {
+        return format!("{enum_name}::{name}");
+    }
+    let ligados: Vec<String> = fields
+        .iter()
+        .map(|(fname, _)| {
+            if campo_usado(fname, body) {
+                format!("{}{fname}", PREFIXO_CAMPO)
+            } else {
+                "_".to_string()
+            }
+        })
+        .collect();
+    format!("{enum_name}::{name}({})", ligados.join(", "))
+}
+
+/// Prefixo do nome que o **padrão** liga, para o `let` de
+/// [`emit_arm_bindings`] poder dar ao usuário o nome sem prefixo sem
+/// sombrear a si mesmo no próprio inicializador. Mesmo papel que o
+/// `titan_forin_` do `for`-in (T71).
+const PREFIXO_CAMPO: &str = "titan_match_";
+
+/// Traz cada campo ligado pelo padrão de referência para valor, no topo do
+/// braço (T77) — o análogo de [`emit_forin_binding`], e pela mesma razão: o
+/// escrutinado é emprestado, mas em Titan o nome ligado é um valor comum
+/// (ADR 0006), que o corpo pode passar adiante e cujo container não deve
+/// enxergar mutação.
+///
+/// Composto e `string` clonam; escalar desreferencia. Campo **encaixotado**
+/// (T77) chega como `&Box<T>` e precisa de um deref a mais — `(**b).clone()`
+/// para o enum recursivo, que é o caso central da tarefa.
+fn emit_arm_bindings(
+    out: &mut String,
+    pattern: &TypedPattern,
+    body: &impl UsaNome,
+    depth: usize,
+    ctx: Ctx,
+) {
+    let TypedPattern::Variant { name, fields, .. } = pattern else {
+        return;
+    };
+    for (i, (fname, fty)) in fields.iter().enumerate() {
+        if !campo_usado(fname, body) {
+            continue;
+        }
+        let interno = format!("{PREFIXO_CAMPO}{fname}");
+        // `let mut` só quando o corpo escreve **através** do nome
+        // (`p.campo = 9` sobre um campo record): atribuir ao nome inteiro é
+        // proibido pelo checker, que trata o ligado como parâmetro. Sem a
+        // pergunta, todo campo composto sairia `mut` e o `unused_mut` do
+        // rustc reclamaria.
+        let bind = if body.escreve_atraves_de(fname) {
+            "let mut"
+        } else {
+            "let"
+        };
+        let rust_ty = rust_type_name(fty);
+        let boxeado = ctx.e_boxeado(name, i);
+        let valor = if valor_com_buffer_proprio(fty) || *fty == Type::String {
+            // Um deref a mais no encaixotado: o padrão ligou `&Box<T>`, e
+            // `interno.clone()` cru daria um `Box<T>` onde se espera `T`.
+            if boxeado {
+                format!("(**{interno}).clone()")
+            } else {
+                format!("{interno}.clone()")
+            }
+        } else if boxeado {
+            format!("**{interno}")
+        } else {
+            format!("*{interno}")
+        };
+        indent(out, depth);
+        out.push_str(&format!("{bind} {fname}: {rust_ty} = {valor};\n"));
+    }
+}
+
+/// `true` se o corpo do braço lê o nome ligado, ou escreve através dele.
+fn campo_usado(nome: &str, body: &impl UsaNome) -> bool {
+    body.le(nome) || body.escreve_atraves_de(nome)
+}
+
+/// O que a emissão de um braço precisa perguntar ao seu corpo, que é um
+/// [`TypedStat`] no `match`-comando e um [`TypedExp`] no `match`-expressão
+/// (T77). Trait em vez de dois pares de funções porque as perguntas são as
+/// mesmas e as respostas vêm das mesmas travessias já existentes.
+trait UsaNome {
+    /// O corpo lê o nome em alguma expressão.
+    fn le(&self, nome: &str) -> bool;
+    /// O corpo escreve **através** do nome (`p.campo = 9`, `xs[1] = 9`) — o
+    /// que exige `let mut` na ligação. Atribuir ao nome inteiro não entra:
+    /// o checker o trata como parâmetro e já recusou.
+    fn escreve_atraves_de(&self, nome: &str) -> bool;
+}
+
+impl UsaNome for TypedStat {
+    fn le(&self, nome: &str) -> bool {
+        referenced_names(self).contains(nome)
+    }
+
+    fn escreve_atraves_de(&self, nome: &str) -> bool {
+        escreve_atraves_no_stat(self, nome)
+    }
+}
+
+impl UsaNome for TypedExp {
+    fn le(&self, nome: &str) -> bool {
+        let mut names = HashSet::new();
+        collect_referenced_names_exp(self, &mut names);
+        names.contains(nome)
+    }
+
+    /// Uma expressão não contém atribuição em Titan — não há `=` dentro de
+    /// expressão nesta linguagem —, então nada escreve através de nome
+    /// nenhum no corpo de um braço de `match`-expressão.
+    fn escreve_atraves_de(&self, _nome: &str) -> bool {
+        false
+    }
+}
+
+/// Alguma atribuição no comando escreve **através** de `nome` — isto é, o
+/// alvo é `nome[i]` ou `nome.campo` (em qualquer profundidade), e não `nome`
+/// inteiro.
+fn escreve_atraves_no_stat(stat: &TypedStat, nome: &str) -> bool {
+    fn raiz_e_o_nome(target: &TypedLValue, nome: &str) -> bool {
+        match target {
+            // Atribuição ao nome inteiro não é escrita *através* dele.
+            TypedLValue::Name(_) => false,
+            TypedLValue::Index { base, .. } | TypedLValue::Field { base, .. } => {
+                raiz_de_exp(base) == Some(nome)
+            }
+        }
+    }
+    fn raiz_de_exp(exp: &TypedExp) -> Option<&str> {
+        match &exp.kind {
+            TypedExpKind::Var(n) => Some(n.as_str()),
+            TypedExpKind::Index { base, .. } | TypedExpKind::Field { base, .. } => {
+                raiz_de_exp(base)
+            }
+            _ => None,
+        }
+    }
+    fn no_stat(stat: &TypedStat, nome: &str) -> bool {
+        match stat {
+            TypedStat::Block { stats, .. } => stats.iter().any(|s| no_stat(s, nome)),
+            TypedStat::Assign { target, .. } => raiz_e_o_nome(target, nome),
+            TypedStat::AssignMulti { targets, .. } => {
+                targets.iter().any(|t| raiz_e_o_nome(t, nome))
+            }
+            TypedStat::If {
+                thens, elsestat, ..
+            } => {
+                thens.iter().any(|t| no_stat(&t.block, nome))
+                    || elsestat.as_ref().is_some_and(|e| no_stat(e, nome))
+            }
+            TypedStat::While { block, .. }
+            | TypedStat::Repeat { block, .. }
+            | TypedStat::For { block, .. }
+            | TypedStat::ForIn { block, .. } => no_stat(block, nome),
+            TypedStat::Match { arms, .. } => arms.iter().any(|arm| no_stat(&arm.body, nome)),
+            TypedStat::Decl { .. }
+            | TypedStat::DeclMulti { .. }
+            | TypedStat::Call { .. }
+            | TypedStat::Return { .. }
+            | TypedStat::Break { .. }
+            | TypedStat::Continue { .. } => false,
+        }
+    }
+    no_stat(stat, nome)
 }
 
 /// Escreve `valor` — texto Rust **já emitido** — no lugar designado por
@@ -1381,14 +1675,18 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         // o `Option`, justamente para a decisão cair aqui. O `nil` do tipo
         // `nil` — o retorno vazio, o valor de um `Decl` sem tipo opcional —
         // continua `()` como sempre foi.
-        // T76/T77: mesma razão do braço de `TypedStat::Match` em
-        // `emit_stat` — `generate` já recusou.
-        TypedExpKind::VariantLit { variant, .. } => unreachable!(
-            "a construção de '{variant}' ainda não é emitida — `generate` recusa o programa antes (T77)"
-        ),
-        TypedExpKind::Match { .. } => {
-            unreachable!("`match` ainda não é emitido — `generate` recusa o programa antes (T77)")
-        }
+        // Construção de variante (T77) → `Enum::Variante(args)`.
+        TypedExpKind::VariantLit {
+            enum_name,
+            variant,
+            args,
+        } => emit_variant_lit(enum_name, variant, args, ctx),
+        // `match` como expressão (T77) → o `match` do Rust, que já é uma
+        // expressão — nenhum temporário, nenhum bloco em volta.
+        TypedExpKind::Match {
+            exp: scrutinee,
+            arms,
+        } => emit_match_exp(scrutinee, arms, true, ctx),
         TypedExpKind::Nil if matches!(exp.ty, Type::Option { .. }) => "None".to_string(),
         TypedExpKind::Nil => "()".to_string(),
         TypedExpKind::Bool(v) => v.to_string(),
@@ -1454,6 +1752,14 @@ fn emit_delimited_exp(exp: &TypedExp, ctx: Ctx) -> String {
         // dispensa os parênteses externos — o `unused_parens` do rustc
         // reclamaria deles.
         TypedExpKind::Cast { kind, exp: inner } => emit_cast(*kind, inner, &exp.ty, ctx),
+        // `match` como expressão (T77), pela mesma razão do `Cast`: em
+        // posição delimitada os parênteses que [`emit_match_exp`] põe viram
+        // `unused_parens`. Em posição de operando eles são obrigatórios, e é
+        // lá que `emit_exp` os mantém.
+        TypedExpKind::Match {
+            exp: scrutinee,
+            arms,
+        } => emit_match_exp(scrutinee, arms, false, ctx),
         _ => emit_exp(exp, ctx),
     }
 }
@@ -1496,11 +1802,25 @@ fn precisa_clone(exp: &TypedExp) -> bool {
 fn emit_slot_value(slot_ty: &Type, value: &TypedExp, ctx: Ctx) -> String {
     if *slot_ty == Type::String {
         emit_owned_string(value, ctx)
-    } else if is_composite(slot_ty) && precisa_clone(value) {
+    } else if valor_com_buffer_proprio(slot_ty) && precisa_clone(value) {
         format!("{}.clone()", emit_exp(value, ctx))
     } else {
         emit_delimited_exp(value, ctx)
     }
+}
+
+/// Tipos que caem na regra de clone do ADR 0006: os compostos de
+/// [`is_composite`] **mais** os tipos soma (T77).
+///
+/// Um `enum` não entra em [`is_composite`], e de propósito: `is_composite`
+/// responde "sai por `&mut` em posição de parâmetro" (ADR 0007), e um valor de
+/// tipo soma sai por valor — o checker já tipa a chamada assim, e um `Exp`
+/// recursivo é um `Box` no bolso, não uma `Vec` para mutar no lugar. Mas ele
+/// é dono de buffer próprio como qualquer record, então `local b: Exp = a`
+/// tem de clonar, ou o Rust moveria `a` e a semântica de valor do Titan
+/// deixaria de valer para exatamente um tipo.
+fn valor_com_buffer_proprio(ty: &Type) -> bool {
+    is_composite(ty) || matches!(ty, Type::Sum { .. })
 }
 
 /// `true` para os tipos que este backend passa por `&mut` em posição de
@@ -1529,7 +1849,7 @@ fn is_composite(ty: &Type) -> bool {
 /// duplicaria a referência.
 fn borrow_composite(exp: &TypedExp, ctx: Ctx) -> String {
     match &exp.kind {
-        TypedExpKind::Var(name) if ctx.contains(name) => name.clone(),
+        TypedExpKind::Var(name) if ctx.e_parametro_composto(name) => name.clone(),
         _ => format!("&{}", emit_exp(exp, ctx)),
     }
 }
@@ -1548,7 +1868,7 @@ fn borrow_composite(exp: &TypedExp, ctx: Ctx) -> String {
 /// de verdade) sempre que `base` é ele mesmo um composto indexado/aninhado.
 fn emit_place_mut(exp: &TypedExp, ctx: Ctx) -> String {
     if let TypedExpKind::Var(name) = &exp.kind
-        && ctx.contains(name)
+        && ctx.e_parametro_composto(name)
     {
         // Parâmetro composto: o nome cru já é `&mut T` — devolvê-lo direto
         // (em vez de `&mut *nome`) evita um reborrow textual que o rustc
@@ -1579,7 +1899,7 @@ fn emit_place_expr(exp: &TypedExp, ctx: Ctx) -> String {
         // maior que `*` prefixo em Rust) — o mesmo bug corrigido no braço
         // `Index` logo abaixo, só que aqui é alcançável mesmo sem `Index`
         // na cadeia (`f(xs: {Ponto})` com `xs.x = 9` no corpo).
-        TypedExpKind::Var(name) if ctx.contains(name) => format!("(*{name})"),
+        TypedExpKind::Var(name) if ctx.e_parametro_composto(name) => format!("(*{name})"),
         // Local dona (array/map/record): o próprio nome já é o lugar.
         TypedExpKind::Var(_) => emit_exp(exp, ctx),
         // `p.campo` onde `campo` é composto: o lugar de `base` seguido do
@@ -2111,13 +2431,19 @@ fn emit_call(callee: &Callee, args: &[TypedExp], ret: &Type, ctx: Ctx) -> String
             }
             let rendered_args: Vec<String> = args
                 .iter()
+                // Um argumento de tipo soma (T77) segue por **valor**, como
+                // escalar, mas é dono de buffer próprio como record: sem o
+                // `.clone()`, `tinge(c) + tinge(c)` moveria `c` na primeira
+                // chamada e o rustc recusaria a segunda em inglês. É
+                // `emit_slot_value` quem já sabe essa regra — o parâmetro é
+                // um slot como qualquer outro.
                 .map(|a| {
                     if a.ty == Type::String {
                         emit_owned_string(a, ctx)
                     } else if is_composite(&a.ty) {
                         emit_place_mut(a, ctx)
                     } else {
-                        emit_delimited_exp(a, ctx)
+                        emit_slot_value(&a.ty, a, ctx)
                     }
                 })
                 .collect();
@@ -2238,7 +2564,10 @@ fn emit_args_by_param(args: &[TypedExp], params: &[Type], ctx: Ctx) -> Vec<Strin
         .map(|(a, p)| match p {
             Type::String => borrow_runtime_str(a, ctx),
             p if is_composite(p) => emit_place_mut(a, ctx),
-            _ => emit_delimited_exp(a, ctx),
+            // Tipo soma (T77) cai na regra de slot, que clona a fonte que
+            // sobrevive à chamada — nenhum builtin/capability de hoje recebe
+            // um `enum`, mas a assinatura é quem manda, não a lista atual.
+            p => emit_slot_value(p, a, ctx),
         })
         .collect()
 }
@@ -2302,6 +2631,79 @@ fn emit_record_lit(type_name: &str, fields: &[(String, TypedExp)], ctx: Ctx) -> 
     format!("{type_name} {{ {} }}", rendered.join(", "))
 }
 
+/// `ExpInteger(42)` como construção de variante (T77) →
+/// `Exp::ExpInteger(42)`, e `Vermelho` sem campo → `Cor::Vermelho`, sem
+/// parênteses, como a declaração de [`emit_enum`] os escreveu.
+///
+/// Cada argumento passa pela regra de slot do **campo** (`emit_slot_value`),
+/// e não pela do próprio argumento: é o campo que define se a variante fica
+/// dona de uma `String`/composto ou não, exatamente como em
+/// [`emit_record_lit`]. O campo encaixotado ganha o `Box::new` por fora — e
+/// é aqui que o `Box` da declaração se paga: `ExpBinop("+", a, b)` aloca os
+/// dois operandos e o valor resultante tem tamanho finito.
+fn emit_variant_lit(enum_name: &str, variant: &str, args: &[TypedExp], ctx: Ctx) -> String {
+    if args.is_empty() {
+        return format!("{enum_name}::{variant}");
+    }
+    let rendered: Vec<String> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let valor = emit_slot_value(&a.ty, a, ctx);
+            if ctx.e_boxeado(variant, i) {
+                format!("Box::new({valor})")
+            } else {
+                valor
+            }
+        })
+        .collect();
+    format!("{enum_name}::{variant}({})", rendered.join(", "))
+}
+
+/// `match e with ... end` em posição de expressão (T77) → o `match` do Rust,
+/// que já é uma expressão.
+///
+/// Mesma tradução do braço `TypedStat::Match` de [`emit_stat`] — escrutinado
+/// emprestado, campos religados no topo do braço —, com a única diferença de
+/// o corpo ser uma expressão, e não uma lista de comandos. Cada braço é um
+/// bloco (`{ let ..; exp }`) e não só a expressão, porque as religações
+/// precisam de um lugar onde morar; sem campo usado o bloco sai com a
+/// expressão sozinha, que é o que o rustc quer ver quando não há `let`.
+///
+/// Em posição de **operando** o `match` sai parentetizado, pela mesma razão
+/// que o bloco de [`emit_foreign_call`]: o rustc recusa um `match` cru como
+/// operando de `+`, e em posição de comando um `{` inicial seria lido como
+/// bloco-statement. Em posição já **delimitada** (valor de `let`, argumento,
+/// `return`) os parênteses viram `unused_parens`, e `parentetizado` é `false`
+/// — a mesma divisão que [`emit_exp`] e [`emit_delimited_exp`] já fazem para
+/// binop, unop e `as`.
+fn emit_match_exp(
+    scrutinee: &TypedExp,
+    arms: &[TypedMatchArm<TypedExp>],
+    parentetizado: bool,
+    ctx: Ctx,
+) -> String {
+    let mut braços = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let mut ligacoes = String::new();
+        emit_arm_bindings(&mut ligacoes, &arm.pattern, &arm.body, 0, ctx);
+        // As ligações saem de `emit_arm_bindings` uma por linha, com `\n` no
+        // fim; numa expressão inline o que se quer é um espaço entre elas.
+        let ligacoes = ligacoes.replace('\n', " ");
+        let corpo = emit_slot_value(&arm.body.ty, &arm.body, ctx);
+        braços.push(format!(
+            "{} => {{ {ligacoes}{corpo} }}",
+            emit_pattern(&arm.pattern, &arm.body)
+        ));
+    }
+    let nu = format!("match &{} {{ {} }}", emit_exp(scrutinee, ctx), braços.join(" "));
+    if parentetizado {
+        format!("({nu})")
+    } else {
+        nu
+    }
+}
+
 /// `{["a"] = 1}` como map (T30): `HashMap::from([(k, v), ..])`.
 fn emit_map_lit(entries: &[(TypedExp, TypedExp)], ctx: Ctx) -> String {
     let rendered: Vec<String> = entries
@@ -2354,6 +2756,12 @@ fn rust_type_name(ty: &Type) -> String {
             )
         }
         Type::Record { name, .. } => name.clone(),
+        // `enum Nome` (T77) → o `enum` Rust de mesmo nome, exatamente como o
+        // record: os dois são tipos nominais no mesmo namespace (ADR 0009).
+        // Sem recursão sobre as variantes, e não é só economia: um `Sum`
+        // aninhado chega do checker como placeholder de variantes vazias, e o
+        // nome é tudo de que a emissão precisa.
+        Type::Sum { name, .. } => name.clone(),
         // `T?` (T69) → `Option<T>`. O braço que a T68 deixou faltando: até
         // aqui um tipo opcional caía no `unreachable!` abaixo, e por isso
         // `generate` tinha de recusar o programa inteiro antes de emitir
@@ -3439,7 +3847,10 @@ end"#;
     #[test]
     fn emit_args_by_param_usa_a_posicao_certa_por_tipo_do_parametro() {
         let loc = crate::ast::Loc { line: 0, col: 0 };
-        let ctx: HashSet<String> = HashSet::new();
+        let ctx = EmitCtx {
+            params: HashSet::new(),
+            boxed: BoxedFields::new(),
+        };
         let args = vec![
             TypedExp {
                 loc,
@@ -4692,54 +5103,437 @@ end"#;
         assert_eq!(output.status.code(), Some(0));
     }
 
-    /// A guarda que separa a T76 da T77: um programa com tipo soma **tipa**,
-    /// mas a emissão o recusa com erro em português — e não com um panic —
-    /// enquanto o `enum` do Rust, o `Box` automático e a tradução do `match`
-    /// não chegam.
+    /// O ciclo mais longo que a travessia de [`campos_boxeados`] tem de
+    /// fechar: record → record → enum → record. Nenhum ciclo só de records
+    /// chega aqui (o checker o rejeita), então é sempre um `enum` que fecha a
+    /// volta — e é o `visitados` do braço `Sum` que faz a busca terminar.
+    ///
+    /// Sem a guarda, este fonte faria o codegen girar para sempre; com ela,
+    /// os dois campos de variante saem encaixotados e os `struct` ficam com
+    /// tamanho finito, o que o `rustc` confirma ao compilar.
     #[test]
-    fn t76_tipo_soma_tipa_mas_a_emissao_recusa_com_erro_em_portugues() {
-        let checar = |fonte: &str| {
-            let tokens = lex(fonte).unwrap_or_else(|e| panic!("erro léxico inesperado: {e}"));
-            let program =
-                parse(&tokens).unwrap_or_else(|e| panic!("erro sintático inesperado: {e}"));
-            let typed = check(&program)
-                .unwrap_or_else(|errs| panic!("o programa deveria tipar, erros: {errs:?}"));
-            generate(&typed.program)
-                .expect_err("a emissão de tipos soma ainda não existe (T77)")
-                .to_string()
-        };
-
-        let declaracao = checar(
-            "enum Cor\n\
-             \x20   Vermelho\n\
+    fn t77_ciclo_por_dois_records_termina_e_encaixota() {
+        let rust = generate_source(
+            "record A\n\
+             \x20   e: E\n\
+             end\n\
+             record B\n\
+             \x20   a: A\n\
+             end\n\
+             enum E\n\
+             \x20   ENil\n\
+             \x20   EB(B)\n\
+             \x20   EA(A)\n\
              end\n\
              function main(args: {string}): integer\n\
              \x20   return 0\n\
              end",
         );
-        assert!(
-            declaracao.contains("o enum 'Cor'") && declaracao.contains("T77"),
-            "erro: {declaracao}"
+
+        assert!(rust.contains("EB(Box<B>)"), "gerado: {rust}");
+        assert!(rust.contains("EA(Box<A>)"), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_ciclo_longo");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// **O critério de aceite da Parte A** (PRD.md, T77): uma mini-AST
+    /// recursiva construída e avaliada por `match` recursivo imprime o
+    /// resultado correto, e o Rust gerado compila **sem warnings**.
+    ///
+    /// É o caso que justifica a fase inteira: `ExpBinop(string, Exp, Exp)`
+    /// só existe em Rust porque a emissão encaixota os dois campos
+    /// recursivos.
+    #[test]
+    fn t77_mini_ast_recursiva_avalia_pelo_match_e_imprime_o_resultado() {
+        let rust = generate_source(
+            "enum Exp\n\
+             \x20   ExpInteger(integer)\n\
+             \x20   ExpBinop(string, Exp, Exp)\n\
+             end\n\
+             function aplica(op: string, a: integer, b: integer): integer\n\
+             \x20   if op == \"+\" then\n\
+             \x20       return a + b\n\
+             \x20   end\n\
+             \x20   if op == \"*\" then\n\
+             \x20       return a * b\n\
+             \x20   end\n\
+             \x20   return 0\n\
+             end\n\
+             function avalia(e: Exp): integer\n\
+             \x20   local r: integer = match e with\n\
+             \x20       ExpInteger(n) then\n\
+             \x20           n\n\
+             \x20       ExpBinop(op, l, r) then\n\
+             \x20           aplica(op, avalia(l), avalia(r))\n\
+             \x20   end\n\
+             \x20   return r\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local e: Exp = ExpBinop(\"+\", ExpInteger(2), ExpBinop(\"*\", ExpInteger(3), ExpInteger(4)))\n\
+             \x20   print(\"resultado: \" .. avalia(e))\n\
+             \x20   return 0\n\
+             end",
         );
 
-        let uso = checar(
+        // O `Box` só nos dois campos recursivos: a `string` do operador
+        // continua `String`.
+        assert!(
+            rust.contains("ExpBinop(String, Box<Exp>, Box<Exp>)"),
+            "gerado: {rust}"
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_mini_ast");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "resultado: 14\n",
+            "gerado: {rust}"
+        );
+    }
+
+    /// O ciclo **indireto** que a checagem de record não vê (`checker.rs` só
+    /// olha record → record): `enum Exp ExpNo(Caixa) end` com
+    /// `record Caixa e: Exp end` é um tamanho infinito em Rust tanto quanto
+    /// o ciclo direto, e é o campo da **variante** que ganha o `Box` —
+    /// encaixotar o campo do record mudaria o tipo que todo `c.e` do
+    /// programa enxerga.
+    #[test]
+    fn t77_ciclo_indireto_por_record_encaixota_o_campo_da_variante() {
+        let rust = generate_source(
+            "record Caixa\n\
+             \x20   e: Exp\n\
+             \x20   peso: integer\n\
+             end\n\
+             enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpNo(Caixa)\n\
+             end\n\
+             function peso(e: Exp): integer\n\
+             \x20   local r: integer = match e with\n\
+             \x20       ExpNil then\n\
+             \x20           0\n\
+             \x20       ExpNo(c) then\n\
+             \x20           c.peso + peso(c.e)\n\
+             \x20   end\n\
+             \x20   return r\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local cf: Caixa = {e = ExpNil, peso = 5}\n\
+             \x20   local folha: Exp = ExpNo(cf)\n\
+             \x20   local cr: Caixa = {e = folha, peso = 7}\n\
+             \x20   local raiz: Exp = ExpNo(cr)\n\
+             \x20   print(\"peso: \" .. peso(raiz))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(rust.contains("ExpNo(Box<Caixa>)"), "gerado: {rust}");
+        // O campo do record **não** é encaixotado: `Box` no lado do enum
+        // basta para o tamanho fechar, e o record segue com o tipo que o
+        // resto do programa lê em `c.e`.
+        assert!(rust.contains("pub e: Exp,"), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_ciclo_indireto");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "peso: 12\n");
+    }
+
+    /// Recursão **mútua** entre dois enums: o `Sum` aninhado chega do checker
+    /// como placeholder de variantes vazias, então só a tabela do programa
+    /// mostra que `A` volta a `A` passando por `B` — é a razão de
+    /// [`campos_boxeados`] atravessar `Sum` pelo nome, e não pelas variantes
+    /// embutidas no tipo.
+    #[test]
+    fn t77_recursao_mutua_entre_enums_encaixota_os_dois_lados() {
+        let rust = generate_source(
+            "enum A\n\
+             \x20   ANil\n\
+             \x20   AB(B)\n\
+             end\n\
+             enum B\n\
+             \x20   BNil\n\
+             \x20   BA(A)\n\
+             end\n\
+             function fundo(a: A): integer\n\
+             \x20   local r: integer = match a with\n\
+             \x20       ANil then\n\
+             \x20           0\n\
+             \x20       AB(b) then\n\
+             \x20           1 + fundo_b(b)\n\
+             \x20   end\n\
+             \x20   return r\n\
+             end\n\
+             function fundo_b(b: B): integer\n\
+             \x20   local r: integer = match b with\n\
+             \x20       BNil then\n\
+             \x20           0\n\
+             \x20       BA(a) then\n\
+             \x20           1 + fundo(a)\n\
+             \x20   end\n\
+             \x20   return r\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local folha: B = BA(ANil)\n\
+             \x20   print(\"fundo: \" .. fundo(AB(folha)))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(rust.contains("AB(Box<B>)"), "gerado: {rust}");
+        assert!(rust.contains("BA(Box<A>)"), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_mutua");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "fundo: 2\n");
+    }
+
+    /// O outro lado da armadilha: `{Exp}` **não** leva `Box`. `Vec<Exp>` já
+    /// põe os elementos no heap, então o tamanho de `Exp` não depende do
+    /// deles — encaixotar compilaria e só acrescentaria uma alocação por
+    /// elemento.
+    #[test]
+    fn t77_recursao_por_array_nao_leva_box() {
+        let rust = generate_source(
+            "enum Exp\n\
+             \x20   ExpFolha(integer)\n\
+             \x20   ExpNo({Exp})\n\
+             end\n\
+             function soma(e: Exp): integer\n\
+             \x20   local total: integer = 0\n\
+             \x20   match e with\n\
+             \x20       ExpFolha(n) then\n\
+             \x20           total = n\n\
+             \x20       ExpNo(filhos) then\n\
+             \x20           for filho in filhos do\n\
+             \x20               total = total + soma(filho)\n\
+             \x20           end\n\
+             \x20   end\n\
+             \x20   return total\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local filhos: {Exp} = {ExpFolha(2), ExpFolha(3)}\n\
+             \x20   print(\"soma: \" .. soma(ExpNo(filhos)))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(rust.contains("ExpNo(Vec<Exp>)"), "gerado: {rust}");
+        assert!(!rust.contains("Box<"), "não deveria encaixotar: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_array");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "soma: 5\n");
+    }
+
+    /// Semântica de valor (ADR 0006) valendo para tipo soma: o escrutinado
+    /// sai emprestado (`match &e`) e a atribuição clona, então `local b = a`
+    /// seguido de `match a` compila — com `match a` por valor, o padrão que
+    /// liga campos moveria `a` e o rustc recusaria em inglês.
+    #[test]
+    fn t77_escrutinado_emprestado_mantem_o_valor_vivo_depois_do_match() {
+        let rust = generate_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpTexto(string)\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local a: Exp = ExpTexto(\"oi\")\n\
+             \x20   local b: Exp = a\n\
+             \x20   local vezes: integer = 0\n\
+             \x20   match a with\n\
+             \x20       ExpNil then\n\
+             \x20           vezes = vezes - 1\n\
+             \x20       ExpTexto(s) then\n\
+             \x20           print(s)\n\
+             \x20           vezes = vezes + 1\n\
+             \x20   end\n\
+             \x20   match b with\n\
+             \x20       ExpNil then\n\
+             \x20           vezes = vezes - 1\n\
+             \x20       ExpTexto(s) then\n\
+             \x20           print(s)\n\
+             \x20           vezes = vezes + 1\n\
+             \x20   end\n\
+             \x20   print(\"vezes: \" .. vezes)\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(rust.contains("match &a {"), "gerado: {rust}");
+        assert!(rust.contains("let b: Exp = a.clone();"), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_valor");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "oi\noi\nvezes: 2\n"
+        );
+    }
+
+    /// Um argumento de tipo soma é dono de buffer próprio como record, mas
+    /// segue por **valor** como escalar (não entra em `is_composite`, ADR
+    /// 0007) — então a chamada tem de clonar a fonte que sobrevive a ela.
+    /// Sem o clone, `tinge(c) + tinge(c)` moveria `c` na primeira chamada.
+    #[test]
+    fn t77_argumento_de_tipo_soma_clona_a_fonte_que_sobrevive_a_chamada() {
+        let rust = generate_source(
             "enum Cor\n\
              \x20   Vermelho\n\
              \x20   Verde\n\
              end\n\
              function tinge(c: Cor): integer\n\
-             \x20   match c with\n\
+             \x20   local r: integer = match c with\n\
              \x20       Vermelho then\n\
-             \x20           return 0\n\
+             \x20           1\n\
              \x20       Verde then\n\
-             \x20           return 1\n\
+             \x20           2\n\
              \x20   end\n\
-             \x20   return 2\n\
+             \x20   return r\n\
              end\n\
              function main(args: {string}): integer\n\
-             \x20   return tinge(Vermelho)\n\
+             \x20   local c: Cor = Verde\n\
+             \x20   print(\"dobro: \" .. tinge(c) + tinge(c))\n\
+             \x20   return 0\n\
              end",
         );
-        assert!(uso.contains("T77"), "erro: {uso}");
+
+        assert!(rust.contains("titan_tinge(c.clone())"), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_arg_clone");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "dobro: 4\n");
+    }
+
+    /// `_` é o `_` do Rust, e um campo que o corpo nunca usa sai como `_` no
+    /// padrão: o escrutinado é emprestado, então a ligação não é descartável
+    /// de graça — um nome ligado sem uso dispararia `unused_variables`, e o
+    /// critério da tarefa é Rust sem warnings.
+    #[test]
+    fn t77_curinga_e_campo_sem_uso_saem_como_underscore() {
+        let rust = generate_source(
+            "enum Exp\n\
+             \x20   ExpNil\n\
+             \x20   ExpInteger(integer)\n\
+             \x20   ExpTexto(string)\n\
+             end\n\
+             function classifica(e: Exp): integer\n\
+             \x20   local r: integer = match e with\n\
+             \x20       ExpInteger(n) then\n\
+             \x20           n\n\
+             \x20       _ then\n\
+             \x20           0\n\
+             \x20   end\n\
+             \x20   return r\n\
+             end\n\
+             function ignora(e: Exp): integer\n\
+             \x20   local r: integer = match e with\n\
+             \x20       ExpTexto(s) then\n\
+             \x20           1\n\
+             \x20       _ then\n\
+             \x20           0\n\
+             \x20   end\n\
+             \x20   return r\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   print(\"soma: \" .. classifica(ExpInteger(7)) + ignora(ExpNil))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(rust.contains("_ => { 0 }"), "gerado: {rust}");
+        // `s` não é lido no corpo do braço: sai `_` no padrão, e sem `let`.
+        assert!(rust.contains("Exp::ExpTexto(_) =>"), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_curinga");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "soma: 7\n");
+    }
+
+    /// Campo composto ligado por um padrão é **mutável dentro do braço**: o
+    /// checker o trata como parâmetro (não dá para atribuir ao nome inteiro),
+    /// mas `c.peso = 9` é permitido — e escreve na cópia do braço, não no
+    /// escrutinado, que o `match &e` manteve intocado.
+    #[test]
+    fn t77_campo_composto_ligado_e_mutavel_dentro_do_braco() {
+        let rust = generate_source(
+            "record Ponto\n\
+             \x20   x: integer\n\
+             end\n\
+             enum Forma\n\
+             \x20   Vazia\n\
+             \x20   Um(Ponto)\n\
+             end\n\
+             function desloca(f: Forma): integer\n\
+             \x20   local r: integer = -1\n\
+             \x20   match f with\n\
+             \x20       Vazia then\n\
+             \x20           r = r + 1\n\
+             \x20       Um(p) then\n\
+             \x20           p.x = p.x + 10\n\
+             \x20           r = p.x\n\
+             \x20   end\n\
+             \x20   return r\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1}\n\
+             \x20   local f: Forma = Um(p)\n\
+             \x20   print(\"x: \" .. desloca(f) .. \"/\" .. desloca(f))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(rust.contains("let mut p: Ponto ="), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_mut_ligado");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        // O segundo `desloca(f)` vê o mesmo `1` do primeiro: a escrita ficou
+        // na cópia do braço.
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "x: 11/11\n");
+    }
+
+    /// `match` como expressão em posição de **operando** precisa dos
+    /// parênteses (`1 + (match ..)` — o rustc recusa o `match` cru ali), e em
+    /// posição já delimitada precisa ficar **sem** eles (`unused_parens`). A
+    /// divisão é a mesma que binop, unop e `as` já seguiam.
+    #[test]
+    fn t77_match_expressao_parentetiza_so_em_posicao_de_operando() {
+        let rust = generate_source(
+            "enum Cor\n\
+             \x20   Vermelho\n\
+             \x20   Verde\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Cor = Verde\n\
+             \x20   local delimitado: integer = match c with\n\
+             \x20       Vermelho then\n\
+             \x20           1\n\
+             \x20       Verde then\n\
+             \x20           2\n\
+             \x20   end\n\
+             \x20   local operando: integer = 10 + match c with\n\
+             \x20       Vermelho then\n\
+             \x20           1\n\
+             \x20       Verde then\n\
+             \x20           2\n\
+             \x20   end\n\
+             \x20   print(\"soma: \" .. delimitado + operando)\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(
+            rust.contains("let delimitado: i64 = match &c {"),
+            "gerado: {rust}"
+        );
+        assert!(rust.contains("10 + (match &c {"), "gerado: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_parens");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "soma: 14\n");
     }
 }
