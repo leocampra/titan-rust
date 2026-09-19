@@ -69,4 +69,7 @@ subjacente.
 - Record recursivo, mesmo que semanticamente razoável com `Box` (`prox:
   Option<Box<No>>`), é rejeitado nesta fase — falta a `Option` para expressar
   a base do recursivo (`Nil`). Revisitar quando `Option` entrar no sistema de
-  tipos.
+  tipos. **Revisitado** para tipo soma no
+  [ADR 0026](0026-enum-recursivo-com-box-na-emissao.md): um `enum` expressa a
+  base do recursivo numa variante sem payload, e o `Box` da emissão quebra o
+  ciclo. A rejeição continua valendo para `record`.

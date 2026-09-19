@@ -3989,6 +3989,29 @@ valor precisam de nomes diferentes.",
             // Numérica, nos dois sentidos.
             (Type::Integer, Type::Float) => CastKind::IntToFloat,
             (Type::Float, Type::Integer) => CastKind::FloatToInt,
+            // Tipo soma → `value` é a única subida que **não** vale (T77):
+            // `titan_runtime::Value` tem um braço por forma de valor do Titan
+            // — `Nil`, `Boolean`, `Integer`, `Float`, `String`, `Array`,
+            // `Map`, `Record`, `Option` — e nenhum para um `enum` do usuário.
+            // A recusa vale para o tipo soma **dentro** de um composto
+            // (`{Cor}`, um record com campo `Cor`) tanto quanto para ele
+            // sozinho, porque `emit_to_value` converte elemento a elemento e
+            // acabaria no mesmo lugar sem braço para escrever. Dizê-lo aqui,
+            // em português e sobre o `as` que o usuário escreveu, é o que
+            // evita o backend ter de recusar um programa que já tipou.
+            (origem, Type::Value) if tipo_soma_alcancado(origem).is_some() => {
+                // `unwrap`: a guarda acima acabou de confirmar o `Some`.
+                let enum_name = tipo_soma_alcancado(origem).unwrap();
+                self.error(
+                    loc,
+                    format!(
+                        "o enum '{enum_name}' não sobe para `value`: `value` guarda \
+                         primitiva, array, map, record e opcional, não tipo soma; use \
+                         `match` para extrair o que vai no `value`."
+                    ),
+                );
+                return None;
+            }
             // Subida ao topo do gradual typing.
             (_, Type::Value) => CastKind::ToValue,
             // Descida do topo, checada em tempo de execução. Só primitiva:
@@ -5168,6 +5191,32 @@ fn is_composite(ty: &Type) -> bool {
         ty,
         Type::Array { .. } | Type::Map { .. } | Type::Record { .. } | Type::Opaque { .. }
     )
+}
+
+/// Nome do primeiro tipo soma que `ty` alcança — nele mesmo ou dentro de um
+/// composto/opcional —, ou `None` se não alcança nenhum (T77).
+///
+/// Existe por causa de uma assimetria só: `value` (`titan_runtime::Value`)
+/// tem um braço por forma de valor do Titan, e nenhum para `enum` do usuário,
+/// então `check_cast` recusa a subida — e precisa recusá-la também para
+/// `{Cor}` e para o record com um campo `Cor`, que `emit_to_value` converteria
+/// elemento a elemento até chegar ao mesmo lugar sem braço.
+///
+/// Um `Sum` aninhado chega como placeholder de variantes vazias
+/// (`collect_enum_names`), então a busca **não** entra nas variantes: um
+/// `enum` que carrega outro `enum` já é recusado pelo primeiro que aparece, e
+/// descer pelas variantes só acharia o mesmo tipo soma outra vez.
+fn tipo_soma_alcancado(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Sum { name, .. } => Some(name),
+        Type::Array { elem } => tipo_soma_alcancado(elem),
+        Type::Map { keys, values } => {
+            tipo_soma_alcancado(keys).or_else(|| tipo_soma_alcancado(values))
+        }
+        Type::Option { base } => tipo_soma_alcancado(base),
+        Type::Record { fields, .. } => fields.iter().find_map(|(_, fty)| tipo_soma_alcancado(fty)),
+        _ => None,
+    }
 }
 
 /// Preenche o placeholder `Type::Opaque` vazio de `CapabilityFn::rettype`
@@ -9469,6 +9518,44 @@ end"#;
                     }
                 ),
                 "{corpo}"
+            );
+        }
+    }
+
+    /// A exceção que a T77 abriu no "qualquer tipo sobe para `value`":
+    /// `titan_runtime::Value` tem um braço por forma de valor do Titan e
+    /// nenhum para `enum` do usuário, então a subida é recusada — e recusada
+    /// também para o tipo soma **dentro** de um composto, que
+    /// `emit_to_value` converteria elemento a elemento até chegar ao mesmo
+    /// lugar sem braço para escrever.
+    #[test]
+    fn t77_tipo_soma_nao_sobe_para_value_nem_dentro_de_composto() {
+        for corpo in [
+            "    local c: Cor = Vermelho\n    local v: value = c as value",
+            "    local xs: {Cor} = {Vermelho}\n    local v: value = xs as value",
+            "    local m: {string: Cor} = {[\"a\"] = Vermelho}\n    local v: value = m as value",
+            "    local o: Cor? = Vermelho\n    local v: value = o as value",
+            "    local k: Caixa = {c = Vermelho}\n    local v: value = k as value",
+        ] {
+            let fonte = format!(
+                "enum Cor\n\
+                 \x20   Vermelho\n\
+                 \x20   Verde\n\
+                 end\n\
+                 record Caixa\n\
+                 \x20   c: Cor\n\
+                 end\n\
+                 function main(args: {{string}}): integer\n{corpo}\n    return 0\nend"
+            );
+            let errs = check_source(&fonte).expect_err(&format!("deveria recusar: {corpo}"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.message.contains("não sobe para `value`")),
+                "corpo {corpo:?}, erros: {}",
+                errs.iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             );
         }
     }
