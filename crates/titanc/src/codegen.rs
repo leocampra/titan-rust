@@ -204,9 +204,17 @@ fn campos_boxeados(program: &TypedProgram) -> BoxedFields {
             Type::Record { fields, .. } => fields
                 .iter()
                 .any(|(_, f)| alcanca(f, alvo, enums, visitados)),
-            // Indireção: o tamanho do container não depende do tamanho do
-            // que ele guarda.
-            Type::Array { .. } | Type::Map { .. } | Type::Option { .. } => false,
+            // Indireção de verdade: `Vec`/`HashMap` guardam os elementos
+            // atrás de um ponteiro, então o tamanho do container não depende
+            // do tamanho do que ele guarda.
+            Type::Array { .. } | Type::Map { .. } => false,
+            // `T?` **não** é indireção: `Option<T>` do Rust embute o `T`, e
+            // `Proximo(Cadeia?)` sem `Box` daria "recursive type has
+            // infinite size" (E0072) sobre código que o usuário não
+            // escreveu. O campo tem de ser encaixotado como qualquer outro
+            // que alcance o enum — `Box<Option<T>>`, e não `Option<Box<T>>`,
+            // porque quem decide o encaixotamento é o campo inteiro.
+            Type::Option { base } => alcanca(base, alvo, enums, visitados),
             _ => false,
         }
     }
@@ -300,7 +308,7 @@ fn emit_record_struct(out: &mut String, name: &str, fields: &[(String, Type)]) {
     for (fname, fty) in fields {
         out.push_str(INDENT);
         out.push_str("pub ");
-        out.push_str(fname);
+        out.push_str(&ident(fname));
         out.push_str(": ");
         out.push_str(&rust_type_name(fty));
         out.push_str(",\n");
@@ -438,6 +446,41 @@ fn mangle_fn_name(name: &str) -> String {
     format!("titan_{name}")
 }
 
+/// Palavras-chave do Rust que **são** identificadores válidos em Titan.
+///
+/// `mod`, `let`, `type`, `impl` e companhia não significam nada em Titan
+/// (`KEYWORDS` do lexer é a lista fechada da linguagem), então
+/// `local mod: integer = 1` é programa legítimo — e emitir `let mod: i64`
+/// faria o rustc recusar, em inglês, código que o usuário não escreveu.
+///
+/// Fora da lista ficam as que o próprio Titan já reserva (`enum`, `match`,
+/// `as`, `if`, `else`, `while`, `for`, `do`, `end`, `return`, `local`,
+/// `function`, `true`, `false`, `nil`, `and`, `or`, `not`, `break`,
+/// `continue`, `repeat`, `until`, `in`, `foreign`, `record`): o lexer as
+/// rejeita antes, e nenhum identificador com esses nomes chega aqui.
+const PALAVRAS_RESERVADAS_DO_RUST: &[&str] = &[
+    "abstract", "async", "await", "become", "box", "const", "crate", "dyn", "extern", "final",
+    "fn", "impl", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub",
+    "ref", "self", "Self", "static", "struct", "super", "trait", "try", "type", "typeof", "unsafe",
+    "unsized", "use", "virtual", "where", "yield",
+];
+
+/// Nome de variável/campo Titan como identificador Rust válido.
+///
+/// Colisão com palavra-chave do Rust vira identificador cru (`r#mod`), que é
+/// exatamente o mecanismo que o Rust oferece para isso: o nome continua
+/// legível no código gerado e nenhum outro nome do programa muda. `r#self`,
+/// `r#Self`, `r#crate` e `r#super` não existem em Rust, então esses quatro
+/// levam sufixo em vez do prefixo cru.
+fn ident(name: &str) -> String {
+    match name {
+        // Os quatro que o Rust proíbe até como identificador cru.
+        "self" | "Self" | "crate" | "super" => format!("{name}_titan"),
+        _ if PALAVRAS_RESERVADAS_DO_RUST.contains(&name) => format!("r#{name}"),
+        _ => name.to_string(),
+    }
+}
+
 fn emit_toplevel(out: &mut String, top: &TypedTopLevel, boxed: &BoxedFields) {
     let TypedTopLevel::Func {
         islocal,
@@ -467,8 +510,9 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel, boxed: &BoxedFields) {
         .iter()
         .map(|(name, ty)| {
             let rust_name = if used.contains(name.as_str()) {
-                name.clone()
+                ident(name)
             } else {
+                // `_nome` já não colide com palavra-chave do Rust.
                 format!("_{name}")
             };
             format!("{rust_name}: {}", rust_param_type_name(ty))
@@ -927,7 +971,7 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
         } => {
             indent(out, depth);
             out.push_str(if *mutable { "let mut " } else { "let " });
-            out.push_str(name);
+            out.push_str(&ident(name));
             out.push_str(": ");
             out.push_str(&rust_type_name(ty));
             out.push_str(" = ");
@@ -948,7 +992,7 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             for (target, temporario) in targets.iter().zip(&temporarios) {
                 indent(out, depth);
                 out.push_str(if target.mutable { "let mut " } else { "let " });
-                out.push_str(&target.name);
+                out.push_str(&ident(&target.name));
                 out.push_str(": ");
                 out.push_str(&rust_type_name(&target.ty));
                 out.push_str(" = ");
@@ -962,6 +1006,13 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
         // em sequência (`a = b; b = a;`) daria `a == b`. Por isso os valores
         // vão primeiro para `let` temporários e só depois são escritos nos
         // alvos, cada um pelo mesmo caminho do `Assign` single-target.
+        //
+        // O **lado esquerdo** tem a mesma exigência, e é a armadilha que a
+        // T78 encontrou: em `i, w[i] = 2, 999` o `w[i]` é o `i` de **antes**
+        // da atribuição, mas as escritas são sequenciais e `i = 2` já
+        // aconteceu quando a segunda é emitida. Os índices/chaves dos alvos
+        // também vão para temporários antes de qualquer escrita
+        // ([`emit_lugares_dos_alvos`]).
         TypedStat::AssignMulti {
             targets, values, ..
         } => {
@@ -974,8 +1025,16 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                 TypedMultiValues::Call(_) => Vec::new(),
             };
             let temporarios = emit_multi_values(out, values, &slots, targets.len(), depth, ctx);
-            for (target, temporario) in targets.iter().zip(&temporarios) {
-                emit_assign_to_lvalue(out, target, temporario, depth, ctx);
+            let indices = emit_lugares_dos_alvos(out, targets, depth, ctx);
+            for ((target, temporario), indice) in targets.iter().zip(&temporarios).zip(&indices) {
+                emit_assign_to_lvalue_com_indice(
+                    out,
+                    target,
+                    temporario,
+                    indice.as_deref(),
+                    depth,
+                    ctx,
+                );
             }
         }
         TypedStat::Call { call, .. } => {
@@ -1114,7 +1173,8 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str("{\n");
             indent(out, inner);
             out.push_str(&format!(
-                "let mut {name}: {t} = {};\n",
+                "let mut {}: {t} = {};\n",
+                ident(name),
                 emit_delimited_exp(start, ctx)
             ));
             indent(out, inner);
@@ -1146,18 +1206,20 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             indent(out, inner + 1);
             out.push_str("} else {\n");
             indent(out, inner + 2);
-            out.push_str(&format!("{name} += titan_for_inc;\n"));
+            out.push_str(&format!("{} += titan_for_inc;\n", ident(name)));
             indent(out, inner + 1);
             out.push_str("}\n");
             // Teste de parada depois do incremento: mesma condição de
             // continuação de antes, negada.
             indent(out, inner + 1);
             out.push_str(&format!(
-                "if !((titan_for_asc && {name} <= titan_for_finish)\n"
+                "if !((titan_for_asc && {} <= titan_for_finish)\n",
+                ident(name)
             ));
             indent(out, inner + 2);
             out.push_str(&format!(
-                "|| (!titan_for_asc && {name} >= titan_for_finish)) {{\n"
+                "|| (!titan_for_asc && {} >= titan_for_finish)) {{\n",
+                ident(name)
             ));
             indent(out, inner + 2);
             out.push_str("break;\n");
@@ -1323,9 +1385,15 @@ fn emit_forin_binding(
         "let"
     };
     if valor_com_buffer_proprio(ty) || *ty == Type::String {
-        out.push_str(&format!("{bind} {name}: {rust_ty} = {interno}.clone();\n"));
+        out.push_str(&format!(
+            "{bind} {}: {rust_ty} = {interno}.clone();\n",
+            ident(name)
+        ));
     } else {
-        out.push_str(&format!("{bind} {name}: {rust_ty} = *{interno};\n"));
+        out.push_str(&format!(
+            "{bind} {}: {rust_ty} = *{interno};\n",
+            ident(name)
+        ));
     }
 }
 
@@ -1431,7 +1499,7 @@ fn emit_arm_bindings(
             format!("*{interno}")
         };
         indent(out, depth);
-        out.push_str(&format!("{bind} {fname}: {rust_ty} = {valor};\n"));
+        out.push_str(&format!("{bind} {}: {rust_ty} = {valor};\n", ident(fname)));
     }
 }
 
@@ -1540,10 +1608,30 @@ fn emit_assign_to_lvalue(
     depth: usize,
     ctx: Ctx,
 ) {
+    emit_assign_to_lvalue_com_indice(out, target, valor, None, depth, ctx);
+}
+
+/// Como [`emit_assign_to_lvalue`], mas com o índice/chave do alvo **já
+/// calculado** num temporário (T67/T78).
+///
+/// Na atribuição múltipla o índice não pode ser lido na hora da escrita: as
+/// escritas acontecem em sequência, e um alvo anterior pode ter mudado
+/// justamente o nome que o índice lê (`i, w[i] = 2, 999` — em Titan, como em
+/// Lua, `w[i]` é o `i` **antigo**). [`emit_lugares_dos_alvos`] pré-calcula
+/// esses índices antes de qualquer escrita e os passa por aqui; o caminho de
+/// alvo único passa `None` e segue lendo o índice no lugar, como sempre.
+fn emit_assign_to_lvalue_com_indice(
+    out: &mut String,
+    target: &TypedLValue,
+    valor: &str,
+    indice_pronto: Option<&str>,
+    depth: usize,
+    ctx: Ctx,
+) {
     indent(out, depth);
     match target {
         TypedLValue::Name(name) => {
-            out.push_str(name);
+            out.push_str(&ident(name));
             out.push_str(" = ");
             out.push_str(valor);
             out.push_str(";\n");
@@ -1567,7 +1655,9 @@ fn emit_assign_to_lvalue(
             Type::Array { .. } => {
                 out.push_str(&format!(
                     "let titan_idx = {};\n",
-                    emit_delimited_exp(index, ctx)
+                    indice_pronto
+                        .map(str::to_string)
+                        .unwrap_or_else(|| emit_delimited_exp(index, ctx))
                 ));
                 indent(out, depth);
                 out.push_str(&format!("let titan_val = {valor};\n"));
@@ -1580,7 +1670,9 @@ fn emit_assign_to_lvalue(
             Type::Map { .. } => {
                 out.push_str(&format!(
                     "let titan_key = {};\n",
-                    emit_slot_value(&index.ty, index, ctx)
+                    indice_pronto
+                        .map(str::to_string)
+                        .unwrap_or_else(|| emit_slot_value(&index.ty, index, ctx))
                 ));
                 indent(out, depth);
                 out.push_str(&format!("let titan_val = {valor};\n"));
@@ -1604,10 +1696,27 @@ fn emit_assign_to_lvalue(
         // referência recém-criada, não ao campo) — `(&mut p).x = ..`
         // é que aciona o auto-deref do Rust e escreve no lugar certo.
         TypedLValue::Field { base, name } => {
-            out.push_str(&format!(
-                "({}).{name} = {valor};\n",
-                emit_place_mut(base, ctx)
-            ));
+            // Base indexada com índice já pré-calculado (T78): a chamada
+            // `_mut` do runtime é montada aqui com o temporário, em vez de
+            // deixar `emit_place_mut` reler o índice depois de uma escrita
+            // anterior o ter mudado (`k, ps[k].x = 2, 99`).
+            let lugar = match (indice_pronto, &base.kind) {
+                (Some(idx), TypedExpKind::Index { base: interna, .. }) => {
+                    let acesso = match &interna.ty {
+                        Type::Map { .. } => format!(
+                            "titan_runtime::map_get_mut({}, &{idx})",
+                            emit_place_mut(interna, ctx)
+                        ),
+                        _ => format!(
+                            "titan_runtime::array_get_mut({}, {idx})",
+                            emit_place_mut(interna, ctx)
+                        ),
+                    };
+                    format!("&mut (*{acesso})")
+                }
+                _ => emit_place_mut(base, ctx),
+            };
+            out.push_str(&format!("({lugar}).{} = {valor};\n", ident(name)));
         }
     }
 }
@@ -1624,6 +1733,55 @@ fn emit_assign_to_lvalue(
 /// composto); na forma-chamada ele é vazio, porque a tupla devolvida pela
 /// função já é dona dos seus componentes — lá quem dá a contagem é
 /// `alvos`.
+/// Pré-calcula, em `let` temporários, o índice/chave de cada alvo de uma
+/// atribuição múltipla (T67/T78), e devolve o nome do temporário de cada um
+/// — `None` para alvo que não tem índice (`Name`, `Field` sobre nome).
+///
+/// É o lado esquerdo da mesma garantia que [`emit_multi_values`] dá ao
+/// direito: quando a primeira escrita acontece, **todo** lugar já foi
+/// resolvido. Sem isso, `i, w[i] = 2, 999` escreveria em `w[2]` (o `i` já
+/// atribuído) em vez de `w[1]`, divergindo de Lua em silêncio.
+///
+/// Só o índice do **próprio** alvo é pré-calculado: a base é sempre um lugar
+/// (nome, campo, elemento), e o que muda de valor entre as escritas é o
+/// índice que o lê. Um alvo `Field` cuja base é `Index` (`ps[k].x`) entra
+/// pelo mesmo caminho, pré-calculando o índice dessa base.
+fn emit_lugares_dos_alvos(
+    out: &mut String,
+    targets: &[TypedLValue],
+    depth: usize,
+    ctx: Ctx,
+) -> Vec<Option<String>> {
+    let mut nomes = Vec::with_capacity(targets.len());
+    for (i, target) in targets.iter().enumerate() {
+        // `Field` sobre base indexada guarda o índice da base; `Index`
+        // guarda o seu próprio. Nos demais alvos não há índice nenhum.
+        let indexado = match target {
+            TypedLValue::Index { base, index } => Some((base, index)),
+            TypedLValue::Field { base, .. } => match &base.kind {
+                TypedExpKind::Index { base, index } => Some((base, index)),
+                _ => None,
+            },
+            TypedLValue::Name(_) => None,
+        };
+        let Some((base, index)) = indexado else {
+            nomes.push(None);
+            continue;
+        };
+        let nome = format!("titan_lugar_{i}");
+        // Mesma regra de slot da escrita: índice de array é valor, chave de
+        // map passa por `emit_slot_value` (é ela que dá a `String` dona).
+        let valor = match &base.ty {
+            Type::Map { .. } => emit_slot_value(&index.ty, index, ctx),
+            _ => emit_delimited_exp(index, ctx),
+        };
+        indent(out, depth);
+        out.push_str(&format!("let {nome} = {valor};\n"));
+        nomes.push(Some(nome));
+    }
+    nomes
+}
+
 fn emit_multi_values(
     out: &mut String,
     values: &TypedMultiValues,
@@ -1693,7 +1851,7 @@ fn emit_exp(exp: &TypedExp, ctx: Ctx) -> String {
         TypedExpKind::Integer(v) => v.to_string(),
         TypedExpKind::Float(v) => format_float_literal(*v),
         TypedExpKind::String(v) => format_string_literal(v),
-        TypedExpKind::Var(name) => name.clone(),
+        TypedExpKind::Var(name) => ident(name),
         TypedExpKind::Concat(exps) => emit_concat(exps, ctx),
         TypedExpKind::Call { callee, args } => emit_call(callee, args, &exp.ty, ctx),
         // `^` vira chamada de método (`.powf`), que já se delimita sozinha —
@@ -1906,7 +2064,7 @@ fn emit_place_expr(exp: &TypedExp, ctx: Ctx) -> String {
         // acesso — nunca via `emit_place_mut(base)` (que já embutiria um
         // `&mut` no meio da cadeia).
         TypedExpKind::Field { base, name } => {
-            format!("{}.{name}", emit_place_expr(base, ctx))
+            format!("{}.{}", emit_place_expr(base, ctx), ident(name))
         }
         // `v[i]` onde o elemento é composto: troca para a variante `_mut`
         // do runtime, que devolve `&mut T` de verdade em vez do valor
@@ -2603,7 +2761,7 @@ fn emit_index(base: &TypedExp, index: &TypedExp, ctx: Ctx) -> String {
 /// decide se este valor precisa de cópia é a posição que o consome
 /// ([`emit_slot_value`]/[`precisa_clone`]), não a leitura do campo em si.
 fn emit_field(base: &TypedExp, name: &str, ctx: Ctx) -> String {
-    format!("{}.{name}", emit_exp(base, ctx))
+    format!("{}.{}", emit_exp(base, ctx), ident(name))
 }
 
 /// `{1, 2, 3}` como array (T30): `vec![..]`. Cada elemento passa pela mesma
@@ -2626,7 +2784,13 @@ fn emit_array_lit(elems: &[TypedExp], ctx: Ctx) -> String {
 fn emit_record_lit(type_name: &str, fields: &[(String, TypedExp)], ctx: Ctx) -> String {
     let rendered: Vec<String> = fields
         .iter()
-        .map(|(name, value)| format!("{name}: {}", emit_slot_value(&value.ty, value, ctx)))
+        .map(|(name, value)| {
+            format!(
+                "{}: {}",
+                ident(name),
+                emit_slot_value(&value.ty, value, ctx)
+            )
+        })
         .collect();
     format!("{type_name} {{ {} }}", rendered.join(", "))
 }
@@ -4468,6 +4632,128 @@ end"#;
         assert_eq!(output.status.code(), Some(0));
     }
 
+    /// T78: o lado **esquerdo** também é resolvido antes de qualquer
+    /// escrita. Em `i, w[i] = 2, 999` o `w[i]` é o `i` de antes — mas as
+    /// escritas são sequenciais, e ler o índice na hora da segunda pegaria o
+    /// `i` que a primeira acabou de mudar, escrevendo em `w[2]` em vez de
+    /// `w[1]`. Divergência silenciosa de Lua: compila, roda e dá outro
+    /// resultado.
+    #[test]
+    fn t78_indice_do_alvo_e_calculado_antes_das_escritas() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local i: integer = 1\n\
+             \x20   local w: {integer} = {100, 200}\n\
+             \x20   i, w[i] = 2, 999\n\
+             \x20   print(\"w-\" .. w[1] .. \"-\" .. w[2] .. \"-i\" .. i)\n\
+             \x20   return 0\n\
+             end",
+        );
+        // O índice vai para um temporário **antes** da escrita em `i`.
+        let lugar = rust
+            .find("let titan_lugar_1 = i;")
+            .expect("índice pré-calculado");
+        let escrita = rust.find("i = titan_multi_0;").expect("escrita em i");
+        assert!(lugar < escrita, "índice deve preceder a escrita:\n{rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t78_lugar_indice");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "w-999-200-i2\n");
+    }
+
+    /// A mesma garantia quando o alvo é um **campo** sobre base indexada:
+    /// `k, ps[k].x = 2, 99` escreve em `ps[1].x`, com o `k` de antes.
+    #[test]
+    fn t78_indice_da_base_do_campo_e_calculado_antes_das_escritas() {
+        let rust = generate_source(
+            "record Ponto\n\
+             \x20   x: integer\n\
+             \x20   y: integer\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local k: integer = 1\n\
+             \x20   local ps: {Ponto} = {{x = 1, y = 1}, {x = 2, y = 2}}\n\
+             \x20   k, ps[k].x = 2, 99\n\
+             \x20   print(\"p-\" .. ps[1].x .. \"-\" .. ps[2].x .. \"-k\" .. k)\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(
+            rust.contains("titan_runtime::array_get_mut(&mut ps, titan_lugar_1)"),
+            "a base indexada deve usar o índice pré-calculado:\n{rust}"
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t78_lugar_campo");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "p-99-2-k2\n");
+    }
+
+    /// T78: palavra-chave do Rust que é identificador legítimo em Titan
+    /// (`mod`, `let`, `type`, `ref`, ..) sai como identificador cru
+    /// (`r#mod`) em vez de quebrar o rustc com um erro em inglês sobre
+    /// código que o usuário não escreveu. Cobre de uma vez os lugares onde
+    /// um nome do usuário é emitido: campo de record, local, parâmetro,
+    /// variável de `for`, nome ligado por `match` e alvo de atribuição.
+    #[test]
+    fn t78_palavra_chave_do_rust_vira_identificador_cru() {
+        let rust = generate_source(
+            "record Caixa\n\
+             \x20   type: integer\n\
+             end\n\
+             enum Coisa\n\
+             \x20   Uma(integer)\n\
+             end\n\
+             function soma(mod: integer, let: integer): integer\n\
+             \x20   return mod + let\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local c: Caixa = { type = 1 }\n\
+             \x20   c.type = 2\n\
+             \x20   local struct: integer = soma(1, 2)\n\
+             \x20   for loop = 1, 1 do\n\
+             \x20       struct = struct + loop\n\
+             \x20   end\n\
+             \x20   local box: Coisa = Uma(9)\n\
+             \x20   match box with\n\
+             \x20       Uma(unsafe) then struct = struct + unsafe\n\
+             \x20   end\n\
+             \x20   print(\"kw-\" .. c.type .. \"-\" .. struct)\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("pub r#type: i64,"), "campo: {rust}");
+        assert!(rust.contains("r#mod: i64"), "parâmetro: {rust}");
+        assert!(rust.contains("let mut r#struct: i64"), "local: {rust}");
+        assert!(rust.contains("let mut r#loop: i64"), "var do for: {rust}");
+        assert!(rust.contains("r#unsafe"), "ligado do match: {rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t78_palavras_chave");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "kw-2-13\n");
+    }
+
+    /// Os quatro que o Rust proíbe **até** como identificador cru
+    /// (`r#self` não existe) ganham sufixo em vez do prefixo.
+    #[test]
+    fn t78_nomes_sem_forma_crua_ganham_sufixo() {
+        let rust = generate_source(
+            "function main(args: {string}): integer\n\
+             \x20   local self: integer = 1\n\
+             \x20   local crate: integer = 2\n\
+             \x20   local super: integer = 3\n\
+             \x20   print(\"s-\" .. self .. crate .. super)\n\
+             \x20   return 0\n\
+             end",
+        );
+        assert!(rust.contains("let self_titan: i64"), "{rust}");
+        assert!(rust.contains("let crate_titan: i64"), "{rust}");
+        assert!(rust.contains("let super_titan: i64"), "{rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t78_sem_forma_crua");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "s-123\n");
+    }
+
     // ---- T69: `Option` no Rust gerado ---------------------------------
 
     #[test]
@@ -5328,6 +5614,47 @@ end"#;
         let (avisos, output) = compila_e_executa(&rust, "t77_array");
         assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "soma: 5\n");
+    }
+
+    /// `T?` fica do lado do `Box`, e não do lado do `{T}`: `Option<T>` do
+    /// Rust **embute** o `T` em vez de apontar para ele, então
+    /// `Proximo(Cadeia?)` sem encaixotar dá "recursive type has infinite
+    /// size" (E0072) — um erro do rustc, em inglês, sobre código que o
+    /// usuário não escreveu. O campo inteiro é que é encaixotado
+    /// (`Box<Option<Cadeia>>`), porque quem alcança o enum é o campo.
+    #[test]
+    fn t77_recursao_por_opcional_leva_box() {
+        let rust = generate_source(
+            "enum Cadeia\n\
+             \x20   Fim(boolean)\n\
+             \x20   Proximo(Cadeia?)\n\
+             end\n\
+             function conta(c: Cadeia): integer\n\
+             \x20   return match c with\n\
+             \x20       Fim(b) then 0\n\
+             \x20       Proximo(p) then 1\n\
+             \x20   end\n\
+             end\n\
+             function main(args: {string}): integer\n\
+             \x20   local vazio: Cadeia = Proximo(nil)\n\
+             \x20   print(\"conta: \" .. conta(vazio))\n\
+             \x20   return 0\n\
+             end",
+        );
+
+        assert!(
+            rust.contains("Proximo(Box<Option<Cadeia>>)"),
+            "gerado: {rust}"
+        );
+        // A construção acompanha a declaração: `Box::new` por fora do `None`.
+        assert!(
+            rust.contains("Cadeia::Proximo(Box::new(None))"),
+            "gerado: {rust}"
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t77_opcional");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "conta: 1\n");
     }
 
     /// Semântica de valor (ADR 0006) valendo para tipo soma: o escrutinado
