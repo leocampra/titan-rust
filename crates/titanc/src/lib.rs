@@ -15,6 +15,7 @@ pub mod capabilities;
 pub mod checker;
 pub mod codegen;
 pub mod driver;
+pub mod grafo;
 pub mod lexer;
 pub mod manifesto;
 pub mod parser;
