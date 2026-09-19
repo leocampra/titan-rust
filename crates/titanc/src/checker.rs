@@ -4903,6 +4903,32 @@ valor precisam de nomes diferentes.",
         Some(typed)
     }
 
+    /// A declaração do `enum` de nome `nome` — a deste módulo, ou a de um
+    /// módulo importado (T82).
+    ///
+    /// `self.enums` só tem os `enum` declarados **aqui**; um
+    /// `match c with ... end` sobre um `c: tipos.Cor` precisa das variantes
+    /// que estão do outro lado da fronteira. Sem o segundo olhar, o `match`
+    /// de um enum importado desistia em silêncio — os nomes ligados pelos
+    /// braços jamais eram declarados, e o erro que o usuário via era um
+    /// "'n' não foi declarado" na linha seguinte, longe da causa.
+    ///
+    /// A busca nos exports não escolhe entre módulos homônimos: enums de
+    /// dois módulos com o mesmo nome são o limite nominal que o checker
+    /// (T81) já registrou, e fechá-lo exige o módulo de origem dentro do
+    /// próprio `Type`. Aqui o `Type::Sum` já veio do escrutinado, então o
+    /// pior caso é ler as variantes do enum errado — o mesmo que
+    /// `Type::equals` já fazia.
+    fn enum_declarado(&self, nome: &str) -> Option<Type> {
+        if let Some(ty) = self.enums.get(nome) {
+            return Some(ty.clone());
+        }
+        self.exports
+            .values()
+            .find_map(|exportado| exportado.enums.get(nome))
+            .cloned()
+    }
+
     /// Resolve um padrão de braço contra a declaração do `enum` escrutinado
     /// (T76), devolvendo o padrão tipado e os nomes que ele liga.
     ///
@@ -4923,7 +4949,7 @@ valor precisam de nomes diferentes.",
             return Some((TypedPattern::Wildcard { loc: *loc }, Vec::new()));
         };
 
-        let Some(Type::Sum { variants, .. }) = self.enums.get(enum_name).cloned() else {
+        let Some(Type::Sum { variants, .. }) = self.enum_declarado(enum_name) else {
             return None;
         };
         let Some((_, field_types)) = variants.iter().find(|(n, _)| n == name) else {
@@ -5000,7 +5026,7 @@ valor precisam de nomes diferentes.",
         enum_name: &str,
         arms: &[ast::MatchArm<T>],
     ) -> bool {
-        let Some(Type::Sum { variants, .. }) = self.enums.get(enum_name).cloned() else {
+        let Some(Type::Sum { variants, .. }) = self.enum_declarado(enum_name) else {
             return false;
         };
 

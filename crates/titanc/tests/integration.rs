@@ -2717,17 +2717,17 @@ fn write_projeto(dir: &Path, arquivos: &[(&str, &str)]) {
     }
 }
 
-/// Critério de aceite da T81 pela CLI: um programa de três módulos — `main`
-/// importa `parser`, `parser` importa `lexer` — **tipa** entre arquivos, com
-/// o `record` de `lexer` atravessando os dois saltos e a `local function`
-/// ficando de fora.
+/// Critério de aceite da T82 pela CLI: um programa de três módulos — `main`
+/// importa `parser`, `parser` importa `lexer` — compila a um **único**
+/// executável e roda com a saída certa, com o `record` de `lexer`
+/// atravessando os dois saltos e a `local function` ficando de fora.
 ///
-/// A emissão do Rust multi-módulo é a T82, e é por isso que o `titanc` ainda
-/// para aqui: o que este teste prova é que ele para com uma **mensagem
-/// clara**, e nunca com um panic — a convenção mais antiga do projeto.
+/// A prova ponta a ponta da Parte B: manifesto (T79), grafo (T80), checagem
+/// entre módulos (T81) e a emissão de um `mod` Rust por módulo Titan (T82),
+/// tudo pela mesma linha de comando que o usuário digita.
 #[test]
-fn t81_programa_multi_modulo_tipa_e_para_com_mensagem_clara() {
-    let dir = temp_dir("t81-multi-modulo");
+fn t82_programa_multi_modulo_compila_a_um_binario_e_roda() {
+    let dir = temp_dir("t82-multi-modulo");
     write_projeto(
         &dir,
         &[
@@ -2747,7 +2747,8 @@ fn t81_programa_multi_modulo_tipa_e_para_com_mensagem_clara() {
                 "src/main.titan",
                 "import parser\n\
                  function main(args: {string}): integer\n\
-                 \x20   local n: integer = parser.primeiro().linha\n    return n\nend\n",
+                 \x20   local n: integer = parser.primeiro().linha\n\
+                 \x20   print(\"linha: \" .. n)\n    return 0\nend\n",
             ),
             (
                 "titan.toml",
@@ -2757,6 +2758,36 @@ fn t81_programa_multi_modulo_tipa_e_para_com_mensagem_clara() {
         ],
     );
 
+    // Primeiro o `--emit-rust`, que é o que o critério de aceite pede ver:
+    // os `mod` e as referências qualificadas.
+    let emitido = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(&dir)
+        .arg("--emit-rust")
+        .output()
+        .expect("invoca titanc --emit-rust --manifesto");
+    assert_never_panics(&emitido);
+    let rust = String::from_utf8_lossy(&emitido.stdout);
+    for modulo in ["pub mod lexer {", "pub mod parser {", "pub mod prog {"] {
+        assert!(rust.contains(modulo), "faltou '{modulo}' no Rust:\n{rust}");
+    }
+    assert!(
+        rust.contains("-> crate::lexer::Token"),
+        "o tipo de outro módulo tem de sair qualificado:\n{rust}"
+    );
+    assert!(
+        rust.contains("crate::lexer::titan_novo("),
+        "a chamada entre módulos tem de sair qualificada:\n{rust}"
+    );
+    // A `local function` continua sem `pub` — dentro de um `mod`, isso passa
+    // a ser privacidade de verdade, conferida pelo rustc.
+    assert!(
+        rust.contains("fn titan_interna()") && !rust.contains("pub fn titan_interna()"),
+        "a `local function` não pode sair `pub`:\n{rust}"
+    );
+
+    // Depois a compilação de verdade: **um** executável, com os três
+    // módulos dentro (decisão 5 da fase — um crate Cargo por programa).
     let output = Command::new(titanc_bin())
         .arg("--manifesto")
         .arg(&dir)
@@ -2765,18 +2796,17 @@ fn t81_programa_multi_modulo_tipa_e_para_com_mensagem_clara() {
         .output()
         .expect("invoca titanc --manifesto");
     assert_never_panics(&output);
+    assert!(
+        output.status.success(),
+        "titanc falhou no programa de três módulos: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Nenhum erro de **tipo**: os três módulos tiparam, e o que resta é só a
-    // emissão que a T82 vai escrever.
-    assert!(
-        !stderr.contains("erro de tipo"),
-        "os três módulos deveriam tipar: {stderr}"
-    );
-    assert!(
-        stderr.contains("emissão de Rust multi-módulo ainda não"),
-        "esperava a mensagem da emissão pendente: {stderr}"
-    );
+    let binario = dir.join("prog");
+    assert!(binario.exists(), "esperava executável em {binario:?}");
+    let execucao = Command::new(&binario).output().expect("executa ./prog");
+    assert_eq!(String::from_utf8_lossy(&execucao.stdout), "linha: 8\n");
+    assert_eq!(execucao.status.code(), Some(0));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
