@@ -224,9 +224,9 @@ fn resolver_grafo(opts: &Options) -> Result<Grafo, CompileError> {
 /// Checa todos os módulos do grafo, na ordem topológica, e devolve os
 /// programas tipados na mesma ordem.
 ///
-/// A ordem importa desde já, mesmo que a T80 ainda não passe símbolos de um
-/// módulo para outro: é ela que garante que, quando a T81 ligar os escopos,
-/// toda dependência já terá sido checada quando quem a importa for checado.
+/// A ordem é o que faz a T81 funcionar: cada módulo é checado **uma vez**, e
+/// o que ele exporta entra na tabela que os seguintes recebem — quando um
+/// módulo é checado, toda dependência sua já deixou seus símbolos lá.
 ///
 /// Os erros de todos os módulos saem **juntos**, e não só os do primeiro que
 /// falha: quem acabou de escrever três módulos prefere a lista inteira a
@@ -235,10 +235,37 @@ fn resolver_grafo(opts: &Options) -> Result<Grafo, CompileError> {
 fn checar_grafo(grafo: &Grafo) -> Result<Vec<checker::CheckedProgram>, CompileError> {
     let mut checados = Vec::with_capacity(grafo.modulos.len());
     let mut erros = Vec::new();
+    // O que cada módulo já checado exporta (T81), acumulado na ordem
+    // topológica: quando um módulo é checado, toda dependência sua já
+    // passou por aqui e já deixou seus símbolos na tabela.
+    let mut exports = checker::Exportacoes::new();
 
-    for modulo in &grafo.modulos {
-        match checker::check(&modulo.programa) {
-            Ok(checado) => {
+    for (indice, modulo) in grafo.modulos.iter().enumerate() {
+        // Uma dependência que não checou não exportou nada, e seguir daqui
+        // encheria a lista de "o módulo 'lexer' não tem 'x'" — erros que são
+        // consequência do primeiro, não defeitos deste módulo. Pular quem
+        // depende de um módulo quebrado deixa a lista com o que o usuário
+        // tem de consertar; os módulos **independentes** seguem sendo
+        // checados, que é o que faz valer a pena reunir os erros.
+        let dependencia_quebrada = modulo
+            .dependencias
+            .iter()
+            .any(|dependencia| !exports.contains_key(dependencia.as_str()));
+        if dependencia_quebrada {
+            debug_assert!(
+                !erros.is_empty(),
+                "uma dependência sem exports só existe depois de um erro"
+            );
+            continue;
+        }
+        let contexto = if indice == grafo.principal {
+            checker::Contexto::principal(exports.clone())
+        } else {
+            checker::Contexto::importado(exports.clone())
+        };
+        match checker::check_com(&modulo.programa, contexto) {
+            Ok((checado, exportado)) => {
+                exports.insert(modulo.nome.clone(), exportado);
                 // Avisos (T76) não impedem a compilação, mas precisam ser
                 // vistos: saem em stderr, para não se misturarem ao Rust que
                 // `--emit-rust` manda para stdout.
@@ -262,6 +289,10 @@ fn checar_grafo(grafo: &Grafo) -> Result<Vec<checker::CheckedProgram>, CompileEr
     }
 
     if erros.is_empty() {
+        // Sem erro nenhum, nada foi pulado — e é isso que faz
+        // `checados[grafo.principal]` continuar sendo o módulo principal em
+        // `compile`, que indexa a lista pelo índice do grafo.
+        debug_assert_eq!(checados.len(), grafo.modulos.len());
         Ok(checados)
     } else {
         Err(CompileError::Check(erros))
@@ -289,17 +320,43 @@ fn prefixar(mut erro: CheckError, grafo: &Grafo, modulo: &grafo::Modulo) -> Chec
     erro
 }
 
+/// O módulo de usuário que o programa principal importa, se houver (T81).
+///
+/// A leitura é das arestas que o grafo (T80) já calculou, e não da AST
+/// tipada: um `import lexer` no principal é exatamente a condição em que
+/// `codegen::emit_call` pode encontrar um `Callee::Module` que não é
+/// capability — e varrer a AST inteira para distinguir o `import` usado do
+/// meramente escrito custaria uma travessia completa de `TypedStat`, que é
+/// justamente o que a T82 vai construir para emitir. Recusar pelo `import`
+/// é mais restritivo do que o necessário em um caso (o `import` escrito e
+/// não usado), e esse caso não perde nada: o programa segue sendo checado,
+/// que é o que a T81 entrega.
+fn modulo_de_usuario_importado(grafo: &Grafo) -> Option<&str> {
+    grafo.principal().dependencias.first().map(String::as_str)
+}
+
 /// Executa o pipeline completo. Devolve o caminho do executável final.
 pub fn compile(opts: &Options) -> Result<PathBuf, CompileError> {
     let grafo = resolver_grafo(opts)?;
     let checados = checar_grafo(&grafo)?;
 
-    // A emissão multi-módulo (um `mod` Rust por módulo Titan) é a T82, e o
-    // `import` de módulo de usuário só passa a tipar na T81. Até lá o Rust
-    // sai do módulo principal, e os demais foram lidos, parseados e
-    // checados — o que já paga o grafo, porque é aqui que ciclo, módulo
-    // inexistente e erro de sintaxe numa dependência são pegos, antes de
-    // qualquer checagem.
+    // A emissão multi-módulo (um `mod` Rust por módulo Titan) é a T82. A
+    // T81 fez o `import` de módulo de usuário **tipar**, e é por isso que
+    // este corte existe: sem ele, um programa que agora passa no checker
+    // desceria até um `codegen::emit_call` que procura `lexer` na tabela de
+    // capabilities e entraria em pânico — o que a convenção do projeto
+    // (PRD.md) não admite em nenhuma entrada. Até a T82, o Rust sai do
+    // módulo principal, e os demais foram lidos, parseados e checados; o
+    // grafo já se paga, porque é aqui que ciclo, módulo inexistente e erro
+    // de sintaxe numa dependência são pegos.
+    if let Some(modulo) = modulo_de_usuario_importado(&grafo) {
+        return Err(CompileError::Codegen(CodegenError(format!(
+            "o programa importa o módulo de usuário '{modulo}' e foi \
+             checado sem erro, mas a emissão de Rust multi-módulo ainda não \
+             existe (T82): por enquanto só programas de arquivo único chegam \
+             a gerar código."
+        ))));
+    }
     let rust_code = codegen::generate(&checados[grafo.principal].program)?;
 
     if opts.emit_rust {
@@ -790,6 +847,258 @@ mod tests {
         let saida = executar(&binario);
         assert_eq!(String::from_utf8_lossy(&saida.stdout), "ok\n");
         assert_eq!(saida.status.code(), Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Um `titan.toml` com os módulos dados, sempre com o mesmo principal.
+    fn manifesto_de(modulos: &[(&str, &str)]) -> String {
+        let mut out =
+            String::from("[pacote]\nnome = \"p\"\nprincipal = \"src/main.titan\"\n\n[modulos]\n");
+        for (nome, caminho) in modulos {
+            out.push_str(&format!("{nome} = \"{caminho}\"\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn t81_programa_de_tres_modulos_checa() {
+        // O critério de aceite da T81 pelo driver: `main` importa `parser`,
+        // `parser` importa `lexer`, e o `record` declarado em `lexer`
+        // atravessa os dois saltos. A emissão de Rust é a T82 — até lá, o
+        // que se prova aqui é que o programa **tipa**, e o corte de
+        // `compile` diz por que ainda não gera binário.
+        let dir = projeto(
+            "t81-tres",
+            &[
+                (
+                    "src/lexer.titan",
+                    "record Token\n    linha: integer\nend\n\
+                     function novo(linha: integer): Token\n\
+                     \x20   local t: Token = {linha = linha}\n    return t\nend\n",
+                ),
+                (
+                    "src/parser.titan",
+                    "import lexer\n\
+                     function primeiro(): lexer.Token\n    return lexer.novo(7)\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import parser\n\
+                     function main(args: {string}): integer\n\
+                     \x20   local n: integer = parser.primeiro().linha\n\
+                     \x20   return n\nend\n",
+                ),
+                (
+                    "titan.toml",
+                    &manifesto_de(&[("lexer", "src/lexer.titan"), ("parser", "src/parser.titan")]),
+                ),
+            ],
+        );
+
+        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        let grafo = resolver_grafo(&opts).expect("o grafo resolve");
+        checar_grafo(&grafo).unwrap_or_else(|e| panic!("os três módulos deveriam tipar: {e}"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t81_erro_de_tipo_entre_modulos_nomeia_o_modulo_de_origem() {
+        // A assinatura atravessa a fronteira de verdade, e o erro aponta o
+        // arquivo onde a chamada errada está — não o que declarou a função.
+        let dir = projeto(
+            "t81-erro-entre-modulos",
+            &[
+                (
+                    "src/lexer.titan",
+                    "function novo(linha: integer): integer\n    return linha\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import lexer\n\
+                     function main(args: {string}): integer\n\
+                     \x20   print(lexer.novo(\"sete\"))\n    return 0\nend\n",
+                ),
+                ("titan.toml", &manifesto_de(&[("lexer", "src/lexer.titan")])),
+            ],
+        );
+
+        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        let erro = compile(&opts).expect_err("string não é integer");
+
+        let mensagem = erro.to_string();
+        assert!(
+            mensagem.contains("em 'p':"),
+            "o erro é de quem chamou, e é 'p' quem chamou: {mensagem}"
+        );
+        assert!(
+            mensagem.contains("lexer.novo"),
+            "a mensagem precisa nomear a função: {mensagem}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t81_local_function_de_outro_modulo_e_recusada_pelo_driver() {
+        let dir = projeto(
+            "t81-local",
+            &[
+                (
+                    "src/lexer.titan",
+                    "local function interna(): integer\n    return 1\nend\n\
+                     function publica(): integer\n    return interna()\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import lexer\n\
+                     function main(args: {string}): integer\n\
+                     \x20   local n: integer = lexer.interna()\n    return n\nend\n",
+                ),
+                ("titan.toml", &manifesto_de(&[("lexer", "src/lexer.titan")])),
+            ],
+        );
+
+        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        let erro = compile(&opts).expect_err("`local function` não é exportada");
+
+        assert!(
+            erro.to_string()
+                .contains("é uma `local function` do módulo 'lexer'"),
+            "mensagem inesperada: {erro}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t81_modulo_importado_nao_precisa_de_main() {
+        // Antes da T81, `checar_grafo` exigia uma `main` de **todo** módulo —
+        // o que tornava um `lexer.titan` impossível de escrever. Este teste é
+        // o que fixa a regra nova: só o principal precisa dela.
+        let dir = projeto(
+            "t81-sem-main",
+            &[
+                (
+                    "src/lexer.titan",
+                    "function novo(): integer\n    return 0\nend\n",
+                ),
+                ("src/main.titan", MAIN_VAZIA),
+                ("titan.toml", &manifesto_de(&[("lexer", "src/lexer.titan")])),
+            ],
+        );
+
+        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        let grafo = resolver_grafo(&opts).expect("o grafo resolve");
+
+        // `lexer.titan` não tem `main`, e mesmo assim os dois módulos checam.
+        checar_grafo(&grafo)
+            .unwrap_or_else(|e| panic!("um módulo importado não precisa de main: {e}"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t81_principal_sem_main_continua_sendo_erro() {
+        // O contraponto: a exigência não sumiu, mudou de alcance.
+        let dir = projeto(
+            "t81-principal-sem-main",
+            &[
+                (
+                    "src/main.titan",
+                    "function nada(): integer\n    return 0\nend\n",
+                ),
+                (
+                    "titan.toml",
+                    "[pacote]\nnome = \"p\"\nprincipal = \"src/main.titan\"\n",
+                ),
+            ],
+        );
+
+        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        let erro = compile(&opts).expect_err("o principal precisa de main");
+
+        assert!(
+            erro.to_string()
+                .contains("função 'main' precisa ter a assinatura"),
+            "mensagem inesperada: {erro}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t81_import_desconhecido_em_programa_com_manifesto_lista_as_duas_fontes() {
+        // Aqui o erro vem do **grafo** (T80), que resolve o `import` antes de
+        // qualquer checagem; a mensagem do checker (T81) cobre o mesmo caso
+        // quando o módulo chega até ele. As duas listam as duas fontes.
+        let dir = projeto(
+            "t81-import-sumido",
+            &[
+                (
+                    "src/main.titan",
+                    "import sumido\n\
+                     function main(args: {string}): integer\n    return 0\nend\n",
+                ),
+                (
+                    "src/lexer.titan",
+                    "function novo(): integer\n    return 0\nend\n",
+                ),
+                ("titan.toml", &manifesto_de(&[("lexer", "src/lexer.titan")])),
+            ],
+        );
+
+        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        let erro = compile(&opts).expect_err("'sumido' não existe");
+
+        let mensagem = erro.to_string();
+        assert!(
+            mensagem.contains("capabilities: data, texto, io"),
+            "faltou listar as capabilities: {mensagem}"
+        );
+        assert!(
+            mensagem.contains("declarados no manifesto: lexer"),
+            "faltou listar os módulos do manifesto: {mensagem}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t81_emissao_multi_modulo_e_recusada_com_mensagem_clara() {
+        // A T82 é quem emite os `mod`. Até lá, o programa que usa um módulo
+        // de usuário tem de parar **aqui**, com uma mensagem em português —
+        // e não num `expect` do codegen, que a convenção do projeto proíbe.
+        let dir = projeto(
+            "t81-sem-emissao",
+            &[
+                (
+                    "src/lexer.titan",
+                    "function novo(): integer\n    return 0\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import lexer\n\
+                     function main(args: {string}): integer\n\
+                     \x20   local n: integer = lexer.novo()\n    return n\nend\n",
+                ),
+                ("titan.toml", &manifesto_de(&[("lexer", "src/lexer.titan")])),
+            ],
+        );
+
+        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
+        let erro = compile(&opts).expect_err("a emissão multi-módulo é a T82");
+
+        assert!(
+            matches!(erro, CompileError::Codegen(_)),
+            "esperava erro de codegen, veio: {erro}"
+        );
+        assert!(
+            erro.to_string()
+                .contains("emissão de Rust multi-módulo ainda não"),
+            "mensagem inesperada: {erro}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
