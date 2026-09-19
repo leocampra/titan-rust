@@ -67,6 +67,10 @@ const INDENT: &str = "    ";
 /// campos de variante saem `Box<T>` — a alternativa seria um segundo
 /// parâmetro em trinta assinaturas.
 struct EmitCtx {
+    /// De que módulo vem cada tipo nominal, e em qual `mod` esta emissão
+    /// está escrevendo (T82) — ver [`Qualificacao`]. Vazia no programa de
+    /// arquivo único, que é o que preserva o byte-a-byte da T80.
+    qual: Qualificacao,
     /// Nomes de parâmetro composto (`array`/`map`/`record`) da função
     /// **atual** — dentro do corpo, esses nomes já são uma referência Rust
     /// (`&mut T`, [`rust_param_type_name`]), então emprestá-los de novo
@@ -108,6 +112,59 @@ type Ctx<'a> = &'a EmitCtx;
 /// nomes de variante sejam **únicos no programa inteiro**, justamente porque
 /// a construção `ExpInteger(42)` não diz de que enum ela vem.
 type BoxedFields = HashSet<(String, usize)>;
+
+/// De onde vem cada tipo nominal do programa e em qual `mod` a emissão está
+/// escrevendo agora (T82).
+///
+/// Num programa multi-módulo, cada módulo Titan vira um `mod` do Rust, e o
+/// `record Token` declarado em `lexer` é `crate::lexer::Token` visto de
+/// qualquer outro lugar. Mas [`Type::Record`] e [`Type::Sum`] são nominais
+/// **pelo nome nu** — o checker (T81) já registrou esse limite —, então o
+/// módulo de origem não vem no tipo: vem daqui, de uma tabela montada uma
+/// vez sobre o grafo inteiro, no mesmo espírito de [`campos_boxeados`].
+///
+/// **Vazia é o arquivo único.** Sem módulos, `atual` é `None` e `origens`
+/// não tem nada; [`Qualificacao::caminho`] devolve o nome nu e todo o
+/// backend emite exatamente o que emitia antes da T82 — que é o critério de
+/// aceite mais estreito da tarefa.
+///
+/// **Por que `crate::` e não o nome do `mod` sozinho:** de dentro de
+/// `mod parser`, escrever `lexer::Token` só resolveria se `lexer` fosse
+/// visível ali (não é: os dois são irmãos sob a raiz). `crate::lexer::Token`
+/// é absoluto e vale em qualquer profundidade, inclusive na raiz onde o shim
+/// de entrada vive.
+#[derive(Debug, Clone, Default)]
+struct Qualificacao {
+    /// Nome do tipo nominal → nome do módulo que o declara.
+    origens: HashMap<String, String>,
+    /// O módulo cujo `mod` está sendo emitido, se houver algum.
+    atual: Option<String>,
+}
+
+impl Qualificacao {
+    /// O caminho Rust pelo qual o tipo nominal `nome` é referenciado **do
+    /// ponto em que a emissão está**.
+    ///
+    /// Nome declarado no próprio módulo sai **nu**: dentro de `mod lexer`, a
+    /// `struct Token` é `Token`, e qualificá-la seria ruído — além de mudar
+    /// o Rust do arquivo único, que não tem `mod` nenhum.
+    fn caminho(&self, nome: &str) -> String {
+        match self.origens.get(nome) {
+            Some(modulo) if Some(modulo) != self.atual.as_ref() => {
+                format!("crate::{modulo}::{nome}")
+            }
+            _ => nome.to_string(),
+        }
+    }
+
+    /// A mesma tabela, com o cursor movido para outro `mod`.
+    fn em(&self, modulo: &str) -> Qualificacao {
+        Qualificacao {
+            origens: self.origens.clone(),
+            atual: Some(modulo.to_string()),
+        }
+    }
+}
 
 /// Uma construção que o checker já tipa, mas que este backend ainda não sabe
 /// emitir. Nunca indica erro do programa Titan em si (o checker já validou
@@ -158,9 +215,16 @@ impl std::error::Error for CodegenError {}
 /// `enum Exp ExpNo(Caixa) end` + `record Caixa e: Exp end` — que a checagem
 /// de ciclo de record não vê, porque `Exp` não é um record — é encontrado
 /// aqui.
-fn campos_boxeados(program: &TypedProgram) -> BoxedFields {
-    let enums: HashMap<&str, &[(String, Vec<Type>)]> = program
+///
+/// **Recebe o programa inteiro, e não um módulo** (T82): a decisão é da
+/// *declaração* do enum, e o `match` que a lê pode estar em outro módulo. A
+/// travessia também precisa da união — `enum Exp` em `ast` com um campo de
+/// um `record` declarado em `tipos` só se dimensiona olhando os dois. No
+/// arquivo único a fatia tem um elemento e nada muda.
+fn campos_boxeados(programas: &[&TypedProgram]) -> BoxedFields {
+    let enums: HashMap<&str, &[(String, Vec<Type>)]> = programas
         .iter()
+        .flat_map(|programa| programa.iter())
         .filter_map(|top| match top {
             TypedTopLevel::Enum { name, variants, .. } => {
                 Some((name.as_str(), variants.as_slice()))
@@ -233,6 +297,22 @@ fn campos_boxeados(program: &TypedProgram) -> BoxedFields {
     boxed
 }
 
+/// Um módulo Titan pronto para a emissão multi-módulo (T82): o nome com que
+/// os outros o importam e a AST já tipada.
+///
+/// O driver monta esta lista na **ordem topológica** do grafo (T80), mas a
+/// emissão não depende dela: no Rust, um `mod` pode referenciar outro
+/// declarado adiante. A ordem sobrevive porque é a do fonte, e um
+/// `main.rs` que segue a ordem em que o programa foi escrito é mais fácil
+/// de ler que um reordenado por conveniência do backend.
+pub struct Modulo<'a> {
+    /// Nome do `mod` Rust gerado — o nome do módulo no manifesto, nunca o
+    /// alias local de um `import ... as` (T72).
+    pub nome: &'a str,
+    /// A AST tipada do módulo.
+    pub programa: &'a TypedProgram,
+}
+
 /// Gera o `main.rs` completo (structs de record + funções do programa + shim
 /// de entrada) a partir da AST tipada.
 ///
@@ -240,29 +320,132 @@ fn campos_boxeados(program: &TypedProgram) -> BoxedFields {
 /// referencia antes de todos estarem declarados, mas manter a ordem "tipos
 /// antes de funções" é convenção usual do Rust gerado. Entre os dois a ordem
 /// não importa: no Rust, um item pode referenciar outro declarado adiante.
+///
+/// Esta é a porta do **arquivo único**, e continua sendo byte-a-byte o que
+/// sempre foi: sem `mod`, sem qualificação de tipo, e o shim chamando
+/// `titan_main` na raiz. A emissão multi-módulo é [`generate_modulos`].
 pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
-    // O mapa de campos encaixotados (T77) é calculado **uma vez**, sobre o
-    // programa inteiro, e vale para toda a emissão: a declaração do `enum`, a
-    // construção de variante e o padrão do `match` têm de concordar sobre
-    // quais campos são `Box<T>`, e a única forma de não divergirem é os três
-    // lerem a mesma resposta.
-    let ctx = EmitCtx {
-        params: HashSet::new(),
-        boxed: campos_boxeados(program),
-    };
-
     let mut out = String::new();
+    let boxed = campos_boxeados(&[program]);
+    emit_itens(&mut out, program, &Qualificacao::default(), &boxed);
+    out.push_str(&entry_shim(None));
+    Ok(out)
+}
+
+/// Gera o `main.rs` de um programa **multi-módulo** (T82): um `mod` Rust por
+/// módulo Titan, num arquivo só — a decisão 5 da fase ("um crate Cargo por
+/// programa, um `mod` Rust por módulo Titan").
+///
+/// `principal` é o índice, em `modulos`, do módulo que tem a `main`; é o
+/// `titan_main` dele que o shim de entrada chama.
+///
+/// **Visibilidade:** `pub` já era emitido por [`emit_toplevel`] em toda
+/// função não-`local` desde antes da T82 — o que a T81 decidiu sobre
+/// exportação e o que o Rust gerado faz coincidem sem trabalho extra. O que
+/// muda aqui é que o `pub` passa a **significar** algo: dentro de um `mod`,
+/// `local function` deixa de ser visível de fora de verdade, e não só por
+/// convenção.
+///
+/// **Sobre os nomes dos `mod`:** o manifesto (T79) já recusa nome de módulo
+/// que colida com capability, e o lexer só aceita identificadores Titan —
+/// que são identificadores Rust válidos, exceto pelas palavras reservadas,
+/// e nenhuma delas ([`PALAVRAS_RESERVADAS_DO_RUST`]) sobrevive a um
+/// `titan.toml` sem antes o usuário ver o erro de módulo desconhecido. Ainda
+/// assim o nome passa por [`ident`], pela mesma disciplina de todo
+/// identificador que este backend escreve.
+pub fn generate_modulos(modulos: &[Modulo<'_>], principal: usize) -> Result<String, CodegenError> {
+    let qual = qualificacao_de(modulos);
+    let programas: Vec<&TypedProgram> = modulos.iter().map(|m| m.programa).collect();
+    let boxed = campos_boxeados(&programas);
+    let mut out = String::new();
+
+    for modulo in modulos {
+        let mut corpo = String::new();
+        emit_itens(&mut corpo, modulo.programa, &qual.em(modulo.nome), &boxed);
+
+        out.push_str("pub mod ");
+        out.push_str(&ident(modulo.nome));
+        out.push_str(" {\n");
+        // `emit_itens` separa cada item do **seguinte** com uma linha em
+        // branco, o que na raiz deixa o arquivo pronto para o shim. Dentro
+        // de um `mod` essa última linha ficaria entre o corpo e o `}`, e o
+        // `rustfmt` a tiraria — tirá-la aqui é o que faz o `mod` sair com a
+        // forma que um humano escreveria.
+        out.push_str(&indentar(corpo.trim_end_matches('\n')));
+        out.push_str("}\n\n");
+    }
+
+    let principal = modulos.get(principal).ok_or_else(|| {
+        CodegenError("o módulo principal não está na lista de módulos.".to_string())
+    })?;
+    out.push_str(&entry_shim(Some(principal.nome)));
+    Ok(out)
+}
+
+/// De que módulo vem cada tipo nominal do programa (T82).
+///
+/// Colisão de nome entre módulos — dois `record Token`, um em cada — resolve
+/// pelo **primeiro** da ordem topológica, e é o limite que o checker (T81)
+/// já registrou: `Type::equals` é nominal pelo nome nu, então os dois tipos
+/// já eram indistinguíveis antes de chegar aqui. Fechá-lo de verdade exige
+/// o módulo de origem dentro do próprio `Type`, e não uma tabela montada
+/// depois; a escolha determinística aqui só garante que a emissão não
+/// dependa da ordem de iteração de um `HashMap`.
+fn qualificacao_de(modulos: &[Modulo<'_>]) -> Qualificacao {
+    let mut origens: HashMap<String, String> = HashMap::new();
+    for modulo in modulos {
+        for top in modulo.programa {
+            let nome = match top {
+                TypedTopLevel::Record { name, .. } | TypedTopLevel::Enum { name, .. } => name,
+                _ => continue,
+            };
+            origens
+                .entry(nome.clone())
+                .or_insert_with(|| modulo.nome.to_string());
+        }
+    }
+    Qualificacao {
+        origens,
+        atual: None,
+    }
+}
+
+/// Os itens de **um** programa Titan — records, enums, `extern "C"` e
+/// funções —, sem shim de entrada.
+///
+/// Extraída de `generate` quando a T82 passou a precisar do mesmo corpo em
+/// dois lugares: na raiz do arquivo único e dentro de cada `mod`. A
+/// qualificação (e, com ela, o `mod` em que a emissão está) é o único
+/// parâmetro que distingue os dois usos.
+///
+/// `boxed` (T77) chega pronto, e do **programa inteiro**: a declaração do
+/// `enum`, a construção de variante e o padrão do `match` têm de concordar
+/// sobre quais campos são `Box<T>`, e depois da T82 os três podem estar em
+/// módulos diferentes. Calculá-lo aqui, por módulo, faria o `match` de um
+/// enum importado esquecer o `Box` que a declaração pôs — e o rustc
+/// recusaria, em inglês, com um `expected Exp, found Box<Exp>`.
+fn emit_itens(
+    out: &mut String,
+    program: &TypedProgram,
+    qual: &Qualificacao,
+    boxed: &BoxedFields,
+) {
+    let ctx = EmitCtx {
+        qual: qual.clone(),
+        params: HashSet::new(),
+        boxed: boxed.clone(),
+    };
 
     for top in program {
         if let TypedTopLevel::Record { name, fields, .. } = top {
-            emit_record_struct(&mut out, name, fields);
+            emit_record_struct(out, name, fields, qual);
             out.push('\n');
         }
     }
 
     for top in program {
         if let TypedTopLevel::Enum { name, variants, .. } = top {
-            emit_enum(&mut out, name, variants, &ctx);
+            emit_enum(out, name, variants, &ctx);
             out.push('\n');
         }
     }
@@ -279,20 +462,35 @@ pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
             ..
         } = top
         {
-            emit_foreign_extern(&mut out, name, params, rettypes);
+            emit_foreign_extern(out, name, params, rettypes);
             out.push('\n');
         }
     }
 
     for top in program {
         if matches!(top, TypedTopLevel::Func { .. }) {
-            emit_toplevel(&mut out, top, &ctx.boxed);
+            emit_toplevel(out, top, &ctx.boxed, qual);
             out.push('\n');
         }
     }
+}
 
-    out.push_str(ENTRY_SHIM);
-    Ok(out)
+/// Indenta um nível o corpo de um `mod` (T82) — linha em branco fica em
+/// branco, para o Rust gerado não sair com espaços soltos no fim da linha.
+///
+/// Reindentar linha a linha é seguro porque nenhum literal emitido por este
+/// backend contém quebra de linha crua: `format_string_literal` usa o
+/// `{:?}` do Rust, que escapa `\n` como `\\n`.
+fn indentar(corpo: &str) -> String {
+    let mut out = String::with_capacity(corpo.len() + corpo.len() / 8);
+    for linha in corpo.lines() {
+        if !linha.is_empty() {
+            out.push_str(INDENT);
+            out.push_str(linha);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// `struct Nome { pub campo: Tipo, .. }` — `Clone` é obrigatório (decisão 1
@@ -300,7 +498,12 @@ pub fn generate(program: &TypedProgram) -> Result<String, CodegenError> {
 /// record pode conter `String`/`Vec`/outro record não-`Copy`. Sem mangling no
 /// nome: o namespace de tipos do Rust não colide com o `fn main` do shim
 /// (ADR 0009).
-fn emit_record_struct(out: &mut String, name: &str, fields: &[(String, Type)]) {
+fn emit_record_struct(
+    out: &mut String,
+    name: &str,
+    fields: &[(String, Type)],
+    qual: &Qualificacao,
+) {
     out.push_str("#[derive(Clone, Debug, PartialEq)]\n");
     out.push_str("pub struct ");
     out.push_str(name);
@@ -310,7 +513,7 @@ fn emit_record_struct(out: &mut String, name: &str, fields: &[(String, Type)]) {
         out.push_str("pub ");
         out.push_str(&ident(fname));
         out.push_str(": ");
-        out.push_str(&rust_type_name(fty));
+        out.push_str(&rust_type_name(fty, qual));
         out.push_str(",\n");
     }
     out.push_str("}\n");
@@ -337,7 +540,7 @@ fn emit_enum(out: &mut String, name: &str, variants: &[(String, Vec<Type>)], ctx
             let tipos: Vec<String> = fields
                 .iter()
                 .enumerate()
-                .map(|(i, fty)| rust_field_type_name(fty, ctx.e_boxeado(vname, i)))
+                .map(|(i, fty)| rust_field_type_name(fty, ctx.e_boxeado(vname, i), &ctx.qual))
                 .collect();
             out.push('(');
             out.push_str(&tipos.join(", "));
@@ -350,11 +553,11 @@ fn emit_enum(out: &mut String, name: &str, variants: &[(String, Vec<Type>)], ctx
 
 /// Tipo Rust de um campo de variante: [`rust_type_name`], envolvido em
 /// `Box<..>` quando o campo foi encaixotado (T77).
-fn rust_field_type_name(ty: &Type, boxeado: bool) -> String {
+fn rust_field_type_name(ty: &Type, boxeado: bool, qual: &Qualificacao) -> String {
     if boxeado {
-        format!("Box<{}>", rust_type_name(ty))
+        format!("Box<{}>", rust_type_name(ty, qual))
     } else {
-        rust_type_name(ty)
+        rust_type_name(ty, qual)
     }
 }
 
@@ -433,12 +636,22 @@ fn c_abi_rettype_name(rettypes: &[Type]) -> Option<String> {
 /// Shim de entrada (PRD.md, T6): o `fn main` real do binário gerado — separado
 /// do `main` do Titan, que vira `titan_main` via mangling — coleta os
 /// argumentos da linha de comando e usa o código de saída retornado.
-const ENTRY_SHIM: &str = "\
-fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    std::process::exit(titan_main(&mut args) as i32);
+///
+/// `principal` é o `mod` onde a `main` do Titan foi parar na emissão
+/// multi-módulo (T82); `None` é o arquivo único, em que ela está na raiz e o
+/// shim sai exatamente como sempre saiu.
+fn entry_shim(principal: Option<&str>) -> String {
+    let alvo = match principal {
+        Some(modulo) => format!("crate::{}::titan_main", ident(modulo)),
+        None => "titan_main".to_string(),
+    };
+    format!(
+        "fn main() {{\n\
+         {INDENT}let mut args: Vec<String> = std::env::args().skip(1).collect();\n\
+         {INDENT}std::process::exit({alvo}(&mut args) as i32);\n\
+         }}\n"
+    )
 }
-";
 
 /// Prefixo de mangling para nomes de função Titan, evitando colisão com o
 /// `fn main` do shim e com palavras-chave do Rust (PRD.md, T6).
@@ -481,7 +694,7 @@ fn ident(name: &str) -> String {
     }
 }
 
-fn emit_toplevel(out: &mut String, top: &TypedTopLevel, boxed: &BoxedFields) {
+fn emit_toplevel(out: &mut String, top: &TypedTopLevel, boxed: &BoxedFields, qual: &Qualificacao) {
     let TypedTopLevel::Func {
         islocal,
         name,
@@ -515,13 +728,13 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel, boxed: &BoxedFields) {
                 // `_nome` já não colide com palavra-chave do Rust.
                 format!("_{name}")
             };
-            format!("{rust_name}: {}", rust_param_type_name(ty))
+            format!("{rust_name}: {}", rust_param_type_name(ty, qual))
         })
         .collect();
     out.push_str(&param_list.join(", "));
     out.push(')');
 
-    if let Some(ret) = rust_rettype_name(rettypes) {
+    if let Some(ret) = rust_rettype_name(rettypes, qual) {
         out.push_str(" -> ");
         out.push_str(&ret);
     }
@@ -532,6 +745,7 @@ fn emit_toplevel(out: &mut String, top: &TypedTopLevel, boxed: &BoxedFields) {
     // lado do mapa de campos encaixotados (T77), que é do programa e não
     // desta função.
     let ctx = EmitCtx {
+        qual: qual.clone(),
         params: params
             .iter()
             .filter(|(_, ty)| is_composite(ty))
@@ -840,7 +1054,7 @@ fn emit_narrowed_block(out: &mut String, then: &TypedThen, depth: usize, ctx: Ct
         let Some(base) = narrowed_base_type(&then.condition, nome) else {
             continue;
         };
-        let t = rust_type_name(&base);
+        let t = rust_type_name(&base, &ctx.qual);
         if reatribuido {
             indent(out, depth);
             out.push_str(&format!(
@@ -973,7 +1187,7 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str(if *mutable { "let mut " } else { "let " });
             out.push_str(&ident(name));
             out.push_str(": ");
-            out.push_str(&rust_type_name(ty));
+            out.push_str(&rust_type_name(ty, &ctx.qual));
             out.push_str(" = ");
             out.push_str(&emit_slot_value(ty, value, ctx));
             out.push_str(";\n");
@@ -994,7 +1208,7 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                 out.push_str(if target.mutable { "let mut " } else { "let " });
                 out.push_str(&ident(&target.name));
                 out.push_str(": ");
-                out.push_str(&rust_type_name(&target.ty));
+                out.push_str(&rust_type_name(&target.ty, &ctx.qual));
                 out.push_str(" = ");
                 out.push_str(temporario);
                 out.push_str(";\n");
@@ -1163,7 +1377,7 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             block,
             ..
         } => {
-            let t = rust_type_name(ty);
+            let t = rust_type_name(ty, &ctx.qual);
             let inner = depth + 1;
             // Bloco externo: a variável de controle e as auxiliares não vazam
             // para fora do laço (semântica Titan) — e laços aninhados apenas
@@ -1276,7 +1490,17 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                 TypedForInKind::Array { name, elem_ty } => {
                     let interno = forin_pattern(name, usado(name));
                     out.push_str(&format!("for {interno} in {base}.iter() {{\n"));
-                    emit_forin_binding(out, name, elem_ty, &interno, block, usado(name), depth + 1);
+                    if usado(name) {
+                        emit_forin_binding(
+                            out,
+                            name,
+                            elem_ty,
+                            &interno,
+                            block,
+                            depth + 1,
+                            &ctx.qual,
+                        );
+                    }
                 }
                 TypedForInKind::Map {
                     key_name,
@@ -1287,24 +1511,28 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
                     let chave = forin_pattern(key_name, usado(key_name));
                     let valor = forin_pattern(value_name, usado(value_name));
                     out.push_str(&format!("for ({chave}, {valor}) in {base}.iter() {{\n"));
-                    emit_forin_binding(
-                        out,
-                        key_name,
-                        key_ty,
-                        &chave,
-                        block,
-                        usado(key_name),
-                        depth + 1,
-                    );
-                    emit_forin_binding(
-                        out,
-                        value_name,
-                        value_ty,
-                        &valor,
-                        block,
-                        usado(value_name),
-                        depth + 1,
-                    );
+                    if usado(key_name) {
+                        emit_forin_binding(
+                            out,
+                            key_name,
+                            key_ty,
+                            &chave,
+                            block,
+                            depth + 1,
+                            &ctx.qual,
+                        );
+                    }
+                    if usado(value_name) {
+                        emit_forin_binding(
+                            out,
+                            value_name,
+                            value_ty,
+                            &valor,
+                            block,
+                            depth + 1,
+                            &ctx.qual,
+                        );
+                    }
                 }
             }
             emit_block_stats(out, block, depth + 1, ctx);
@@ -1339,7 +1567,7 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
             out.push_str(" {\n");
             for arm in arms {
                 indent(out, depth + 1);
-                out.push_str(&emit_pattern(&arm.pattern, &arm.body));
+                out.push_str(&emit_pattern(&arm.pattern, &arm.body, &ctx.qual));
                 out.push_str(" => {\n");
                 emit_arm_bindings(out, &arm.pattern, &arm.body, depth + 2, ctx);
                 emit_block_stats(out, &arm.body, depth + 2, ctx);
@@ -1363,20 +1591,22 @@ fn emit_stat(out: &mut String, stat: &TypedStat, depth: usize, ctx: Ctx) {
 /// variável do laço cai no `unused_mut`/`immutable` do rustc antes. Uma fase
 /// futura que queira permitir `x = x + 1` sobre a variável ligada faz disso
 /// um `let mut`.
+///
+/// Só é chamada para nome que o corpo **usa**: uma ligação que ninguém lê
+/// renderia `unused_variables`, e o critério da fase é Rust gerado sem
+/// warnings. A pergunta fica em quem chama, que já a fez para montar o
+/// padrão do `for` (`forin_pattern`).
 fn emit_forin_binding(
     out: &mut String,
     name: &str,
     ty: &Type,
     interno: &str,
     block: &TypedStat,
-    usado: bool,
     depth: usize,
+    qual: &Qualificacao,
 ) {
-    if !usado {
-        return;
-    }
     indent(out, depth);
-    let rust_ty = rust_type_name(ty);
+    let rust_ty = rust_type_name(ty, qual);
     // `let mut` só quando o corpo escreve na variável — senão o rustc
     // reclamaria de `unused_mut`, e o critério é Rust sem warnings.
     let bind = if assigns_to_name(block, name) {
@@ -1417,7 +1647,7 @@ fn forin_pattern(name: &str, usado: bool) -> String {
 /// tarefa é Rust gerado **sem warnings**. O `_` no padrão também dispensa
 /// [`emit_arm_bindings`] de emitir a ligação correspondente, e as duas
 /// decisões usam a mesma pergunta ([`campo_usado`]) para não divergirem.
-fn emit_pattern(pattern: &TypedPattern, body: &impl UsaNome) -> String {
+fn emit_pattern(pattern: &TypedPattern, body: &impl UsaNome, qual: &Qualificacao) -> String {
     let TypedPattern::Variant {
         enum_name,
         name,
@@ -1427,6 +1657,7 @@ fn emit_pattern(pattern: &TypedPattern, body: &impl UsaNome) -> String {
     else {
         return "_".to_string();
     };
+    let enum_name = qual.caminho(enum_name);
     if fields.is_empty() {
         return format!("{enum_name}::{name}");
     }
@@ -1483,7 +1714,7 @@ fn emit_arm_bindings(
         } else {
             "let"
         };
-        let rust_ty = rust_type_name(fty);
+        let rust_ty = rust_type_name(fty, &ctx.qual);
         let boxeado = ctx.e_boxeado(name, i);
         let valor = if valor_com_buffer_proprio(fty) || *fty == Type::String {
             // Um deref a mais no encaixotado: o padrão ligou `&Box<T>`, e
@@ -2587,24 +2818,7 @@ fn emit_call(callee: &Callee, args: &[TypedExp], ret: &Type, ctx: Ctx) -> String
                 let rendered_args = emit_args_by_param(args, builtin.params, ctx);
                 return format!("{}({})", builtin.rust_path, rendered_args.join(", "));
             }
-            let rendered_args: Vec<String> = args
-                .iter()
-                // Um argumento de tipo soma (T77) segue por **valor**, como
-                // escalar, mas é dono de buffer próprio como record: sem o
-                // `.clone()`, `tinge(c) + tinge(c)` moveria `c` na primeira
-                // chamada e o rustc recusaria a segunda em inglês. É
-                // `emit_slot_value` quem já sabe essa regra — o parâmetro é
-                // um slot como qualquer outro.
-                .map(|a| {
-                    if a.ty == Type::String {
-                        emit_owned_string(a, ctx)
-                    } else if is_composite(&a.ty) {
-                        emit_place_mut(a, ctx)
-                    } else {
-                        emit_slot_value(&a.ty, a, ctx)
-                    }
-                })
-                .collect();
+            let rendered_args = emit_args_by_titan_abi(args, ctx);
             format!("{}({})", mangle_fn_name(name), rendered_args.join(", "))
         }
         // `abs(-7)` com `abs` declarada por `foreign function` (T73). Três
@@ -2625,15 +2839,34 @@ fn emit_call(callee: &Callee, args: &[TypedExp], ret: &Type, ctx: Ctx) -> String
         // `data.read_csv(...)` (T39): chamada de função de módulo — sem
         // receptor, argumentos por posição contra a assinatura da
         // capability (mesma ABI por-parâmetro do builtin/função Titan).
-        Callee::Module { module, name } => {
-            let capability = crate::capabilities::lookup_module(module)
-                .expect("checker só produz Callee::Module para módulo importado existente");
-            let function = capability
-                .find_function(name)
-                .expect("checker só produz Callee::Module para função existente na capability");
-            let rendered_args = emit_args_by_param(args, function.params, ctx);
-            format!("{}({})", function.rust_path, rendered_args.join(", "))
-        }
+        Callee::Module { module, name } => match crate::capabilities::lookup_module(module) {
+            Some(capability) => {
+                let function = capability
+                    .find_function(name)
+                    .expect("checker só produz Callee::Module para função existente na capability");
+                let rendered_args = emit_args_by_param(args, function.params, ctx);
+                format!("{}({})", function.rust_path, rendered_args.join(", "))
+            }
+            // `lexer.novo(7)` (T82): módulo de **usuário**, e não capability
+            // — `lookup_module` não o acha porque ele não está em
+            // `capabilities.rs`, está no `titan.toml`.
+            //
+            // A chamada é a de uma função Titan comum, e não a de uma
+            // função de runtime: mesmo mangling (`titan_novo`, que segue
+            // valendo dentro de cada `mod` — o namespace do Rust já separa)
+            // e mesma ABI por argumento de [`Callee::Direct`]. O que muda é
+            // só o caminho, absoluto a partir da raiz para valer de dentro
+            // de qualquer `mod`.
+            None => {
+                let rendered_args = emit_args_by_titan_abi(args, ctx);
+                format!(
+                    "crate::{}::{}({})",
+                    ident(module),
+                    mangle_fn_name(name),
+                    rendered_args.join(", ")
+                )
+            }
+        },
         // `df.soma(...)` (T40): método sobre tipo opaco — o receptor entra
         // como primeiro argumento posicional da função Rust do runtime, por
         // `emit_place_mut` (T42: `Opaque` já é `is_composite`, reusa a
@@ -2658,6 +2891,33 @@ fn emit_call(callee: &Callee, args: &[TypedExp], ret: &Type, ctx: Ctx) -> String
             format!("{}({})", method.rust_path, all_args.join(", "))
         }
     }
+}
+
+/// Os argumentos de uma chamada a função **Titan**, pela ABI da fase
+/// (ADR 0006/0007): `string` por valor próprio, composto por `&mut`, escalar
+/// e tipo soma por valor.
+///
+/// Um argumento de tipo soma (T77) segue por **valor**, como escalar, mas é
+/// dono de buffer próprio como record: sem o `.clone()`, `tinge(c) + tinge(c)`
+/// moveria `c` na primeira chamada e o rustc recusaria a segunda em inglês. É
+/// `emit_slot_value` quem já sabe essa regra — o parâmetro é um slot como
+/// qualquer outro.
+///
+/// Serve `f(x)` ([`Callee::Direct`]) e `lexer.f(x)` (módulo de usuário,
+/// T82) sem diferença: as duas chamam a mesma função Titan, uma pelo nome
+/// mangled na raiz e a outra pelo caminho do `mod`.
+fn emit_args_by_titan_abi(args: &[TypedExp], ctx: Ctx) -> Vec<String> {
+    args.iter()
+        .map(|a| {
+            if a.ty == Type::String {
+                emit_owned_string(a, ctx)
+            } else if is_composite(&a.ty) {
+                emit_place_mut(a, ctx)
+            } else {
+                emit_slot_value(&a.ty, a, ctx)
+            }
+        })
+        .collect()
 }
 
 /// Chamada a uma `foreign function` (T73) — ver o braço `Callee::Foreign`
@@ -2792,7 +3052,7 @@ fn emit_record_lit(type_name: &str, fields: &[(String, TypedExp)], ctx: Ctx) -> 
             )
         })
         .collect();
-    format!("{type_name} {{ {} }}", rendered.join(", "))
+    format!("{} {{ {} }}", ctx.qual.caminho(type_name), rendered.join(", "))
 }
 
 /// `ExpInteger(42)` como construção de variante (T77) →
@@ -2806,6 +3066,7 @@ fn emit_record_lit(type_name: &str, fields: &[(String, TypedExp)], ctx: Ctx) -> 
 /// é aqui que o `Box` da declaração se paga: `ExpBinop("+", a, b)` aloca os
 /// dois operandos e o valor resultante tem tamanho finito.
 fn emit_variant_lit(enum_name: &str, variant: &str, args: &[TypedExp], ctx: Ctx) -> String {
+    let enum_name = ctx.qual.caminho(enum_name);
     if args.is_empty() {
         return format!("{enum_name}::{variant}");
     }
@@ -2857,7 +3118,7 @@ fn emit_match_exp(
         let corpo = emit_slot_value(&arm.body.ty, &arm.body, ctx);
         braços.push(format!(
             "{} => {{ {ligacoes}{corpo} }}",
-            emit_pattern(&arm.pattern, &arm.body)
+            emit_pattern(&arm.pattern, &arm.body, &ctx.qual)
         ));
     }
     let nu = format!("match &{} {{ {} }}", emit_exp(scrutinee, ctx), braços.join(" "));
@@ -2904,35 +3165,37 @@ fn borrow_runtime_str(exp: &TypedExp, ctx: Ctx) -> String {
 /// [`emit_record_struct`], sem mangling (ADR 0009). `Value`/`Function`/
 /// `Option`/`Invalid` nunca chegam aqui: `resolve_type` (`checker.rs`) já
 /// rejeita essas anotações com erro claro antes da passada 2.
-fn rust_type_name(ty: &Type) -> String {
+fn rust_type_name(ty: &Type, qual: &Qualificacao) -> String {
     match ty {
         Type::Nil => "()".to_string(),
         Type::Boolean => "bool".to_string(),
         Type::Integer => "i64".to_string(),
         Type::Float => "f64".to_string(),
         Type::String => "String".to_string(),
-        Type::Array { elem } => format!("Vec<{}>", rust_type_name(elem)),
+        Type::Array { elem } => format!("Vec<{}>", rust_type_name(elem, qual)),
         Type::Map { keys, values } => {
             format!(
                 "std::collections::HashMap<{}, {}>",
-                rust_type_name(keys),
-                rust_type_name(values)
+                rust_type_name(keys, qual),
+                rust_type_name(values, qual)
             )
         }
-        Type::Record { name, .. } => name.clone(),
+        // Qualificado pelo módulo de origem quando a referência vem de fora
+        // dele (T82); nu no arquivo único e dentro do próprio `mod`.
+        Type::Record { name, .. } => qual.caminho(name),
         // `enum Nome` (T77) → o `enum` Rust de mesmo nome, exatamente como o
         // record: os dois são tipos nominais no mesmo namespace (ADR 0009).
         // Sem recursão sobre as variantes, e não é só economia: um `Sum`
         // aninhado chega do checker como placeholder de variantes vazias, e o
         // nome é tudo de que a emissão precisa.
-        Type::Sum { name, .. } => name.clone(),
+        Type::Sum { name, .. } => qual.caminho(name),
         // `T?` (T69) → `Option<T>`. O braço que a T68 deixou faltando: até
         // aqui um tipo opcional caía no `unreachable!` abaixo, e por isso
         // `generate` tinha de recusar o programa inteiro antes de emitir
         // qualquer coisa. O `base` passa por esta mesma função, então
         // composto dentro de opcional sai `Option<Vec<i64>>` e segue o ADR
         // 0006/0007 como qualquer outro composto.
-        Type::Option { base } => format!("Option<{}>", rust_type_name(base)),
+        Type::Option { base } => format!("Option<{}>", rust_type_name(base, qual)),
         // `value` (T70) → o enum boxado do runtime. A T25 rejeitava o tipo no
         // checker justamente porque este braço não existia e o
         // `unreachable!` abaixo viraria panic.
@@ -2964,16 +3227,16 @@ fn rust_type_name(ty: &Type) -> String {
 /// função. Quem recebe fica dono, como no retorno composto único que já
 /// existia — por isso aqui é [`rust_type_name`] e nunca
 /// [`rust_param_type_name`].
-fn rust_rettype_name(rettypes: &[Type]) -> Option<String> {
+fn rust_rettype_name(rettypes: &[Type], qual: &Qualificacao) -> Option<String> {
     match rettypes {
         [] => None,
         [Type::Nil] => None,
-        [único] => Some(rust_type_name(único)),
+        [único] => Some(rust_type_name(único, qual)),
         vários => Some(format!(
             "({})",
             vários
                 .iter()
-                .map(rust_type_name)
+                .map(|ty| rust_type_name(ty, qual))
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
@@ -2984,11 +3247,11 @@ fn rust_rettype_name(rettypes: &[Type]) -> Option<String> {
 /// exceto os tipos compostos (T30, decisão 4 da Fase 2) — `array`, `map` e
 /// `record` — que saem por `&mut T` em vez de por valor, preservando o
 /// idioma in-place da referência (`selection_sort`, PRD.md).
-fn rust_param_type_name(ty: &Type) -> String {
+fn rust_param_type_name(ty: &Type, qual: &Qualificacao) -> String {
     if is_composite(ty) {
-        format!("&mut {}", rust_type_name(ty))
+        format!("&mut {}", rust_type_name(ty, qual))
     } else {
-        rust_type_name(ty)
+        rust_type_name(ty, qual)
     }
 }
 
@@ -4012,6 +4275,7 @@ end"#;
     fn emit_args_by_param_usa_a_posicao_certa_por_tipo_do_parametro() {
         let loc = crate::ast::Loc { line: 0, col: 0 };
         let ctx = EmitCtx {
+            qual: Qualificacao::default(),
             params: HashSet::new(),
             boxed: BoxedFields::new(),
         };
@@ -5862,5 +6126,234 @@ end"#;
         let (avisos, output) = compila_e_executa(&rust, "t77_parens");
         assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "soma: 14\n");
+    }
+
+    // ------------------------------------------------------------------
+    // T82 — um `mod` Rust por módulo Titan
+    // ------------------------------------------------------------------
+
+    /// Checa uma lista de módulos na ordem dada — a ordem topológica que o
+    /// grafo (T80) entrega ao driver — e emite o `main.rs` multi-módulo.
+    /// O último da lista é o principal, como no grafo.
+    fn gera_modulos(fontes: &[(&str, &str)]) -> String {
+        let asts: Vec<_> = fontes
+            .iter()
+            .map(|(nome, fonte)| {
+                let tokens = lex(fonte).unwrap_or_else(|e| panic!("erro léxico em '{nome}': {e}"));
+                let programa =
+                    parse(&tokens).unwrap_or_else(|e| panic!("erro sintático em '{nome}': {e}"));
+                (*nome, programa)
+            })
+            .collect();
+
+        let mut exports = crate::checker::Exportacoes::new();
+        let mut checados = Vec::with_capacity(asts.len());
+        for (i, (nome, programa)) in asts.iter().enumerate() {
+            let contexto = if i + 1 == asts.len() {
+                crate::checker::Contexto::principal(exports.clone())
+            } else {
+                crate::checker::Contexto::importado(exports.clone())
+            };
+            let (checado, exportado) = crate::checker::check_com(programa, contexto)
+                .unwrap_or_else(|errs| {
+                    panic!(
+                        "erro de tipo em '{nome}': {}",
+                        errs.iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                });
+            exports.insert((*nome).to_string(), exportado);
+            checados.push(checado);
+        }
+
+        let modulos: Vec<Modulo<'_>> = asts
+            .iter()
+            .zip(&checados)
+            .map(|((nome, _), checado)| Modulo {
+                nome,
+                programa: &checado.program,
+            })
+            .collect();
+        generate_modulos(&modulos, modulos.len() - 1)
+            .unwrap_or_else(|e| panic!("erro de geração multi-módulo: {e}"))
+    }
+
+    #[test]
+    fn t82_qualificacao_vazia_devolve_o_nome_nu() {
+        // O invariante que sustenta o byte-a-byte do arquivo único: sem
+        // módulo nenhum, `caminho` é a identidade.
+        let vazia = Qualificacao::default();
+        assert_eq!(vazia.caminho("Token"), "Token");
+        assert_eq!(rust_type_name(&Type::Integer, &vazia), "i64");
+    }
+
+    #[test]
+    fn t82_qualificacao_nao_qualifica_dentro_do_proprio_modulo() {
+        let mut origens = HashMap::new();
+        origens.insert("Token".to_string(), "lexer".to_string());
+        let qual = Qualificacao {
+            origens,
+            atual: None,
+        };
+
+        // De dentro de `lexer`, o nome é nu; de qualquer outro lugar,
+        // absoluto a partir da raiz.
+        assert_eq!(qual.em("lexer").caminho("Token"), "Token");
+        assert_eq!(qual.em("parser").caminho("Token"), "crate::lexer::Token");
+        assert_eq!(qual.caminho("Token"), "crate::lexer::Token");
+        // Nome que não é de módulo nenhum (um record do próprio arquivo
+        // único) segue nu em qualquer posição.
+        assert_eq!(qual.em("parser").caminho("Outro"), "Outro");
+    }
+
+    #[test]
+    fn t82_dois_modulos_viram_dois_mods_com_o_shim_na_raiz() {
+        let rust = gera_modulos(&[
+            (
+                "lexer",
+                "record Token\n    linha: integer\nend\n\
+                 function novo(linha: integer): Token\n\
+                 \x20   local t: Token = {linha = linha}\n    return t\nend",
+            ),
+            (
+                "p",
+                "import lexer\n\
+                 function main(args: {string}): integer\n\
+                 \x20   local t: lexer.Token = lexer.novo(7)\n\
+                 \x20   print(\"linha: \" .. t.linha)\n    return 0\nend",
+            ),
+        ]);
+
+        assert!(rust.contains("pub mod lexer {\n"), "gerado:\n{rust}");
+        assert!(rust.contains("pub mod p {\n"), "gerado:\n{rust}");
+        // O `struct` sai **dentro** do `mod`, indentado um nível.
+        assert!(
+            rust.contains("    pub struct Token {\n"),
+            "gerado:\n{rust}"
+        );
+        // O shim fica na raiz, fora de qualquer `mod`, e chama a `main` do
+        // principal pelo caminho absoluto.
+        assert!(
+            rust.contains("\nfn main() {\n") && rust.contains("crate::p::titan_main(&mut args)"),
+            "gerado:\n{rust}"
+        );
+        // Nenhuma linha em branco entre o fim do corpo e o `}` do `mod`.
+        assert!(!rust.contains("\n\n}\n"), "gerado:\n{rust}");
+
+        let (avisos, output) = compila_e_executa(&rust, "t82_dois_mods");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "linha: 7\n");
+    }
+
+    #[test]
+    fn t82_enum_recursivo_de_outro_modulo_constroi_e_casa_qualificado() {
+        // Junta o que a fase tem de mais delicado: um `enum` recursivo
+        // (T77, com `Box`) declarado num módulo e percorrido por `match` de
+        // outro. A declaração, a construção e o padrão têm de concordar no
+        // caminho qualificado **e** no encaixotamento.
+        let rust = gera_modulos(&[
+            (
+                "ast",
+                "enum Exp\n    ExpInteger(integer)\n    ExpSoma(Exp, Exp)\nend\n\
+                 function folha(n: integer): Exp\n    return ExpInteger(n)\nend\n\
+                 function soma(a: Exp, b: Exp): Exp\n    return ExpSoma(a, b)\nend",
+            ),
+            (
+                "p",
+                "import ast\n\
+                 function avalia(e: ast.Exp): integer\n\
+                 \x20   local r: integer = match e with\n\
+                 \x20       ExpInteger(n) then\n\
+                 \x20           n\n\
+                 \x20       ExpSoma(a, b) then\n\
+                 \x20           avalia(a) + avalia(b)\n\
+                 \x20   end\n\
+                 \x20   return r\nend\n\
+                 function main(args: {string}): integer\n\
+                 \x20   local e: ast.Exp = ast.soma(ast.folha(2), ast.folha(40))\n\
+                 \x20   print(\"total: \" .. avalia(e))\n    return 0\nend",
+            ),
+        ]);
+
+        // O `Box` continua decidido pela declaração, dentro do módulo dono.
+        assert!(
+            rust.contains("ExpSoma(Box<Exp>, Box<Exp>)"),
+            "gerado:\n{rust}"
+        );
+        // O padrão do `match`, do outro lado da fronteira, sai qualificado.
+        assert!(
+            rust.contains("crate::ast::Exp::ExpSoma("),
+            "gerado:\n{rust}"
+        );
+        // E a assinatura que recebe o tipo também.
+        assert!(
+            rust.contains("titan_avalia(e: crate::ast::Exp)"),
+            "gerado:\n{rust}"
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t82_enum_recursivo");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "total: 42\n");
+    }
+
+    #[test]
+    fn t82_array_e_map_de_tipo_de_outro_modulo_saem_qualificados_por_dentro() {
+        // `rust_type_name` desce recursivamente em `Vec`/`HashMap`/`Option`:
+        // o que atravessa a fronteira pode estar **dentro** de um composto,
+        // e não só em posição de tipo nu.
+        let rust = gera_modulos(&[
+            (
+                "lexer",
+                "record Token\n    linha: integer\nend\n\
+                 function novo(linha: integer): Token\n\
+                 \x20   local t: Token = {linha = linha}\n    return t\nend",
+            ),
+            (
+                "p",
+                "import lexer\n\
+                 function main(args: {string}): integer\n\
+                 \x20   local ts: {lexer.Token} = {lexer.novo(1), lexer.novo(2)}\n\
+                 \x20   print(\"n: \" .. #ts)\n    return 0\nend",
+            ),
+        ]);
+
+        assert!(
+            rust.contains("Vec<crate::lexer::Token>"),
+            "gerado:\n{rust}"
+        );
+
+        let (avisos, output) = compila_e_executa(&rust, "t82_array_qualificado");
+        assert!(avisos.is_empty(), "warnings:\n{avisos}\n{rust}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "n: 2\n");
+    }
+
+    #[test]
+    fn t82_arquivo_unico_emite_exatamente_o_que_emitia_antes() {
+        // O critério de aceite mais estreito da T82, no nível do codegen:
+        // um programa sem módulos passa por `generate` e sai sem `mod`, sem
+        // `crate::` e com o shim chamando `titan_main` na raiz — que é a
+        // forma exata que os testes desta fase toda vêm conferindo.
+        let rust = generate_source(
+            "record Ponto\n    x: integer\nend\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: Ponto = {x = 1}\n\
+             \x20   print(\"x: \" .. p.x)\n    return 0\nend",
+        );
+
+        assert!(!rust.contains("mod "), "gerado:\n{rust}");
+        assert!(!rust.contains("crate::"), "gerado:\n{rust}");
+        assert!(rust.contains("pub struct Ponto {\n"), "gerado:\n{rust}");
+        assert!(rust.contains("let p: Ponto = Ponto { x: 1 };"), "gerado:\n{rust}");
+        assert!(
+            rust.ends_with(
+                "fn main() {\n\
+                 \x20   let mut args: Vec<String> = std::env::args().skip(1).collect();\n\
+                 \x20   std::process::exit(titan_main(&mut args) as i32);\n\
+                 }\n"
+            ),
+            "gerado:\n{rust}"
+        );
     }
 }

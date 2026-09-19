@@ -320,19 +320,34 @@ fn prefixar(mut erro: CheckError, grafo: &Grafo, modulo: &grafo::Modulo) -> Chec
     erro
 }
 
-/// O módulo de usuário que o programa principal importa, se houver (T81).
+/// Emite o `main.rs` do programa a partir do grafo checado (T82).
 ///
-/// A leitura é das arestas que o grafo (T80) já calculou, e não da AST
-/// tipada: um `import lexer` no principal é exatamente a condição em que
-/// `codegen::emit_call` pode encontrar um `Callee::Module` que não é
-/// capability — e varrer a AST inteira para distinguir o `import` usado do
-/// meramente escrito custaria uma travessia completa de `TypedStat`, que é
-/// justamente o que a T82 vai construir para emitir. Recusar pelo `import`
-/// é mais restritivo do que o necessário em um caso (o `import` escrito e
-/// não usado), e esse caso não perde nada: o programa segue sendo checado,
-/// que é o que a T81 entrega.
-fn modulo_de_usuario_importado(grafo: &Grafo) -> Option<&str> {
-    grafo.principal().dependencias.first().map(String::as_str)
+/// O arquivo único vai por [`codegen::generate`], e é a única forma de o
+/// byte-a-byte exigido pela T80 continuar valendo: sem `mod`, sem
+/// qualificação de tipo e com o shim chamando `titan_main` na raiz, como
+/// sempre. O programa com manifesto vai por [`codegen::generate_modulos`],
+/// que põe um `mod` por módulo Titan no mesmo arquivo (decisão 5 da fase).
+///
+/// **Todo módulo do grafo entra**, inclusive o declarado no manifesto e
+/// nunca importado por ninguém — um vértice isolado, que o grafo (T80)
+/// aceita de propósito. Emitir um `mod` que nada chama custa o tempo do
+/// rustc compilá-lo, e é o preço de o manifesto ser a fonte da verdade
+/// sobre o que faz parte do programa; podá-lo aqui faria o compilador
+/// discordar em silêncio do que o usuário declarou.
+fn emitir(grafo: &Grafo, checados: &[checker::CheckedProgram]) -> Result<String, CodegenError> {
+    if grafo.arquivo_unico() {
+        return codegen::generate(&checados[grafo.principal].program);
+    }
+    let modulos: Vec<codegen::Modulo<'_>> = grafo
+        .modulos
+        .iter()
+        .zip(checados)
+        .map(|(modulo, checado)| codegen::Modulo {
+            nome: &modulo.nome,
+            programa: &checado.program,
+        })
+        .collect();
+    codegen::generate_modulos(&modulos, grafo.principal)
 }
 
 /// Executa o pipeline completo. Devolve o caminho do executável final.
@@ -340,24 +355,7 @@ pub fn compile(opts: &Options) -> Result<PathBuf, CompileError> {
     let grafo = resolver_grafo(opts)?;
     let checados = checar_grafo(&grafo)?;
 
-    // A emissão multi-módulo (um `mod` Rust por módulo Titan) é a T82. A
-    // T81 fez o `import` de módulo de usuário **tipar**, e é por isso que
-    // este corte existe: sem ele, um programa que agora passa no checker
-    // desceria até um `codegen::emit_call` que procura `lexer` na tabela de
-    // capabilities e entraria em pânico — o que a convenção do projeto
-    // (PRD.md) não admite em nenhuma entrada. Até a T82, o Rust sai do
-    // módulo principal, e os demais foram lidos, parseados e checados; o
-    // grafo já se paga, porque é aqui que ciclo, módulo inexistente e erro
-    // de sintaxe numa dependência são pegos.
-    if let Some(modulo) = modulo_de_usuario_importado(&grafo) {
-        return Err(CompileError::Codegen(CodegenError(format!(
-            "o programa importa o módulo de usuário '{modulo}' e foi \
-             checado sem erro, mas a emissão de Rust multi-módulo ainda não \
-             existe (T82): por enquanto só programas de arquivo único chegam \
-             a gerar código."
-        ))));
-    }
-    let rust_code = codegen::generate(&checados[grafo.principal].program)?;
+    let rust_code = emitir(&grafo, &checados)?;
 
     if opts.emit_rust {
         println!("{rust_code}");
@@ -1065,41 +1063,288 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ------------------------------------------------------------------
+    // T82 — um `mod` Rust por módulo Titan
+    // ------------------------------------------------------------------
+
+    /// O Rust que `--emit-rust` imprimiria, sem passar por stdout.
+    fn rust_de(opts: &Options) -> String {
+        let grafo = resolver_grafo(opts).unwrap_or_else(|e| panic!("o grafo resolve: {e}"));
+        let checados = checar_grafo(&grafo).unwrap_or_else(|e| panic!("os módulos tipam: {e}"));
+        emitir(&grafo, &checados).unwrap_or_else(|e| panic!("a emissão funciona: {e}"))
+    }
+
     #[test]
-    fn t81_emissao_multi_modulo_e_recusada_com_mensagem_clara() {
-        // A T82 é quem emite os `mod`. Até lá, o programa que usa um módulo
-        // de usuário tem de parar **aqui**, com uma mensagem em português —
-        // e não num `expect` do codegen, que a convenção do projeto proíbe.
+    fn t82_emite_um_mod_por_modulo_com_as_referencias_qualificadas() {
+        // O critério de aceite da T82 sobre o `--emit-rust`: os `mod`
+        // aparecem, e o que atravessa a fronteira sai qualificado.
         let dir = projeto(
-            "t81-sem-emissao",
+            "t82-tres-mods",
             &[
                 (
                     "src/lexer.titan",
-                    "function novo(): integer\n    return 0\nend\n",
+                    "record Token\n    linha: integer\nend\n\
+                     function novo(linha: integer): Token\n\
+                     \x20   local t: Token = {linha = linha}\n    return t\nend\n",
+                ),
+                (
+                    "src/parser.titan",
+                    "import lexer\n\
+                     function primeiro(): lexer.Token\n    return lexer.novo(7)\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import parser\n\
+                     function main(args: {string}): integer\n\
+                     \x20   return parser.primeiro().linha\nend\n",
+                ),
+                (
+                    "titan.toml",
+                    &manifesto_de(&[("lexer", "src/lexer.titan"), ("parser", "src/parser.titan")]),
+                ),
+            ],
+        );
+
+        let rust = rust_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
+
+        // Um `mod` por módulo declarado, mais o principal.
+        assert!(rust.contains("pub mod lexer {"), "faltou o mod lexer:\n{rust}");
+        assert!(
+            rust.contains("pub mod parser {"),
+            "faltou o mod parser:\n{rust}"
+        );
+        assert!(rust.contains("pub mod p {"), "faltou o mod principal:\n{rust}");
+
+        // O `record` sai **uma vez**, dentro do módulo que o declara.
+        assert_eq!(
+            rust.matches("pub struct Token {").count(),
+            1,
+            "o record tem de sair uma vez só:\n{rust}"
+        );
+
+        // Referência de fora do módulo de origem: qualificada.
+        assert!(
+            rust.contains("-> crate::lexer::Token"),
+            "o retorno de 'parser.primeiro' tem de ser qualificado:\n{rust}"
+        );
+        assert!(
+            rust.contains("crate::lexer::titan_novo(7)"),
+            "a chamada entre módulos tem de ser qualificada:\n{rust}"
+        );
+        assert!(
+            rust.contains("crate::parser::titan_primeiro()"),
+            "a chamada do principal tem de ser qualificada:\n{rust}"
+        );
+
+        // Dentro do próprio módulo, o nome sai **nu**: qualificar seria
+        // ruído, e é o que mantém o arquivo único intacto.
+        assert!(
+            rust.contains("let t: Token ="),
+            "dentro de 'lexer' o record é 'Token' e nada mais:\n{rust}"
+        );
+
+        // O shim chama a `main` do principal, e não um `titan_main` solto.
+        assert!(
+            rust.contains("std::process::exit(crate::p::titan_main(&mut args) as i32);"),
+            "o shim tem de chamar a main do módulo principal:\n{rust}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t82_programa_de_tres_modulos_compila_e_roda_com_a_saida_certa() {
+        // A execução real: o `record` construído em `lexer`, devolvido por
+        // `parser` e lido pelo principal chega com o valor certo.
+        let dir = projeto(
+            "t82-roda",
+            &[
+                (
+                    "src/lexer.titan",
+                    "record Token\n    linha: integer\nend\n\
+                     function novo(linha: integer): Token\n\
+                     \x20   local t: Token = {linha = linha}\n    return t\nend\n",
+                ),
+                (
+                    "src/parser.titan",
+                    "import lexer\n\
+                     function primeiro(): lexer.Token\n    return lexer.novo(7)\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import parser\n\
+                     function main(args: {string}): integer\n\
+                     \x20   local t: integer = parser.primeiro().linha\n\
+                     \x20   print(\"linha: \" .. t)\n    return 0\nend\n",
+                ),
+                (
+                    "titan.toml",
+                    &manifesto_de(&[("lexer", "src/lexer.titan"), ("parser", "src/parser.titan")]),
+                ),
+            ],
+        );
+
+        let opts = Options {
+            input: PathBuf::new(),
+            manifesto: Some(dir.clone()),
+            out_dir: dir.clone(),
+            emit_rust: false,
+            verbose: false,
+        };
+        let binario = compile(&opts).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+
+        let saida = executar(&binario);
+        assert_eq!(String::from_utf8_lossy(&saida.stdout), "linha: 7\n");
+        assert_eq!(saida.status.code(), Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t82_enum_de_um_modulo_usado_em_outro_sai_qualificado_e_roda() {
+        // O mesmo que o record, para o tipo soma (T74–T77): a construção da
+        // variante e o padrão do `match` têm de concordar no caminho
+        // qualificado, senão o rustc recusa em inglês.
+        let dir = projeto(
+            "t82-enum",
+            &[
+                (
+                    "src/tipos.titan",
+                    "enum Cor\n    Vermelho\n    Rgb(integer)\nend\n\
+                     function vermelho(): Cor\n    return Vermelho\nend\n",
+                ),
+                (
+                    "src/main.titan",
+                    "import tipos\n\
+                     function main(args: {string}): integer\n\
+                     \x20   local c: tipos.Cor = tipos.vermelho()\n\
+                     \x20   local n: integer = match c with\n\
+                     \x20       Vermelho then\n\
+                     \x20           1\n\
+                     \x20       Rgb(v) then\n\
+                     \x20           v\n\
+                     \x20   end\n\
+                     \x20   print(\"cor: \" .. n)\n    return 0\nend\n",
+                ),
+                ("titan.toml", &manifesto_de(&[("tipos", "src/tipos.titan")])),
+            ],
+        );
+
+        let rust = rust_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
+        assert!(
+            rust.contains("crate::tipos::Cor::Vermelho"),
+            "a variante tem de sair qualificada de fora do módulo:\n{rust}"
+        );
+        assert_eq!(
+            rust.matches("pub enum Cor {").count(),
+            1,
+            "o enum tem de sair uma vez só:\n{rust}"
+        );
+
+        let opts = Options {
+            input: PathBuf::new(),
+            manifesto: Some(dir.clone()),
+            out_dir: dir.clone(),
+            emit_rust: false,
+            verbose: false,
+        };
+        let binario = compile(&opts).unwrap_or_else(|e| panic!("esperava sucesso: {e}"));
+        let saida = executar(&binario);
+        assert_eq!(String::from_utf8_lossy(&saida.stdout), "cor: 1\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t82_local_function_fica_privada_dentro_do_mod() {
+        // O `pub` que a T81 decidiu passa a **significar** algo: dentro de um
+        // `mod`, `local function` é privada de verdade para o rustc, e não só
+        // por convenção do checker.
+        let dir = projeto(
+            "t82-local-privada",
+            &[
+                (
+                    "src/lexer.titan",
+                    "local function interna(): integer\n    return 1\nend\n\
+                     function publica(): integer\n    return interna()\nend\n",
                 ),
                 (
                     "src/main.titan",
                     "import lexer\n\
                      function main(args: {string}): integer\n\
-                     \x20   local n: integer = lexer.novo()\n    return n\nend\n",
+                     \x20   return lexer.publica() - 1\nend\n",
                 ),
                 ("titan.toml", &manifesto_de(&[("lexer", "src/lexer.titan")])),
             ],
         );
 
-        let opts = opts_de(&dir, Some(dir.clone()), PathBuf::new());
-        let erro = compile(&opts).expect_err("a emissão multi-módulo é a T82");
-
+        let rust = rust_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
         assert!(
-            matches!(erro, CompileError::Codegen(_)),
-            "esperava erro de codegen, veio: {erro}"
+            rust.contains("fn titan_interna()") && !rust.contains("pub fn titan_interna()"),
+            "a `local function` não pode sair `pub`:\n{rust}"
         );
         assert!(
-            erro.to_string()
-                .contains("emissão de Rust multi-módulo ainda não"),
-            "mensagem inesperada: {erro}"
+            rust.contains("pub fn titan_publica()"),
+            "a função exportada tem de sair `pub`:\n{rust}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t82_modulo_declarado_e_nunca_importado_tambem_vira_mod() {
+        // O manifesto é a fonte da verdade sobre o que faz parte do
+        // programa; um módulo declarado e não importado é um vértice isolado
+        // do grafo (T80), e some do `main.rs` só se o usuário o tirar do
+        // `titan.toml`.
+        let dir = projeto(
+            "t82-orfao",
+            &[
+                (
+                    "src/orfao.titan",
+                    "function nunca(): integer\n    return 0\nend\n",
+                ),
+                ("src/main.titan", MAIN_VAZIA),
+                ("titan.toml", &manifesto_de(&[("orfao", "src/orfao.titan")])),
+            ],
+        );
+
+        let rust = rust_de(&opts_de(&dir, Some(dir.clone()), PathBuf::new()));
+        assert!(
+            rust.contains("pub mod orfao {"),
+            "o módulo órfão também vira `mod`:\n{rust}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t82_arquivo_unico_nao_ganha_mod_nenhum() {
+        // O critério de aceite mais estreito da tarefa: programa de um
+        // arquivo só emite **exatamente** o que emitia antes — sem `mod`
+        // supérfluo, sem qualificação, com o shim chamando `titan_main` na
+        // raiz. `arquivo_unico_emite_o_mesmo_rust_que_o_pipeline_direto`
+        // (T80) prova a igualdade byte-a-byte sobre os cinco exemplos; aqui
+        // ficam nomeadas as três formas que a T82 poderia ter introduzido.
+        for exemplo in ["hello", "nucleo", "compostos", "dados", "lexer"] {
+            let caminho = examples_dir().join(format!("{exemplo}.titan"));
+            let out_dir = temp_out_dir(&format!("t82-unico-{exemplo}"));
+            let rust = rust_de(&opts_de(&out_dir, None, caminho));
+
+            assert!(
+                !rust.contains("pub mod "),
+                "'{exemplo}.titan' é arquivo único e não pode ganhar `mod`"
+            );
+            assert!(
+                !rust.contains("crate::"),
+                "'{exemplo}.titan' é arquivo único e não pode ganhar qualificação"
+            );
+            assert!(
+                rust.contains("std::process::exit(titan_main(&mut args) as i32);"),
+                "o shim do arquivo único tem de chamar 'titan_main' na raiz"
+            );
+
+            let _ = std::fs::remove_dir_all(&out_dir);
+        }
     }
 }
