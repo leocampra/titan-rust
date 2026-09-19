@@ -151,6 +151,13 @@ fn compila_e_executa_hello_titan_conferindo_stdout_e_exit_code() {
         !cargo_toml.contains("titan-lsp"),
         "Cargo.toml gerado não deveria depender do LSP:\n{cargo_toml}"
     );
+    // Decisão técnica 9 da Fase 5 (PRD.md, T79): o crate `toml`, que lê o
+    // manifesto, é dep do workspace do compilador e nunca do programa
+    // gerado — mesma disciplina que o ADR 0019 impôs às deps do LSP.
+    assert!(
+        !cargo_toml.contains("toml = "),
+        "Cargo.toml gerado não deveria depender do crate toml:\n{cargo_toml}"
+    );
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }

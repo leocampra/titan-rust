@@ -16,5 +16,6 @@ pub mod checker;
 pub mod codegen;
 pub mod driver;
 pub mod lexer;
+pub mod manifesto;
 pub mod parser;
 pub mod types;
