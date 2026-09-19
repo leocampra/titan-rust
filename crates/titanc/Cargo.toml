@@ -8,3 +8,7 @@ repository.workspace = true
 
 [dependencies]
 titan-runtime.workspace = true
+# Leitura do manifesto `titan.toml` (PRD.md, T79). Dependência do **workspace
+# do compilador**, nunca do `Cargo.toml` gerado por programa — mesma
+# disciplina que o ADR 0019 impôs às deps do LSP.
+toml = { version = "0.9", default-features = false, features = ["parse"] }

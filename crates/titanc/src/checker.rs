@@ -782,6 +782,127 @@ pub struct CheckedProgram {
     pub warnings: Vec<CheckError>,
 }
 
+/// O que um módulo de usuário oferece a quem o importa (T81).
+///
+/// **Visibilidade:** `local function` **não** entra em `funcs` — entra em
+/// [`ModuloExportado::locais`], que existe só para a mensagem de erro poder
+/// dizer *por que* o nome não está disponível em vez de um "não tem função
+/// 'f'" que mandaria o usuário procurar um erro de digitação. Record e
+/// `enum` não têm forma local nesta fase e são sempre exportados.
+///
+/// **Limite conhecido, que a T82 fecha:** [`Type::Record`] e [`Type::Sum`]
+/// são nominais **pelo nome nu** (`Type::equals`), sem o módulo de origem.
+/// Dois módulos que declarem, cada um, um `record Token` produzem tipos que
+/// `equals` considera iguais, e o checker aceitaria passar um onde o outro é
+/// esperado. Qualificar o nome aqui não resolveria: o nome também é o da
+/// `struct` emitida, e reescrevê-lo mudaria o Rust gerado para o programa de
+/// arquivo único, que a T80 exige preservar byte-a-byte. O lugar de resolver
+/// é a T82, que já precisa dar ao tipo nominal o seu módulo de origem
+/// (`rust_type_name` qualificado, `lexer::Token`) para emitir os `mod` —
+/// e é o mesmo dado que faltaria aqui. Até lá o risco é real, mas estreito:
+/// exige dois módulos com um tipo de mesmo nome e uma passagem entre eles.
+///
+/// **Por que um resumo e não o `Checker` inteiro:** quem importa precisa das
+/// assinaturas e dos tipos nomeados, não das locais, dos escopos nem do
+/// corpo tipado do outro módulo. Guardar só o que atravessa a fronteira é o
+/// que impede um módulo de alcançar o que o outro não exportou — a mesma
+/// disciplina de [`crate::capabilities::Capability`], que descreve uma
+/// capability sem carregar o crate dela.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModuloExportado {
+    /// Funções não-locais: nome → [`Type::Function`].
+    pub funcs: HashMap<String, Type>,
+    /// Records declarados no módulo: nome → [`Type::Record`].
+    pub records: HashMap<String, Type>,
+    /// Enums declarados no módulo: nome → [`Type::Sum`].
+    pub enums: HashMap<String, Type>,
+    /// Nomes de `local function` — não chamáveis de fora, guardados só para
+    /// a mensagem de erro.
+    pub locais: HashSet<String>,
+}
+
+impl ModuloExportado {
+    /// A função exportada de nome `name`, se houver.
+    pub fn func(&self, name: &str) -> Option<&Type> {
+        self.funcs.get(name)
+    }
+
+    /// O tipo nominal (record ou `enum`) de nome `name`, se houver.
+    ///
+    /// Record e `enum` dividem o mesmo espaço de nomes dentro de um módulo
+    /// (`collect_record_names` recusa a colisão), então a ordem da consulta
+    /// não decide nada — é a mesma razão de `resolve_type` consultar as duas
+    /// tabelas em sequência.
+    pub fn tipo(&self, name: &str) -> Option<&Type> {
+        self.records.get(name).or_else(|| self.enums.get(name))
+    }
+
+    /// Os nomes exportados, em ordem alfabética — para as mensagens de erro
+    /// listarem o que o módulo *tem*, no mesmo molde de
+    /// [`crate::capabilities::Capability`].
+    pub fn nomes(&self) -> Vec<&str> {
+        let mut nomes: Vec<&str> = self
+            .funcs
+            .keys()
+            .chain(self.records.keys())
+            .chain(self.enums.keys())
+            .map(String::as_str)
+            .collect();
+        nomes.sort_unstable();
+        nomes
+    }
+}
+
+/// Os módulos de usuário já checados, pelo nome com que os outros os
+/// importam — o que o driver acumula ao descer a ordem topológica (T81).
+pub type Exportacoes = HashMap<String, ModuloExportado>;
+
+/// A que um nome importado resolve: uma capability do compilador
+/// (`import data`, T38) ou um módulo de usuário do manifesto
+/// (`import lexer`, T81).
+///
+/// As duas formas convivem na mesma tabela (`Checker::modules`) porque
+/// resolvem no **mesmo ponto** — `data.f(...)` e `lexer.f(...)` são a mesma
+/// sintaxe, e separá-las em duas tabelas obrigaria todo consumidor
+/// (`resolve_callee`, `resolve_type`, `check_assign`, o snapshot de escopo)
+/// a consultar as duas e a decidir a precedência de novo, cada um por conta
+/// própria. Com uma tabela só, a precedência é decidida uma vez, em
+/// `collect_signature`: capability primeiro, módulo de usuário depois.
+#[derive(Clone)]
+pub enum ModuleRef {
+    /// `import data` — resolve contra `capabilities.rs` (T37).
+    Capability(&'static crate::capabilities::Capability),
+    /// `import lexer` — resolve contra os símbolos exportados pelo módulo de
+    /// mesmo nome no grafo (T81). Carrega o nome **real** do módulo (o do
+    /// manifesto), nunca o alias local: é ele que o codegen (T82) usa para
+    /// nomear o `mod` do Rust gerado.
+    Usuario(String),
+}
+
+/// `Debug` e `PartialEq` à mão porque [`crate::capabilities::Capability`]
+/// não os deriva (é uma tabela de constantes, não um valor que se compara) —
+/// e porque a identidade de um módulo é o **nome**, não a estrutura: duas
+/// referências ao mesmo módulo são a mesma coisa, tenham ou não vindo do
+/// mesmo ponteiro `'static`.
+impl std::fmt::Debug for ModuleRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleRef::Capability(c) => write!(f, "Capability({})", c.titan_name),
+            ModuleRef::Usuario(nome) => write!(f, "Usuario({nome})"),
+        }
+    }
+}
+
+impl PartialEq for ModuleRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ModuleRef::Capability(a), ModuleRef::Capability(b)) => a.titan_name == b.titan_name,
+            (ModuleRef::Usuario(a), ModuleRef::Usuario(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 /// Operador unário já resolvido (T13; `Len` acrescentado estruturalmente na
 /// T25 — `#v`/`#s`, sem produtor ainda: `check_unop` só mapeia `-`/`not` do
 /// parser).
@@ -825,7 +946,18 @@ struct Checker {
     /// esquerda do `.` — com `import data as d` (T72) a chave é `d`. O nome
     /// real do módulo, que o codegen precisa para achar o caminho Rust, sai
     /// de `Capability::titan_name`, nunca desta chave.
-    modules: HashMap<String, &'static crate::capabilities::Capability>,
+    modules: HashMap<String, ModuleRef>,
+    /// Os módulos de usuário que este pode importar (T81): o que o driver
+    /// acumulou ao checar as dependências, na ordem topológica do grafo.
+    ///
+    /// Vazio no caminho de arquivo único e no LSP, e é exatamente isso que
+    /// mantém o comportamento da T80 intacto: sem nenhuma entrada aqui, todo
+    /// `import` que não é capability volta a cair na mensagem de sempre.
+    exports: Exportacoes,
+    /// Se este é o módulo **principal** do programa (T81) — o único de quem
+    /// se exige uma `main`. Um módulo importado não tem ponto de entrada, e
+    /// cobrá-la dele seria cobrar uma função que nunca seria chamada.
+    principal: bool,
     /// Índice colateral de usos resolvidos, para hover e go-to-definition
     /// (T49) — ver [`SymbolUse`].
     uses: Vec<SymbolUse>,
@@ -915,6 +1047,8 @@ impl Checker {
             variant_owner: HashMap::new(),
             enum_def_locs: HashMap::new(),
             modules: HashMap::new(),
+            exports: Exportacoes::new(),
+            principal: true,
             foreigns: HashSet::new(),
             uses: Vec::new(),
             scopes: Vec::new(),
@@ -976,6 +1110,33 @@ impl Checker {
             message: message.into(),
             loc,
         });
+    }
+
+    /// Mensagem do `import` que não resolveu contra fonte nenhuma (T81).
+    ///
+    /// O erro lista as **duas** fontes de módulo — as capabilities do
+    /// compilador e os módulos do manifesto — porque quem escreveu
+    /// `import lexer` não sabe (nem precisa saber) em qual das duas o
+    /// compilador procurou; dizer só uma manda procurar o erro no lugar
+    /// errado.
+    ///
+    /// **Sem módulo de usuário nenhum a mensagem é a de sempre**, palavra
+    /// por palavra: num programa de arquivo único não há `[modulos]` para
+    /// citar, e apontar para uma seção de um arquivo que não existe seria
+    /// pior do que o silêncio. É a mesma distinção que
+    /// `grafo::dependencias_de` faz com `multi_modulo`.
+    fn erro_de_import_desconhecido(&self, modname: &str) -> String {
+        let capabilities = crate::capabilities::available_module_names().join(", ");
+        if self.exports.is_empty() {
+            return format!("capability '{modname}' não existe; disponíveis: {capabilities}.");
+        }
+        let mut declarados: Vec<&str> = self.exports.keys().map(String::as_str).collect();
+        declarados.sort_unstable();
+        format!(
+            "o módulo '{modname}' não existe; capabilities: {capabilities}; \
+             declarados no manifesto: {}.",
+            declarados.join(", ")
+        )
     }
 
     /// Recusa um nome novo que colida com uma variante de `enum` (T76).
@@ -1456,11 +1617,21 @@ impl Checker {
             // qualquer função, porque uma assinatura pode citar um `enum`
             // declarado adiante no arquivo.
             TopLevel::TopLevelEnum { .. } => {}
-            // `import data` e `import data as d` (T72). O nome que colide,
-            // que vira símbolo e que chaveia `self.modules` é sempre o
-            // **local** (`localname`); `modname` só serve para achar a
-            // capability. Sem alias os dois são iguais, e o comportamento
-            // da T38 fica idêntico.
+            // `import data` e `import data as d` (T72), `import lexer`
+            // (T81). O nome que colide, que vira símbolo e que chaveia
+            // `self.modules` é sempre o **local** (`localname`); `modname`
+            // só serve para achar o módulo. Sem alias os dois são iguais, e
+            // o comportamento da T38 fica idêntico.
+            //
+            // **A capability vem primeiro** e o módulo de usuário depois —
+            // a mesma ordem que `grafo::dependencias_de` (T80) usa ao montar
+            // as arestas, e a única que faz `import texto` querer dizer a
+            // mesma coisa em todo programa. A ordem nunca decide um empate
+            // de verdade: a T79 recusa no `titan.toml` todo nome de módulo
+            // que colida com capability, então não existe manifesto em que
+            // as duas fontes respondam ao mesmo nome. Ela é aqui a garantia
+            // de que, se um dia essa recusa falhar, o programa segue vendo a
+            // capability — e não um módulo que a sombreou em silêncio.
             TopLevel::TopLevelImport {
                 loc,
                 localname,
@@ -1472,9 +1643,16 @@ impl Checker {
                     self.error(*loc, format!("'{localname}' já foi declarado antes."));
                     return;
                 }
-                match crate::capabilities::lookup_module(modname) {
-                    Some(capability) => {
-                        self.modules.insert(localname.clone(), capability);
+                let referencia = match crate::capabilities::lookup_module(modname) {
+                    Some(capability) => Some(ModuleRef::Capability(capability)),
+                    None if self.exports.contains_key(modname) => {
+                        Some(ModuleRef::Usuario(modname.clone()))
+                    }
+                    None => None,
+                };
+                match referencia {
+                    Some(referencia) => {
+                        self.modules.insert(localname.clone(), referencia);
                         self.st.add_symbol(
                             localname,
                             Type::Invalid,
@@ -1484,15 +1662,7 @@ impl Checker {
                             NO_DEF_LOC,
                         );
                     }
-                    None => {
-                        let available = crate::capabilities::available_module_names().join(", ");
-                        self.error(
-                            *loc,
-                            format!(
-                                "capability '{modname}' não existe; disponíveis: {available}."
-                            ),
-                        );
-                    }
+                    None => self.error(*loc, self.erro_de_import_desconhecido(modname)),
                 }
             }
             // `foreign function abs(n: integer): integer` (T73). A
@@ -1733,22 +1903,43 @@ impl Checker {
             // real do módulo, que é o que o codegen resolve contra
             // `capabilities::lookup_module`.
             ast::Type::TypeQualName { loc, module, name } => {
-                let Some(capability) = self.modules.get(module) else {
+                let Some(referencia) = self.modules.get(module).cloned() else {
                     self.error(*loc, format!("módulo '{module}' não foi importado."));
                     return None;
                 };
-                match capability.find_opaque(name) {
-                    Some(opaque) => Some(Type::Opaque {
-                        module: capability.titan_name.to_string(),
-                        name: name.clone(),
-                        rust_path: opaque.rust_path.to_string(),
-                    }),
-                    None => {
-                        self.error(
-                            *loc,
-                            format!("o módulo '{module}' não tem o tipo '{name}'."),
-                        );
-                        None
+                match referencia {
+                    ModuleRef::Capability(capability) => match capability.find_opaque(name) {
+                        Some(opaque) => Some(Type::Opaque {
+                            module: capability.titan_name.to_string(),
+                            name: name.clone(),
+                            rust_path: opaque.rust_path.to_string(),
+                        }),
+                        None => {
+                            self.error(
+                                *loc,
+                                format!("o módulo '{module}' não tem o tipo '{name}'."),
+                            );
+                            None
+                        }
+                    },
+                    // `x: lexer.Token` (T81). O `Type::Record`/`Type::Sum`
+                    // atravessa a fronteira **como é**, sem virar opaco: um
+                    // record de outro módulo é o mesmo record, com os mesmos
+                    // campos acessíveis, e transformá-lo aqui criaria um
+                    // segundo tipo para a mesma declaração.
+                    ModuleRef::Usuario(nome_do_modulo) => {
+                        let exportado = self
+                            .exports
+                            .get(&nome_do_modulo)
+                            .expect("ModuleRef::Usuario só nasce de um módulo exportado");
+                        match exportado.tipo(name).cloned() {
+                            Some(ty) => Some(ty),
+                            None => {
+                                let mensagem = erro_de_membro(exportado, module, name);
+                                self.error(*loc, mensagem);
+                                None
+                            }
+                        }
                     }
                 }
             }
@@ -1757,7 +1948,18 @@ impl Checker {
 
     // ---- Validação de `main` -------------------------------------------
 
+    /// Só o módulo **principal** precisa de uma `main` (T81): um módulo
+    /// importado não é ponto de entrada, e exigir dele uma função que nunca
+    /// seria chamada tornaria impossível escrever `lexer.titan`.
+    ///
+    /// Um módulo importado **pode** ter uma função chamada `main` — ela é
+    /// uma função comum, sem nada de especial, e o shim de entrada (T82)
+    /// chama a do principal. Recusá-la seria reservar um nome que o Titan
+    /// não reserva.
     fn check_has_main(&mut self, program: &Program) {
+        if !self.principal {
+            return;
+        }
         let has_valid_main = program.iter().any(|node| match node {
             TopLevel::TopLevelFunc {
                 name,
@@ -4366,27 +4568,59 @@ valor precisam de nomes diferentes.",
             // codegen resolve contra `capabilities::lookup_module`.
             Var::VarDot { exp, name, .. } if self.dot_base_module(exp).is_some() => {
                 let local_name = self.dot_base_module(exp).expect("checado acima");
-                let capability = *self
+                let referencia = self
                     .modules
                     .get(&local_name)
-                    .expect("dot_base_module só devolve módulo importado");
-                let Some(function) = capability.find_function(name) else {
-                    self.error(
-                        *loc,
-                        format!("o módulo '{local_name}' não tem função '{name}'."),
-                    );
-                    return None;
-                };
-                let module = capability.titan_name.to_string();
-                Some((
-                    Callee::Module {
-                        module: module.clone(),
-                        name: name.clone(),
-                    },
-                    format!("{local_name}.{name}"),
-                    function.params.to_vec(),
-                    vec![requalify_rettype(&function.rettype, &module)],
-                ))
+                    .expect("dot_base_module só devolve módulo importado")
+                    .clone();
+                match referencia {
+                    ModuleRef::Capability(capability) => {
+                        let Some(function) = capability.find_function(name) else {
+                            self.error(
+                                *loc,
+                                format!("o módulo '{local_name}' não tem função '{name}'."),
+                            );
+                            return None;
+                        };
+                        let module = capability.titan_name.to_string();
+                        Some((
+                            Callee::Module {
+                                module: module.clone(),
+                                name: name.clone(),
+                            },
+                            format!("{local_name}.{name}"),
+                            function.params.to_vec(),
+                            vec![requalify_rettype(&function.rettype, &module)],
+                        ))
+                    }
+                    // `lexer.proximo_token(e)` (T81): mesmo ponto de
+                    // resolução, mesmo `Callee::Module` — o que muda é só a
+                    // tabela consultada. O codegen (T82) distingue as duas
+                    // pelo `module`, como já distingue as capabilities entre
+                    // si.
+                    ModuleRef::Usuario(module) => {
+                        let exportado = self
+                            .exports
+                            .get(&module)
+                            .expect("ModuleRef::Usuario só nasce de um módulo exportado")
+                            .clone();
+                        let Some(Type::Function { params, rettypes }) =
+                            exportado.func(name).cloned()
+                        else {
+                            self.error(*loc, erro_de_membro(&exportado, &local_name, name));
+                            return None;
+                        };
+                        Some((
+                            Callee::Module {
+                                module,
+                                name: name.clone(),
+                            },
+                            format!("{local_name}.{name}"),
+                            params,
+                            rettypes,
+                        ))
+                    }
+                }
             }
             // `df.soma(...)` (T40) — delegado a `resolve_method_callee`,
             // que a forma com dois-pontos (`df:soma(...)`, T72) também usa.
@@ -5224,6 +5458,34 @@ fn tipo_soma_alcancado(ty: &Type) -> Option<&str> {
 /// não-vazia) com o `module` real da chamada — `name`/`rust_path` vêm do
 /// tipo opaco correspondente na mesma capability. Tipos não-opacos (`Float`
 /// em `soma`, por exemplo) passam adiante sem mudança.
+/// Mensagem para um nome que um módulo de usuário não oferece (T81).
+///
+/// Uma `local function` ganha mensagem **própria**, e não o "não tem função
+/// 'f'" genérico: o nome existe, está escrito no outro arquivo e o usuário
+/// acabou de lê-lo ali — mandá-lo procurar um erro de digitação seria mandar
+/// procurar o que não há. A regra de visibilidade é o que ele precisa ler, e
+/// é ela que a mensagem diz.
+///
+/// `local_name` é o nome que o programa escreveu à esquerda do ponto (o
+/// alias da T72, quando há um), porque é o que ele vê no próprio arquivo.
+fn erro_de_membro(exportado: &ModuloExportado, local_name: &str, name: &str) -> String {
+    if exportado.locais.contains(name) {
+        return format!(
+            "'{name}' é uma `local function` do módulo '{local_name}': \
+             funções locais não são exportadas, remova o `local` na \
+             declaração para poder chamá-la de fora."
+        );
+    }
+    let nomes = exportado.nomes();
+    if nomes.is_empty() {
+        return format!("o módulo '{local_name}' não exporta nada, e não tem '{name}'.");
+    }
+    format!(
+        "o módulo '{local_name}' não tem '{name}'; exporta: {}.",
+        nomes.join(", ")
+    )
+}
+
 fn requalify_rettype(rettype: &Type, module: &str) -> Type {
     let Type::Opaque { name, .. } = rettype else {
         return rettype.clone();
@@ -5507,8 +5769,10 @@ pub fn type_name(ty: &Type) -> String {
 /// Roda as duas passadas sobre `program`, devolvendo o `Checker` já
 /// preenchido (erros, `uses`, `scopes` e a AST tipada parcial) — [`check`] e
 /// [`check_partial`] são as duas formas de consumir esse resultado.
-fn run(program: &Program) -> (Checker, TypedProgram) {
+fn run(program: &Program, contexto: Contexto) -> (Checker, TypedProgram) {
     let mut checker = Checker::new();
+    checker.exports = contexto.exports;
+    checker.principal = contexto.principal;
 
     // Records primeiro (T29): uma função pode receber um record declarado
     // mais adiante no arquivo.
@@ -5551,21 +5815,144 @@ fn run(program: &Program) -> (Checker, TypedProgram) {
     (checker, typed_program)
 }
 
+/// O que um módulo de usuário oferece a quem o importa, extraído do
+/// `Checker` que acabou de checá-lo (T81).
+///
+/// A leitura é do **`Checker` já preenchido**, e não da `TypedProgram`,
+/// porque é ele que tem os tipos já resolvidos (`records`, `enums`) e as
+/// assinaturas na tabela de símbolos — refazer isso a partir da AST tipada
+/// seria reimplementar `resolve_type` num segundo lugar.
+///
+/// `foreign function` **não** é exportada: o símbolo vem do linker e é
+/// visível a todo o crate gerado, mas expô-la entre módulos faria a
+/// fronteira C (ADR 0025) atravessar duas vezes sem que a T81 tenha dito
+/// como. Fica local ao módulo que a declarou, como a `local function`.
+fn exportacoes_de(checker: &Checker, program: &Program) -> ModuloExportado {
+    let mut exportado = ModuloExportado::default();
+
+    for node in program {
+        match node {
+            TopLevel::TopLevelFunc { islocal, name, .. } => {
+                if *islocal {
+                    exportado.locais.insert(name.clone());
+                    continue;
+                }
+                // Um nome sem símbolo é um que `collect_signature` recusou
+                // (duplicado, tipo desconhecido): o módulo já não compila, e
+                // exportar o nome faria o erro ressurgir no importador como
+                // se fosse dele.
+                if let Some(Symbol {
+                    ty: ty @ Type::Function { .. },
+                    ..
+                }) = checker.st.find_symbol(name)
+                {
+                    exportado.funcs.insert(name.clone(), ty.clone());
+                }
+            }
+            TopLevel::TopLevelForeignFunc { name, .. } => {
+                exportado.locais.insert(name.clone());
+            }
+            TopLevel::TopLevelRecord { name, .. } => {
+                if let Some(ty) = checker.records.get(name) {
+                    exportado.records.insert(name.clone(), ty.clone());
+                }
+            }
+            TopLevel::TopLevelEnum { name, .. } => {
+                if let Some(ty) = checker.enums.get(name) {
+                    exportado.enums.insert(name.clone(), ty.clone());
+                }
+            }
+            // Nada a exportar: `import` é do escopo de quem importa, e as
+            // três restantes `collect_signature` recusa com erro claro — um
+            // módulo que as tenha não chega a exportar coisa alguma, porque
+            // `check_com` só coleta quando não há erro.
+            TopLevel::TopLevelImport { .. }
+            | TopLevel::TopLevelVar { .. }
+            | TopLevel::TopLevelMethod { .. }
+            | TopLevel::TopLevelStatic { .. } => {}
+        }
+    }
+
+    exportado
+}
+
+/// O que um módulo precisa saber do resto do programa para ser checado
+/// (T81): quem ele pode importar, e se é o ponto de entrada.
+///
+/// `Default` é o arquivo único e o LSP — nenhum módulo de usuário à vista e
+/// `main` exigida —, que é exatamente o comportamento de antes da T81.
+#[derive(Debug, Clone)]
+pub struct Contexto {
+    /// Os módulos de usuário já checados, pelo nome com que se importam.
+    pub exports: Exportacoes,
+    /// Se este módulo é o principal do programa — o único de quem se exige
+    /// uma `main`.
+    pub principal: bool,
+}
+
+impl Contexto {
+    /// O contexto do módulo principal de um programa multi-módulo.
+    pub fn principal(exports: Exportacoes) -> Self {
+        Contexto {
+            exports,
+            principal: true,
+        }
+    }
+
+    /// O contexto de um módulo importado: mesmos módulos à vista, sem
+    /// exigência de `main`.
+    pub fn importado(exports: Exportacoes) -> Self {
+        Contexto {
+            exports,
+            principal: false,
+        }
+    }
+}
+
+impl Default for Contexto {
+    fn default() -> Self {
+        Contexto {
+            exports: Exportacoes::new(),
+            principal: true,
+        }
+    }
+}
+
 /// Verifica o programa por completo, produzindo a AST tipada (mais o índice
 /// de usos da T49, em [`CheckedProgram::uses`]) em caso de sucesso.
 ///
 /// Nunca panic: qualquer construção fora do subconjunto suportado, ou erro de
 /// tipo, vira uma entrada em `Err`.
 pub fn check(program: &Program) -> Result<CheckedProgram, Vec<CheckError>> {
-    let (checker, typed_program) = run(program);
+    check_com(program, Contexto::default()).map(|(checado, _)| checado)
+}
+
+/// Como [`check`], mas num programa que tem **módulos** (T81): recebe o que
+/// as dependências já checadas exportam e devolve, junto do programa
+/// checado, o que este módulo por sua vez exporta.
+///
+/// É a forma que o driver usa ao descer a ordem topológica do grafo (T80);
+/// [`check`] é ela com um contexto vazio, que é o arquivo único de sempre.
+/// Os exports saem **mesmo** que o módulo só interesse a si próprio (um
+/// principal, um órfão): quem não é importado por ninguém simplesmente não
+/// tem quem os leia, e devolvê-los evita um segundo caminho de saída.
+pub fn check_com(
+    program: &Program,
+    contexto: Contexto,
+) -> Result<(CheckedProgram, ModuloExportado), Vec<CheckError>> {
+    let (checker, typed_program) = run(program, contexto);
 
     if checker.errors.is_empty() {
-        Ok(CheckedProgram {
-            program: typed_program,
-            uses: checker.uses,
-            scopes: checker.scopes,
-            warnings: checker.warnings,
-        })
+        let exportado = exportacoes_de(&checker, program);
+        Ok((
+            CheckedProgram {
+                program: typed_program,
+                uses: checker.uses,
+                scopes: checker.scopes,
+                warnings: checker.warnings,
+            },
+            exportado,
+        ))
     } else {
         Err(checker.errors)
     }
@@ -5579,7 +5966,7 @@ pub fn check(program: &Program) -> Result<CheckedProgram, Vec<CheckError>> {
 /// tem uso para `TypedProgram` nem para os erros — quem chama já sabe que o
 /// buffer é sintético e não vai reportá-los.
 pub fn check_partial(program: &Program) -> CheckedProgram {
-    let (checker, typed_program) = run(program);
+    let (checker, typed_program) = run(program, Contexto::default());
     CheckedProgram {
         program: typed_program,
         uses: checker.uses,
@@ -10376,5 +10763,503 @@ end"#;
                 .any(|e| e.message == "o nome 'a' é ligado duas vezes neste padrão."),
             "erros: {errs:?}"
         );
+    }
+
+    // ---- T81: módulos de usuário -------------------------------------
+
+    /// Checa um módulo **importado** (sem exigência de `main`) e devolve o
+    /// que ele exporta — o que o driver faz ao descer a ordem topológica.
+    fn exportar(nome: &str, source: &str, exports: &Exportacoes) -> (String, ModuloExportado) {
+        let tokens = lex(source).unwrap_or_else(|e| panic!("'{nome}' tem erro léxico: {e}"));
+        let program = parse(&tokens).unwrap_or_else(|e| panic!("'{nome}' tem erro sintático: {e}"));
+        let (_, exportado) = check_com(&program, Contexto::importado(exports.clone()))
+            .unwrap_or_else(|errs| panic!("'{nome}' não deveria ter erro de tipo: {errs:?}"));
+        (nome.to_string(), exportado)
+    }
+
+    /// A tabela de exports de um programa de vários módulos, montada na
+    /// ordem em que os módulos são dados (que é a topológica).
+    fn exports_de(modulos: &[(&str, &str)]) -> Exportacoes {
+        let mut exports = Exportacoes::new();
+        for (nome, source) in modulos {
+            let (nome, exportado) = exportar(nome, source, &exports);
+            exports.insert(nome, exportado);
+        }
+        exports
+    }
+
+    /// Checa o módulo **principal** contra os exports dados.
+    fn check_principal(
+        source: &str,
+        exports: Exportacoes,
+    ) -> Result<TypedProgram, Vec<CheckError>> {
+        let tokens =
+            lex(source).unwrap_or_else(|e| panic!("fonte não deveria ter erro léxico: {e}"));
+        let program =
+            parse(&tokens).unwrap_or_else(|e| panic!("fonte não deveria ter erro sintático: {e}"));
+        check_com(&program, Contexto::principal(exports)).map(|(checado, _)| checado.program)
+    }
+
+    /// Um `main` mínimo em volta do corpo dado.
+    fn com_main(imports: &str, corpo: &str) -> String {
+        format!("{imports}\nfunction main(args: {{string}}): integer\n{corpo}\n    return 0\nend\n")
+    }
+
+    #[test]
+    fn chamada_a_funcao_de_outro_modulo_tipa() {
+        // O critério de aceite do PRD: `lexer.proximo_token(e)` tipa entre
+        // arquivos.
+        let exports = exports_de(&[(
+            "lexer",
+            "function proximo_token(entrada: string): integer\n    return 0\nend\n",
+        )]);
+
+        let typed = check_principal(
+            &com_main(
+                "import lexer",
+                "    local t: integer = lexer.proximo_token(\"oi\")",
+            ),
+            exports,
+        )
+        .unwrap_or_else(|errs| panic!("deveria tipar: {errs:?}"));
+
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava a main");
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava um bloco");
+        };
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava a declaração de 't'");
+        };
+        assert_eq!(value.ty, Type::Integer);
+        // Módulo de usuário e capability resolvem no mesmo ponto e produzem
+        // o **mesmo** nó — é o que a T82 vai emitir como `lexer::...`.
+        let TypedExpKind::Call {
+            callee: Callee::Module { module, name },
+            ..
+        } = &value.kind
+        else {
+            panic!("esperava Callee::Module, obteve {:?}", value.kind);
+        };
+        assert_eq!(module, "lexer");
+        assert_eq!(name, "proximo_token");
+    }
+
+    #[test]
+    fn argumento_de_tipo_errado_para_funcao_de_outro_modulo_da_erro() {
+        // A assinatura atravessa a fronteira de verdade: tipar contra ela é
+        // o que distingue importar de simplesmente confiar.
+        let exports = exports_de(&[(
+            "lexer",
+            "function proximo_token(entrada: string): integer\n    return 0\nend\n",
+        )]);
+
+        let errs = check_principal(
+            &com_main(
+                "import lexer",
+                "    local t: integer = lexer.proximo_token(42)",
+            ),
+            exports,
+        )
+        .expect_err("integer não é string");
+
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("lexer.proximo_token")),
+            "erros: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn record_de_outro_modulo_tipa() {
+        let exports = exports_de(&[(
+            "lexer",
+            "record Token\n    linha: integer\nend\n\
+             function novo(linha: integer): Token\n             local t: Token = {linha = linha}\n    return t\nend\n",
+        )]);
+
+        let typed = check_principal(
+            &com_main(
+                "import lexer",
+                "    local t: lexer.Token = lexer.novo(7)\n    local l: integer = t.linha",
+            ),
+            exports,
+        )
+        .unwrap_or_else(|errs| panic!("deveria tipar: {errs:?}"));
+
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava a main");
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava um bloco");
+        };
+        let TypedStat::Decl { ty, .. } = &stats[0] else {
+            panic!("esperava a declaração de 't'");
+        };
+        // O record atravessa **como é**: mesmo nome, mesmos campos — e é por
+        // isso que `t.linha` logo abaixo tipa.
+        assert_eq!(
+            *ty,
+            Type::Record {
+                name: "Token".to_string(),
+                fields: vec![("linha".to_string(), Type::Integer)],
+            }
+        );
+    }
+
+    #[test]
+    fn enum_de_outro_modulo_tipa() {
+        let exports = exports_de(&[(
+            "ast",
+            "enum Exp\n    ExpNil\n    ExpInteger(integer)\nend\n\
+             function zero(): Exp\n    return ExpInteger(0)\nend\n",
+        )]);
+
+        let typed = check_principal(
+            &com_main("import ast", "    local e: ast.Exp = ast.zero()"),
+            exports,
+        )
+        .unwrap_or_else(|errs| panic!("deveria tipar: {errs:?}"));
+
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava a main");
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava um bloco");
+        };
+        let TypedStat::Decl { ty, .. } = &stats[0] else {
+            panic!("esperava a declaração de 'e'");
+        };
+        assert!(
+            matches!(ty, Type::Sum { name, variants } if name == "Exp" && variants.len() == 2),
+            "tipo inesperado: {ty:?}"
+        );
+    }
+
+    #[test]
+    fn chamar_local_function_de_outro_modulo_da_erro_claro() {
+        let exports = exports_de(&[(
+            "lexer",
+            "local function interna(): integer\n    return 1\nend\n\
+             function publica(): integer\n    return interna()\nend\n",
+        )]);
+
+        let errs = check_principal(
+            &com_main("import lexer", "    local x: integer = lexer.interna()"),
+            exports,
+        )
+        .expect_err("`local function` não é exportada");
+
+        assert_eq!(
+            errs[0].message,
+            "'interna' é uma `local function` do módulo 'lexer': funções locais \
+             não são exportadas, remova o `local` na declaração para poder \
+             chamá-la de fora."
+        );
+    }
+
+    #[test]
+    fn local_function_nao_entra_nos_exports() {
+        // A contraparte do teste acima, vista do outro lado: o nome está em
+        // `locais`, não em `funcs` — é isso que a mensagem lê.
+        let exports = exports_de(&[(
+            "lexer",
+            "local function interna(): integer\n    return 1\nend\n\
+             function publica(): integer\n    return interna()\nend\n",
+        )]);
+        let lexer = &exports["lexer"];
+
+        assert!(lexer.func("interna").is_none());
+        assert!(lexer.locais.contains("interna"));
+        assert!(lexer.func("publica").is_some());
+        assert_eq!(lexer.nomes(), vec!["publica"]);
+    }
+
+    #[test]
+    fn nome_inexistente_em_modulo_de_usuario_lista_o_que_ele_exporta() {
+        let exports = exports_de(&[(
+            "lexer",
+            "record Token\n    linha: integer\nend\n\
+             function novo(): integer\n    return 0\nend\n",
+        )]);
+
+        let errs = check_principal(
+            &com_main("import lexer", "    local x: integer = lexer.sumido()"),
+            exports,
+        )
+        .expect_err("'sumido' não existe");
+
+        assert_eq!(
+            errs[0].message,
+            "o módulo 'lexer' não tem 'sumido'; exporta: Token, novo."
+        );
+    }
+
+    #[test]
+    fn import_desconhecido_lista_as_duas_fontes() {
+        // O critério de aceite: o erro nomeia as capabilities **e** os
+        // módulos do manifesto, porque quem escreveu o `import` não sabe em
+        // qual das duas o compilador procurou.
+        let exports = exports_de(&[("lexer", "function f(): integer\n    return 0\nend\n")]);
+
+        let errs = check_principal(&com_main("import sumido", ""), exports)
+            .expect_err("'sumido' não é capability nem módulo");
+
+        assert_eq!(
+            errs[0].message,
+            "o módulo 'sumido' não existe; capabilities: data, texto, io; \
+             declarados no manifesto: lexer."
+        );
+    }
+
+    #[test]
+    fn sem_manifesto_o_import_desconhecido_mantem_a_mensagem_de_sempre() {
+        // Byte-a-byte a mensagem da T38: num arquivo único não há
+        // `[modulos]` a citar, e apontar para uma seção de um arquivo que
+        // não existe mandaria procurar no lugar errado.
+        let errs =
+            check_source(&com_main("import sumido", "")).expect_err("'sumido' não é capability");
+
+        assert_eq!(
+            errs[0].message,
+            "capability 'sumido' não existe; disponíveis: data, texto, io."
+        );
+    }
+
+    #[test]
+    fn capability_tem_precedencia_sobre_modulo_de_usuario_homonimo() {
+        // A T79 recusa no `titan.toml` todo nome que colida com capability,
+        // então este caso não nasce de um manifesto válido. O teste fixa o
+        // que acontece **se** ele chegar aqui: vence a capability, e o
+        // módulo de usuário não a sombreia em silêncio.
+        let mut exports = Exportacoes::new();
+        exports.insert(
+            "texto".to_string(),
+            ModuloExportado {
+                funcs: HashMap::from([(
+                    "tamanho".to_string(),
+                    Type::Function {
+                        params: vec![Type::Integer],
+                        rettypes: vec![Type::Integer],
+                    },
+                )]),
+                ..ModuloExportado::default()
+            },
+        );
+
+        // `texto.tamanho` da capability recebe `string`, não `integer` —
+        // passar um inteiro só dá erro se a capability tiver vencido; o
+        // módulo de usuário forjado acima o aceitaria.
+        let errs = check_principal(
+            &com_main("import texto", "    local x: integer = texto.tamanho(1)"),
+            exports,
+        )
+        .expect_err("a capability 'texto' recebe string");
+
+        assert!(
+            errs.iter().any(|e| e.message.contains("texto.tamanho")),
+            "erros: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn modulo_importado_nao_precisa_de_main() {
+        // `Contexto::importado` é o que permite existir um `lexer.titan`:
+        // exigir dele uma `main` seria exigir uma função que nunca seria
+        // chamada.
+        let source = "function f(): integer\n    return 0\nend\n";
+        let tokens = lex(source).unwrap();
+        let program = parse(&tokens).unwrap();
+
+        assert!(check_com(&program, Contexto::importado(Exportacoes::new())).is_ok());
+        assert!(
+            check_com(&program, Contexto::principal(Exportacoes::new())).is_err(),
+            "o principal continua precisando de main"
+        );
+    }
+
+    #[test]
+    fn alias_de_import_vale_para_modulo_de_usuario() {
+        // T72 sobre T81: o alias é do escopo de quem importa; o
+        // `Callee::Module` carrega o nome **real**, que é o que a T82 emite.
+        let exports = exports_de(&[("lexer", "function f(): integer\n    return 0\nend\n")]);
+
+        let typed = check_principal(
+            &com_main("import lexer as lx", "    local x: integer = lx.f()"),
+            exports,
+        )
+        .unwrap_or_else(|errs| panic!("deveria tipar: {errs:?}"));
+
+        let TypedTopLevel::Func { body, .. } = &typed[0] else {
+            panic!("esperava a main");
+        };
+        let TypedStat::Block { stats, .. } = body.as_ref() else {
+            panic!("esperava um bloco");
+        };
+        let TypedStat::Decl { value, .. } = &stats[0] else {
+            panic!("esperava a declaração de 'x'");
+        };
+        let TypedExpKind::Call {
+            callee: Callee::Module { module, .. },
+            ..
+        } = &value.kind
+        else {
+            panic!("esperava Callee::Module, obteve {:?}", value.kind);
+        };
+        assert_eq!(module, "lexer", "o alias não vaza para o nó tipado");
+    }
+
+    #[test]
+    fn alias_com_nome_de_capability_nomeia_o_modulo_aliasado() {
+        // `import lexer as texto` é legítimo: a precedência decide o que
+        // `modname` resolve, e o alias é só o nome local de quem importa —
+        // exatamente como a T72 já permitia com capabilities. Quem escreveu
+        // isso mandou `texto.` falar com `lexer`, e é o que acontece.
+        let exports = exports_de(&[("lexer", "function proprio(): integer\n    return 0\nend\n")]);
+
+        check_principal(
+            &com_main(
+                "import lexer as texto",
+                "    local x: integer = texto.proprio()",
+            ),
+            exports,
+        )
+        .unwrap_or_else(|errs| panic!("deveria tipar: {errs:?}"));
+    }
+
+    #[test]
+    fn erro_de_alias_nomeia_o_alias_e_nao_o_modulo() {
+        // A mensagem fala do nome que o programa escreveu no próprio
+        // arquivo — `lx`, não `lexer`, que ele pode nem ter digitado.
+        let exports = exports_de(&[("lexer", "function f(): integer\n    return 0\nend\n")]);
+
+        let errs = check_principal(
+            &com_main("import lexer as lx", "    local x: integer = lx.sumido()"),
+            exports,
+        )
+        .expect_err("'sumido' não existe");
+
+        assert!(
+            errs[0]
+                .message
+                .starts_with("o módulo 'lx' não tem 'sumido'")
+        );
+    }
+
+    #[test]
+    fn tipo_inexistente_em_modulo_de_usuario_da_erro_claro() {
+        let exports = exports_de(&[(
+            "lexer",
+            "record Token\n    linha: integer\nend\n\
+             function f(): integer\n    return 0\nend\n",
+        )]);
+
+        let errs = check_principal(
+            &com_main("import lexer", "    local t: lexer.Simbolo = lexer.f()"),
+            exports,
+        )
+        .expect_err("'Simbolo' não existe em 'lexer'");
+
+        assert_eq!(
+            errs[0].message,
+            "o módulo 'lexer' não tem 'Simbolo'; exporta: Token, f."
+        );
+    }
+
+    #[test]
+    fn cadeia_de_tres_modulos_tipa() {
+        // O critério de aceite do programa de três módulos, visto do
+        // checker: `parser` importa `lexer`, `main` importa `parser`, e o
+        // tipo declarado em `lexer` atravessa os dois saltos.
+        let exports = exports_de(&[
+            (
+                "lexer",
+                "record Token\n    linha: integer\nend\n\
+                 function novo(linha: integer): Token\n             local t: Token = {linha = linha}\n    return t\nend\n",
+            ),
+            (
+                "parser",
+                "import lexer\n\
+                 function primeiro(): lexer.Token\n    return lexer.novo(1)\nend\n",
+            ),
+        ]);
+
+        let typed = check_principal(
+            &com_main(
+                "import parser",
+                "    local t: integer = parser.primeiro().linha",
+            ),
+            exports,
+        )
+        .unwrap_or_else(|errs| panic!("deveria tipar: {errs:?}"));
+
+        assert!(matches!(&typed[0], TypedTopLevel::Func { name, .. } if name == "main"));
+    }
+
+    #[test]
+    fn modulo_nao_ve_o_que_o_outro_importou() {
+        // Importar `lexer` não é importar o que `lexer` importa: o `import`
+        // é do escopo de quem o escreve. Sem isso, `parser` alcançaria
+        // `lexer` sem jamais tê-lo declarado, e o grafo do driver (T80)
+        // deixaria de descrever as dependências de verdade.
+        let exports = exports_de(&[
+            ("lexer", "function f(): integer\n    return 0\nend\n"),
+            (
+                "parser",
+                "import lexer\nfunction g(): integer\n    return lexer.f()\nend\n",
+            ),
+        ]);
+
+        let errs = check_principal(
+            &com_main("import parser", "    local x: integer = lexer.f()"),
+            exports,
+        )
+        .expect_err("'lexer' não foi importado aqui");
+
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'lexer' não foi declarado.")),
+            "erros: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn modulo_importado_pode_usar_capability() {
+        // Um módulo interno importa `texto` como qualquer programa. Quem o
+        // importa **não** herda esse `import` (ver o teste acima), mas o
+        // `titan-texto` precisa chegar ao `Cargo.toml` gerado — e é disso
+        // que a T83 vai cuidar, unindo as capabilities de todo o grafo.
+        let exports = exports_de(&[(
+            "util",
+            "import texto
+             function tamanho(s: string): integer
+    return texto.tamanho(s)
+end
+",
+        )]);
+
+        check_principal(
+            &com_main("import util", "    local n: integer = util.tamanho(\"oi\")"),
+            exports,
+        )
+        .unwrap_or_else(|errs| panic!("deveria tipar: {errs:?}"));
+    }
+
+    #[test]
+    fn foreign_function_nao_e_exportada() {
+        // A fronteira C (ADR 0025) é do módulo que a declarou: a T81 não
+        // disse como ela atravessaria um segundo limite, então ela fica
+        // onde está, como a `local function`.
+        let exports = exports_de(&[(
+            "sistema",
+            "foreign function abs(n: integer): integer\n\
+             function modulo(n: integer): integer\n    return abs(n)\nend\n",
+        )]);
+        let sistema = &exports["sistema"];
+
+        assert!(sistema.func("abs").is_none());
+        assert!(sistema.locais.contains("abs"));
+        assert!(sistema.func("modulo").is_some());
     }
 }

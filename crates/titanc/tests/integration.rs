@@ -151,6 +151,13 @@ fn compila_e_executa_hello_titan_conferindo_stdout_e_exit_code() {
         !cargo_toml.contains("titan-lsp"),
         "Cargo.toml gerado não deveria depender do LSP:\n{cargo_toml}"
     );
+    // Decisão técnica 9 da Fase 5 (PRD.md, T79): o crate `toml`, que lê o
+    // manifesto, é dep do workspace do compilador e nunca do programa
+    // gerado — mesma disciplina que o ADR 0019 impôs às deps do LSP.
+    assert!(
+        !cargo_toml.contains("toml = "),
+        "Cargo.toml gerado não deveria depender do crate toml:\n{cargo_toml}"
+    );
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }
@@ -2700,4 +2707,171 @@ fn emit_rust_de_dois_pontos_e_identico_ao_de_ponto() {
     );
 
     let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Um projeto multi-módulo no disco: `titan.toml` mais os `.titan` dados.
+fn write_projeto(dir: &Path, arquivos: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir.join("src")).expect("cria src/ do projeto");
+    for (nome, conteudo) in arquivos {
+        std::fs::write(dir.join(nome), conteudo).expect("escreve arquivo do projeto");
+    }
+}
+
+/// Critério de aceite da T81 pela CLI: um programa de três módulos — `main`
+/// importa `parser`, `parser` importa `lexer` — **tipa** entre arquivos, com
+/// o `record` de `lexer` atravessando os dois saltos e a `local function`
+/// ficando de fora.
+///
+/// A emissão do Rust multi-módulo é a T82, e é por isso que o `titanc` ainda
+/// para aqui: o que este teste prova é que ele para com uma **mensagem
+/// clara**, e nunca com um panic — a convenção mais antiga do projeto.
+#[test]
+fn t81_programa_multi_modulo_tipa_e_para_com_mensagem_clara() {
+    let dir = temp_dir("t81-multi-modulo");
+    write_projeto(
+        &dir,
+        &[
+            (
+                "src/lexer.titan",
+                "record Token\n    linha: integer\nend\n\
+                 local function interna(): integer\n    return 1\nend\n\
+                 function novo(linha: integer): Token\n\
+                 \x20   local t: Token = {linha = linha + interna()}\n    return t\nend\n",
+            ),
+            (
+                "src/parser.titan",
+                "import lexer\n\
+                 function primeiro(): lexer.Token\n    return lexer.novo(7)\nend\n",
+            ),
+            (
+                "src/main.titan",
+                "import parser\n\
+                 function main(args: {string}): integer\n\
+                 \x20   local n: integer = parser.primeiro().linha\n    return n\nend\n",
+            ),
+            (
+                "titan.toml",
+                "[pacote]\nnome = \"prog\"\nprincipal = \"src/main.titan\"\n\n\
+                 [modulos]\nlexer = \"src/lexer.titan\"\nparser = \"src/parser.titan\"\n",
+            ),
+        ],
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(&dir)
+        .arg("--out")
+        .arg(&dir)
+        .output()
+        .expect("invoca titanc --manifesto");
+    assert_never_panics(&output);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Nenhum erro de **tipo**: os três módulos tiparam, e o que resta é só a
+    // emissão que a T82 vai escrever.
+    assert!(
+        !stderr.contains("erro de tipo"),
+        "os três módulos deveriam tipar: {stderr}"
+    );
+    assert!(
+        stderr.contains("emissão de Rust multi-módulo ainda não"),
+        "esperava a mensagem da emissão pendente: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// O contraponto: chamar uma `local function` de outro módulo tem de dar
+/// erro **claro**, dizendo a regra de visibilidade em vez de mandar procurar
+/// um erro de digitação (PRD.md, T81).
+#[test]
+fn t81_local_function_de_outro_modulo_da_erro_claro_na_cli() {
+    let dir = temp_dir("t81-local-function");
+    write_projeto(
+        &dir,
+        &[
+            (
+                "src/lexer.titan",
+                "local function interna(): integer\n    return 1\nend\n\
+                 function publica(): integer\n    return interna()\nend\n",
+            ),
+            (
+                "src/main.titan",
+                "import lexer\n\
+                 function main(args: {string}): integer\n\
+                 \x20   local n: integer = lexer.interna()\n    return n\nend\n",
+            ),
+            (
+                "titan.toml",
+                "[pacote]\nnome = \"prog\"\nprincipal = \"src/main.titan\"\n\n\
+                 [modulos]\nlexer = \"src/lexer.titan\"\n",
+            ),
+        ],
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(&dir)
+        .arg("--out")
+        .arg(&dir)
+        .output()
+        .expect("invoca titanc --manifesto");
+    assert_never_panics(&output);
+    assert!(!output.status.success(), "a compilação deveria falhar");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("é uma `local function` do módulo 'lexer'"),
+        "mensagem inesperada: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// O `import` que não resolve contra fonte nenhuma lista as **duas** fontes
+/// — as capabilities do compilador e os módulos do manifesto (PRD.md, T81).
+#[test]
+fn t81_import_desconhecido_lista_capabilities_e_modulos_do_manifesto() {
+    let dir = temp_dir("t81-import-sumido");
+    write_projeto(
+        &dir,
+        &[
+            (
+                "src/lexer.titan",
+                "function novo(): integer\n    return 0\nend\n",
+            ),
+            (
+                "src/main.titan",
+                "import sumido\n\
+                 function main(args: {string}): integer\n    return 0\nend\n",
+            ),
+            (
+                "titan.toml",
+                "[pacote]\nnome = \"prog\"\nprincipal = \"src/main.titan\"\n\n\
+                 [modulos]\nlexer = \"src/lexer.titan\"\n",
+            ),
+        ],
+    );
+
+    let output = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(&dir)
+        .arg("--out")
+        .arg(&dir)
+        .output()
+        .expect("invoca titanc --manifesto");
+    assert_never_panics(&output);
+    assert!(!output.status.success(), "a compilação deveria falhar");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("capabilities: data, texto, io"),
+        "faltou listar as capabilities: {stderr}"
+    );
+    assert!(
+        stderr.contains("declarados no manifesto: lexer"),
+        "faltou listar os módulos do manifesto: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

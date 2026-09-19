@@ -60,13 +60,23 @@ Três decisões derivadas, que a implementação fixou:
 
 **1. A busca para na indireção que já existe.** `{Exp}` é `Vec<Exp>` e
 `{string: Exp}` é `HashMap<String, Exp>`: os dois já põem os elementos no
-heap, e `Exp?` é `Option<Exp>`, cujo tamanho é o do maior braço — todos
-finitos sem ajuda. Encaixotá-los compilaria e só acrescentaria uma alocação
-por valor, então a travessia não entra em array, map nem opcional. Ela
-atravessa `Sum` **pelo nome** (consultando a tabela de enums do programa,
-porque um `Sum` aninhado chega do checker como placeholder de variantes
-vazias, e é só assim que a recursão mútua entre dois enums aparece) e
-atravessa os campos de um `record` embutido.
+heap, então são finitos sem ajuda. Encaixotá-los compilaria e só
+acrescentaria uma alocação por valor, então a travessia não entra em array
+nem em map. Ela atravessa `Sum` **pelo nome** (consultando a tabela de enums
+do programa, porque um `Sum` aninhado chega do checker como placeholder de
+variantes vazias, e é só assim que a recursão mútua entre dois enums
+aparece) e atravessa os campos de um `record` embutido.
+
+**Correção da T78:** `Exp?` **não** é indireção, e a redação original desta
+ADR errava ao pôr o opcional ao lado do array e do map. `Option<T>` do Rust
+é um enum que **embute** o `T` — o tamanho do maior braço é o tamanho do
+próprio `T` —, de modo que `Proximo(Cadeia?)` sem `Box` dá E0072 ("recursive
+type has infinite size"), um erro do rustc, em inglês, sobre código que o
+usuário não escreveu. A travessia entra no opcional como entra num record, e
+o campo inteiro é encaixotado: `Box<Option<Cadeia>>`, e não
+`Option<Box<Cadeia>>`, porque quem alcança o enum é o campo — é ele que
+`rust_field_type_name`, a construção de variante e o padrão do `match` leem
+da mesma resposta de `campos_boxeados`.
 
 **2. O `Box` fica do lado do `enum`, nunca do record.** No ciclo indireto
 `enum Exp ExpNo(Caixa) end` + `record Caixa e: Exp end` — que a checagem de
