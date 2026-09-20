@@ -1,0 +1,38 @@
+import ast
+
+-- Driver do titanc auto-hospedado (PRD.md, Parte C).
+--
+-- Na T84 ele e o programa minimo que faz o projeto `selfhost/` compilar como um
+-- todo: monta a `Exp` recursiva de `1 + 2 * 3` com o `enum` da ast e a percorre
+-- com `match`, imprimindo a arvore reparentizada e o numero de nos. E a mesma
+-- construcao que o teste de integracao confere, so que pela linha de comando:
+--
+--     titanc --manifesto selfhost --out /tmp/x && /tmp/x/titanself
+--
+-- As tarefas seguintes o substituem pelo driver de verdade: lexer (T85),
+-- parser (T86) e checker (T87) encadeados sobre um arquivo passado em `args`.
+
+function exemplo(): ast.Exp
+    -- 1 + 2 * 3, com a precedencia ja resolvida na forma da arvore: o `*`
+    -- e o filho direito do `+`, e nao um irmao.
+    --
+    -- Cada no vai para um `local` em vez de encaixar as chamadas umas nas
+    -- outras. Nao e estilo: passar o mesmo `Loc` para a chamada de fora e para
+    -- uma chamada aninhada faz o codegen emitir dois `&mut l` vivos ao mesmo
+    -- tempo (ADR 0007), e o rustc reclama em ingles. Com os `local` as chamadas
+    -- ficam sequenciadas e cada emprestimo termina antes do proximo.
+    local l: ast.Loc = ast.loc(1, 1)
+    local um: ast.Exp = ast.inteiro(l, 1)
+    local dois: ast.Exp = ast.inteiro(l, 2)
+    local tres: ast.Exp = ast.inteiro(l, 3)
+    local dois_vezes_tres: ast.Exp = ast.binop(l, "*", dois, tres)
+    return ast.binop(l, "+", um, dois_vezes_tres)
+end
+
+function main(args: {string}): integer
+    local e: ast.Exp = exemplo()
+    print("arvore: " .. ast.exp_para_texto(e))
+    print("nos: " .. ast.tamanho_da_exp(e))
+    print("linha: " .. ast.loc_da_exp(e).linha)
+    return 0
+end

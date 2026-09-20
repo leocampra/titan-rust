@@ -1,0 +1,14 @@
+# Manifesto do titanc auto-hospedado (PRD.md, Parte C, T84-T89).
+#
+# O projeto que a Parte C preenche modulo a modulo: `ast` na T84, `lexer` na
+# T85, `parser` na T86, `checker` na T87. Cada tarefa acrescenta uma linha em
+# [modulos] e o grafo do driver (T80) resolve o resto — o nome do modulo e o
+# que o programa escreve em `import`, e nao precisa coincidir com o nome do
+# arquivo.
+
+[pacote]
+nome = "titanself"
+principal = "main.titan"
+
+[modulos]
+ast = "ast.titan"

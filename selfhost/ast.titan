@@ -1,0 +1,468 @@
+-- AST do Titan escrita em Titan (PRD.md, T84).
+--
+-- O arquivo que prova que os tipos soma da Fase 5 (T74-T77) resolveram um
+-- problema real, e nao uma conveniencia estetica. Vale ler este arquivo lado a
+-- lado com examples/lexer.titan, que e o mesmo compilador escrito na linguagem
+-- de antes:
+--
+--   examples/lexer.titan (Fase 4)          | selfhost/ast.titan (Fase 5)
+--   ---------------------------------------|------------------------------------
+--   TokenKind e `integer`, e cada constante | `enum` de verdade, com variantes
+--   vira uma funcao sem argumento:          | nomeadas:
+--     function TK_NAME(): integer           |   enum Var
+--         return 1                          |       VarName(Loc, string)
+--     end                                   |       ...
+--                                           |   end
+--   ---------------------------------------|------------------------------------
+--   Um `no` com 13 formas possiveis so cabe | Cada variante carrega exatamente
+--   num record gordo, com um campo por      | os campos que ela tem, e nada
+--   forma e a tag inteira dizendo quais     | mais: ExpBinop(Loc, string, Exp,
+--   estao preenchidos.                      | Exp) e recursivo de verdade.
+--   ---------------------------------------|------------------------------------
+--   Ler a tag e um `if` encadeado sobre     | `match` com exaustividade conferida
+--   inteiros; esquecer um caso passa batido.| pelo checker, em portugues.
+--
+-- O ADR 0020 registrou essa deselegancia como evidencia empirica de que
+-- faltavam tipos soma; examples/lexer.titan fica intocado justamente para que a
+-- evidencia continue verificavel. Este arquivo e o outro lado da comparacao.
+--
+-- ESCOPO: espelha crates/titanc/src/ast.rs, que e a fonte de verdade. Os nomes
+-- de variante sao os mesmos (ExpBinop, StatWhile, TypeArray...) para que a
+-- comparacao entre os dois arquivos seja literal. Duas divergencias
+-- deliberadas, ambas por limite da linguagem hoje:
+--
+--   1. As variantes do Titan sao POSICIONAIS (ExpBinop(Loc, string, Exp, Exp)),
+--      enquanto o ast.rs usa campos nomeados. A ordem dos campos aqui segue a
+--      ordem de declaracao la, e `loc` vem sempre primeiro.
+--   2. `Decl.type: Option<Type>` (ast.rs) nao tem equivalente direto: o
+--      inicializador de record ainda nao converte um valor para `T?`
+--      (`{x = 1}` com `x: integer?` e erro de tipo). A ausencia de anotacao
+--      vira, aqui, a variante `TipoAusente` do proprio `enum Tipo` — o que e
+--      mais fiel ao espirito da fase: um caso a mais do tipo soma, exaustivo
+--      como os outros, em vez de um `nil` que o checker precisa lembrar de
+--      testar.
+
+-- Posicao de um no no codigo-fonte (ast.rs: `Loc`).
+--
+-- Continua sendo `record`, e nao `enum`: e um produto de dois inteiros, nao uma
+-- escolha entre formas. Tipo soma nao e martelo universal.
+record Loc
+    linha: integer
+    coluna: integer
+end
+
+-- Anotacoes de tipo escritas no codigo-fonte (ast.rs: `Type`).
+--
+-- `TipoAusente` e a divergencia 2 do cabecalho: representa o tipo que o autor
+-- nao escreveu, e que a inferencia preenche. Em Rust isso e `None`; aqui e uma
+-- variante, o que faz o `match` do checker ter de trata-la explicitamente.
+enum Tipo
+    TipoAusente
+    TipoNil(Loc)
+    TipoBoolean(Loc)
+    TipoInteger(Loc)
+    TipoFloat(Loc)
+    TipoString(Loc)
+    TipoValue(Loc)
+    TipoQualName(Loc, string, string)
+    TipoName(Loc, string)
+    TipoArray(Loc, Tipo)
+    TipoMap(Loc, Tipo, Tipo)
+    TipoFunction(Loc, {Tipo}, {Tipo})
+    TipoOption(Loc, Tipo)
+end
+
+-- Declaracao de nome tipado (ast.rs: `Decl`).
+--
+-- `tipo` e `TipoAusente` quando a anotacao nao foi escrita; `opcional` marca a
+-- forma `local x?`.
+record Decl
+    loc: Loc
+    nome: string
+    tipo: Tipo
+    opcional: boolean
+end
+
+-- Uma variante de um `enum` declarado no programa lido (ast.rs: `Variant`).
+--
+-- `campos` vazio e a variante sem payload (`ExpNil`), escrita sem parenteses —
+-- parenteses vazios sao erro, nao sinonimo. Note que os campos sao `{Tipo}` e
+-- nao `{Decl}`: a variante liga os campos a nomes so no braco do `match`.
+record Variante
+    loc: Loc
+    nome: string
+    campos: {Tipo}
+end
+
+-- Lugares atribuiveis (ast.rs: `Var`).
+--
+-- O contraste mais curto com examples/lexer.titan: la, distinguir `x`, `x[i]` e
+-- `x.c` exigiria uma tag inteira mais tres campos que so as vezes valem.
+enum Var
+    VarName(Loc, string)
+    VarBracket(Loc, Exp, Exp)
+    VarDot(Loc, Exp, string)
+end
+
+-- Identidade de um campo de `ExpInitList` (ast.rs: `FieldName`, que em Lua era
+-- o polimorfico `false | string | Exp`).
+enum NomeDeCampo
+    NomeAusente
+    NomeChave(string)
+    NomeExp(Exp)
+end
+
+-- Campo de record ou de `ExpInitList` (ast.rs: `Field`).
+record Campo
+    loc: Loc
+    nome: NomeDeCampo
+    exp: Exp
+end
+
+-- Argumentos de chamada (ast.rs: `Args`).
+--
+-- `ArgsMethod` guarda o nome do metodo de `df:soma("valor")` (T72).
+enum Args
+    ArgsFunc(Loc, {Exp})
+    ArgsMethod(Loc, string, {Exp})
+end
+
+-- Padrao de um braco de `match` (ast.rs: `Pattern`).
+--
+-- O parser nao distingue variante existente de variante inventada, so a forma
+-- escrita; quem decide e o checker.
+enum Padrao
+    PadraoVariante(Loc, string, {Decl})
+    PadraoCuringa(Loc)
+end
+
+-- Expressoes (ast.rs: `Exp`).
+--
+-- O `enum` que o ADR 0020 citou como impossivel de representar: 15 variantes,
+-- recursivo de verdade. `ExpBinop(Loc, string, Exp, Exp)` carrega os dois
+-- operandos como `Exp`, sem tag inteira e sem record gordo — o codegen fecha a
+-- recursao com `Box` na emissao (ADR 0026), coisa que o autor do fonte Titan
+-- nunca escreve.
+enum Exp
+    ExpNil(Loc)
+    ExpBool(Loc, boolean)
+    ExpInteger(Loc, integer)
+    ExpFloat(Loc, float)
+    ExpString(Loc, string)
+    ExpInitList(Loc, {Campo})
+    ExpCall(Loc, Exp, Args)
+    ExpVar(Loc, Var)
+    ExpUnop(Loc, string, Exp)
+    ExpConcat(Loc, {Exp})
+    ExpBinop(Loc, string, Exp, Exp)
+    ExpCast(Loc, Exp, Tipo)
+    -- Ajusta uma chamada para produzir apenas o primeiro valor de retorno.
+    ExpAdjust(Loc, Exp)
+    -- index-esimo (>1) valor de retorno de uma chamada; o ultimo campo e o
+    -- tipo que o checker anota (`TipoAusente` antes disso).
+    ExpExtra(Loc, Exp, integer, Tipo)
+    ExpMatch(Loc, Exp, {BracoExp})
+end
+
+-- Um braco de `match` em posicao de expressao (ast.rs: `MatchArm<Exp>`).
+--
+-- O `MatchArm<T>` do Rust e generico no que o braco produz; Titan nao tem
+-- genericos de usuario, entao a generalizacao vira dois records — a terceira
+-- divergencia, esta sim de custo visivel, e o item que a Fase 6 tem motivo para
+-- olhar.
+record BracoExp
+    loc: Loc
+    padrao: Padrao
+    corpo: Exp
+end
+
+-- Ramo `then` de um `if` (ast.rs: `Then`).
+record Ramo
+    loc: Loc
+    condicao: Exp
+    bloco: Stat
+end
+
+-- Um braco de `match` em posicao de comando (ast.rs: `MatchArm<Stat>`).
+record BracoStat
+    loc: Loc
+    padrao: Padrao
+    corpo: Stat
+end
+
+-- Comandos (ast.rs: `Stat`).
+--
+-- `StatIf` carrega os ramos `then` em `{Ramo}` e o `else` numa variante
+-- separada (`StatIfElse`), pela mesma razao da divergencia 2: nao ha como
+-- guardar um `Stat?` dentro de um record inicializado por literal. Aqui o
+-- desdobramento custa uma variante e paga com exaustividade.
+enum Stat
+    StatBlock(Loc, {Stat})
+    StatWhile(Loc, Exp, Stat)
+    StatRepeat(Loc, Stat, Exp)
+    StatIf(Loc, {Ramo})
+    StatIfElse(Loc, {Ramo}, Stat)
+    -- `for` numerico: variavel de controle, inicio, limite e passo.
+    StatFor(Loc, Decl, Exp, Exp, Exp)
+    -- `for` sem passo escrito — o passo implicito e 1.
+    StatForSemPasso(Loc, Decl, Exp, Exp)
+    -- `for x in v do` / `for k, v in m do` (T71): `decls` tem 1 elemento sobre
+    -- `{T}` e 2 sobre `{K: V}`.
+    StatForIn(Loc, {Decl}, Exp, Stat)
+    StatAssign(Loc, {Var}, {Exp})
+    StatDecl(Loc, {Decl}, {Exp})
+    StatCall(Loc, Exp)
+    StatReturn(Loc, {Exp})
+    StatBreak(Loc)
+    StatContinue(Loc)
+    StatMatch(Loc, Exp, {BracoStat})
+end
+
+-- Declaracoes de topo de arquivo (ast.rs: `TopLevel`).
+--
+-- `TopLevelFunc` tem o `islocal` como `boolean`, igual ao ast.rs — e o unico
+-- lugar em que um booleano ainda diz "qual das duas formas", e ele fica porque
+-- `local function` e `function` nao diferem em mais nada.
+enum TopLevel
+    TopLevelMethod(Loc, string, string, {Decl}, {Tipo}, Stat)
+    TopLevelStatic(Loc, string, string, {Decl}, {Tipo}, Stat)
+    TopLevelFunc(Loc, boolean, string, {Decl}, {Tipo}, Stat)
+    TopLevelVar(Loc, boolean, Decl, Exp)
+    TopLevelRecord(Loc, string, {Decl})
+    TopLevelImport(Loc, string, string)
+    TopLevelEnum(Loc, string, {Variante})
+    -- `foreign function abs(n: integer): integer` (T73): sem corpo, por isso
+    -- nem bloco nem `islocal` (ADR 0025).
+    TopLevelForeignFunc(Loc, string, {Decl}, {Tipo})
+end
+
+-- Um programa e uma lista de declaracoes de topo — o Titan original tambem nao
+-- tem um no `Program`. Titan nao tem `type` alias, entao o parser (T86) devolve
+-- `{TopLevel}` diretamente.
+
+---------------------------------------------------------------------------
+-- Construtores de conveniencia
+--
+-- O parser (T86) monta muita `Loc` e muito no folha; estas funcoes evitam
+-- repetir o literal de record em cada ponto.
+---------------------------------------------------------------------------
+
+function loc(linha: integer, coluna: integer): Loc
+    return {linha = linha, coluna = coluna}
+end
+
+function decl(l: Loc, nome: string, tipo: Tipo): Decl
+    return {loc = l, nome = nome, tipo = tipo, opcional = false}
+end
+
+function decl_sem_tipo(l: Loc, nome: string): Decl
+    return {loc = l, nome = nome, tipo = TipoAusente, opcional = false}
+end
+
+function inteiro(l: Loc, valor: integer): Exp
+    return ExpInteger(l, valor)
+end
+
+function binop(l: Loc, op: string, esq: Exp, dir: Exp): Exp
+    return ExpBinop(l, op, esq, dir)
+end
+
+function nome(l: Loc, n: string): Exp
+    return ExpVar(l, VarName(l, n))
+end
+
+---------------------------------------------------------------------------
+-- Travessia
+--
+-- As funcoes que provam, na pratica, que a exaustividade do `match` funciona:
+-- acrescentar uma variante a `Exp` quebra a compilacao aqui, em portugues,
+-- apontando o braco que falta. Com a tag inteira de examples/lexer.titan, o
+-- mesmo descuido passaria em silencio.
+---------------------------------------------------------------------------
+
+-- A posicao de qualquer expressao. `TipoAusente` nao aparece aqui porque e
+-- variante de `Tipo`, nao de `Exp`.
+function loc_da_exp(e: Exp): Loc
+    match e with
+        ExpNil(l) then return l
+        ExpBool(l, v) then return l
+        ExpInteger(l, v) then return l
+        ExpFloat(l, v) then return l
+        ExpString(l, v) then return l
+        ExpInitList(l, campos) then return l
+        ExpCall(l, f, args) then return l
+        ExpVar(l, v) then return l
+        ExpUnop(l, op, sub) then return l
+        ExpConcat(l, partes) then return l
+        ExpBinop(l, op, esq, dir) then return l
+        ExpCast(l, sub, t) then return l
+        ExpAdjust(l, sub) then return l
+        ExpExtra(l, sub, i, t) then return l
+        ExpMatch(l, escrutinado, bracos) then return l
+    end
+end
+
+-- Quantos nos a expressao tem, contando ela mesma — a travessia recursiva que
+-- o criterio de aceite da T84 pede.
+function tamanho_da_exp(e: Exp): integer
+    match e with
+        ExpUnop(l, op, sub) then
+            return 1 + tamanho_da_exp(sub)
+        ExpBinop(l, op, esq, dir) then
+            return 1 + tamanho_da_exp(esq) + tamanho_da_exp(dir)
+        ExpCast(l, sub, t) then
+            return 1 + tamanho_da_exp(sub)
+        ExpAdjust(l, sub) then
+            return 1 + tamanho_da_exp(sub)
+        ExpExtra(l, sub, i, t) then
+            return 1 + tamanho_da_exp(sub)
+        ExpConcat(l, partes) then
+            local total: integer = 1
+            for p in partes do
+                total = total + tamanho_da_exp(p)
+            end
+            return total
+        _ then
+            return 1
+    end
+end
+
+-- Reimprime a expressao em forma totalmente parentizada. Serve de prova visual
+-- da travessia (o teste da T84 compara a string) e, mais adiante, de mensagem
+-- de erro do checker (T87).
+function exp_para_texto(e: Exp): string
+    match e with
+        ExpNil(l) then
+            return "nil"
+        ExpBool(l, v) then
+            if v then
+                return "true"
+            end
+            return "false"
+        ExpInteger(l, v) then
+            return "" .. v
+        ExpFloat(l, v) then
+            return "" .. v
+        ExpString(l, v) then
+            return "\"" .. v .. "\""
+        ExpVar(l, v) then
+            return var_para_texto(v)
+        ExpUnop(l, op, sub) then
+            return "(" .. op .. exp_para_texto(sub) .. ")"
+        ExpBinop(l, op, esq, dir) then
+            return "(" .. exp_para_texto(esq) .. " " .. op .. " " .. exp_para_texto(dir) .. ")"
+        ExpConcat(l, partes) then
+            local s: string = "("
+            local primeiro: boolean = true
+            for p in partes do
+                if primeiro then
+                    s = s .. exp_para_texto(p)
+                    primeiro = false
+                else
+                    s = s .. " .. " .. exp_para_texto(p)
+                end
+            end
+            return s .. ")"
+        ExpCast(l, sub, t) then
+            return "(" .. exp_para_texto(sub) .. " as " .. tipo_para_texto(t) .. ")"
+        ExpAdjust(l, sub) then
+            return exp_para_texto(sub)
+        ExpExtra(l, sub, i, t) then
+            return exp_para_texto(sub) .. "#" .. i
+        ExpCall(l, f, args) then
+            return exp_para_texto(f) .. "(...)"
+        ExpInitList(l, campos) then
+            return "{...}"
+        ExpMatch(l, escrutinado, bracos) then
+            return "match " .. exp_para_texto(escrutinado) .. " with ... end"
+    end
+end
+
+function var_para_texto(v: Var): string
+    match v with
+        VarName(l, n) then
+            return n
+        VarBracket(l, base, indice) then
+            return exp_para_texto(base) .. "[" .. exp_para_texto(indice) .. "]"
+        VarDot(l, base, campo) then
+            return exp_para_texto(base) .. "." .. campo
+    end
+end
+
+function tipo_para_texto(t: Tipo): string
+    match t with
+        TipoAusente then
+            return "?"
+        TipoNil(l) then
+            return "nil"
+        TipoBoolean(l) then
+            return "boolean"
+        TipoInteger(l) then
+            return "integer"
+        TipoFloat(l) then
+            return "float"
+        TipoString(l) then
+            return "string"
+        TipoValue(l) then
+            return "value"
+        TipoQualName(l, modulo, n) then
+            return modulo .. "." .. n
+        TipoName(l, n) then
+            return n
+        TipoArray(l, sub) then
+            return "{" .. tipo_para_texto(sub) .. "}"
+        TipoMap(l, chaves, valores) then
+            return "{" .. tipo_para_texto(chaves) .. ": " .. tipo_para_texto(valores) .. "}"
+        TipoFunction(l, params, retornos) then
+            return "function(...)"
+        TipoOption(l, base) then
+            return tipo_para_texto(base) .. "?"
+    end
+end
+
+-- A posicao de qualquer comando. O par de `loc_da_exp` para o lado dos
+-- comandos: o que o parser (T86) usa para localizar o erro e o checker (T87)
+-- para localizar o diagnostico.
+function loc_do_stat(s: Stat): Loc
+    match s with
+        StatBlock(l, corpo) then return l
+        StatWhile(l, cond, corpo) then return l
+        StatRepeat(l, corpo, cond) then return l
+        StatIf(l, ramos) then return l
+        StatIfElse(l, ramos, senao) then return l
+        StatFor(l, d, inicio, limite, passo) then return l
+        StatForSemPasso(l, d, inicio, limite) then return l
+        StatForIn(l, decls, container, corpo) then return l
+        StatAssign(l, vars, exps) then return l
+        StatDecl(l, decls, exps) then return l
+        StatCall(l, chamada) then return l
+        StatReturn(l, exps) then return l
+        StatBreak(l) then return l
+        StatContinue(l) then return l
+        StatMatch(l, escrutinado, bracos) then return l
+    end
+end
+
+-- O nome declarado por uma declaracao de topo, para o indice de simbolos do
+-- checker (T87). `TopLevelImport` devolve o nome local, que e como o programa
+-- se refere ao modulo (ADR 0011).
+function nome_do_toplevel(t: TopLevel): string
+    match t with
+        TopLevelMethod(l, classe, n, params, retornos, bloco) then
+            return classe .. "." .. n
+        TopLevelStatic(l, classe, n, params, retornos, bloco) then
+            return classe .. "." .. n
+        TopLevelFunc(l, islocal, n, params, retornos, bloco) then
+            return n
+        TopLevelVar(l, islocal, d, valor) then
+            return d.nome
+        TopLevelRecord(l, n, campos) then
+            return n
+        TopLevelImport(l, nomelocal, nomemodulo) then
+            return nomelocal
+        TopLevelEnum(l, n, variantes) then
+            return n
+        TopLevelForeignFunc(l, n, params, retornos) then
+            return n
+    end
+end
