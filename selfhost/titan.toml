@@ -12,3 +12,4 @@ principal = "main.titan"
 
 [modulos]
 ast = "ast.titan"
+lexer = "lexer.titan"

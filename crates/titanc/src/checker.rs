@@ -100,8 +100,15 @@ enum SymbolKind {
     /// `TypedStat::Decl`), e o Rust gerado não compilaria — rejeitado com
     /// erro claro até uma fase futura rastrear parâmetros também.
     Param,
-    /// Variável de controle de `for`. Atribuição é permitida sem rastreio:
-    /// ela é sempre `mut` no template desaçucarado do T15.
+    /// Variável de controle de `for` (numérico, T15) ou nome ligado por um
+    /// `for`-in (T71). Atribuição é permitida sem rastreio, mas por razões
+    /// diferentes nos dois casos: no `for` numérico ela é sempre `mut` no
+    /// template desaçucarado do T15; no `for`-in o codegen decide a
+    /// mutabilidade da ligação ao emiti-la, porque ela não é um
+    /// `TypedStat::Decl` e não passa por `fixup_mutability`. Quem mexer
+    /// nisso tem de olhar `emit_forin_binding`, e não só este ponto: passar
+    /// o nome a uma função que recebe composto também exige `mut`, e é o
+    /// que `passa_como_composto` responde lá.
     ForVar,
     /// Local declarada com `local`; atribuições registram o `DeclId` para o
     /// fix-up de mutabilidade ao final do corpo da função.
@@ -3092,9 +3099,11 @@ valor precisam de nomes diferentes.",
                         );
                         return None;
                     }
-                    // `ForVar` é sempre `mut` no template do T15 (nada a
-                    // rastrear); `Local` é registrada mais abaixo, após a
-                    // atribuição validar.
+                    // `ForVar` não entra no rastreio: no `for` numérico é
+                    // sempre `mut` (template do T15), e no `for`-in a
+                    // ligação é emitida pelo codegen, que decide o `mut`
+                    // por conta própria. `Local` é registrada mais abaixo,
+                    // após a atribuição validar.
                     SymbolKind::ForVar | SymbolKind::Local { .. } => {}
                 }
 
