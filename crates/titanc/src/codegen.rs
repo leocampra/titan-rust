@@ -1607,9 +1607,14 @@ fn emit_forin_binding(
 ) {
     indent(out, depth);
     let rust_ty = rust_type_name(ty, qual);
-    // `let mut` só quando o corpo escreve na variável — senão o rustc
-    // reclamaria de `unused_mut`, e o critério é Rust sem warnings.
-    let bind = if assigns_to_name(block, name) {
+    // `let mut` quando o corpo **escreve** na variável (`for x in v do x = 0
+    // end`, atribuição a uma cópia — ADR 0024) ou quando a **passa a uma
+    // função que recebe composto**: todo parâmetro composto é `&mut T` (T30,
+    // decisão 4), e `f(&mut x)` sobre um `let` sem `mut` é `E0596`.
+    //
+    // Fora esses dois casos fica `let` puro — `mut` a mais faria o rustc
+    // reclamar de `unused_mut`, e o critério da T69 é Rust sem warnings.
+    let bind = if assigns_to_name(block, name) || block.passa_como_composto(name) {
         "let mut"
     } else {
         "let"
@@ -1704,12 +1709,14 @@ fn emit_arm_bindings(
             continue;
         }
         let interno = format!("{PREFIXO_CAMPO}{fname}");
-        // `let mut` só quando o corpo escreve **através** do nome
-        // (`p.campo = 9` sobre um campo record): atribuir ao nome inteiro é
-        // proibido pelo checker, que trata o ligado como parâmetro. Sem a
-        // pergunta, todo campo composto sairia `mut` e o `unused_mut` do
-        // rustc reclamaria.
-        let bind = if body.escreve_atraves_de(fname) {
+        // `let mut` quando o corpo escreve **através** do nome (`p.campo =
+        // 9` sobre um campo record — atribuir ao nome inteiro é proibido
+        // pelo checker, que trata o ligado como parâmetro) ou quando o passa
+        // a uma função que recebe composto (`Um(p) then f(p)`), que sai
+        // `f(&mut p)` pela decisão 4 da T30. Sem as duas perguntas, um
+        // campo composto sairia `let` e o rustc recusaria o empréstimo
+        // (`E0596`); com `mut` sempre, reclamaria de `unused_mut`.
+        let bind = if body.escreve_atraves_de(fname) || body.passa_como_composto(fname) {
             "let mut"
         } else {
             "let"
@@ -1750,6 +1757,11 @@ trait UsaNome {
     /// que exige `let mut` na ligação. Atribuir ao nome inteiro não entra:
     /// o checker o trata como parâmetro e já recusou.
     fn escreve_atraves_de(&self, nome: &str) -> bool;
+    /// O corpo passa o nome como **argumento composto** (ou receptor de
+    /// método) — o que também exige `let mut`, porque todo parâmetro
+    /// composto é `&mut T` (T30, decisão 4) e a chamada sai
+    /// `f(&mut nome)` por [`emit_place_mut`].
+    fn passa_como_composto(&self, nome: &str) -> bool;
 }
 
 impl UsaNome for TypedStat {
@@ -1759,6 +1771,10 @@ impl UsaNome for TypedStat {
 
     fn escreve_atraves_de(&self, nome: &str) -> bool {
         escreve_atraves_no_stat(self, nome)
+    }
+
+    fn passa_como_composto(&self, nome: &str) -> bool {
+        passa_como_composto_no_stat(self, nome)
     }
 }
 
@@ -1774,6 +1790,13 @@ impl UsaNome for TypedExp {
     /// nenhum no corpo de um braço de `match`-expressão.
     fn escreve_atraves_de(&self, _nome: &str) -> bool {
         false
+    }
+
+    /// Uma expressão **contém** chamadas, e uma chamada com argumento
+    /// composto é exatamente o caso que exige `mut` — um braço de
+    /// `match`-expressão como `Um(p) then f(p)` cai aqui.
+    fn passa_como_composto(&self, nome: &str) -> bool {
+        passa_como_composto_na_exp(self, nome)
     }
 }
 
@@ -1826,6 +1849,177 @@ fn escreve_atraves_no_stat(stat: &TypedStat, nome: &str) -> bool {
         }
     }
     no_stat(stat, nome)
+}
+
+/// O comando passa algo **enraizado em `nome`** como argumento composto de
+/// alguma chamada — o nome inteiro (`f(p)`), um campo (`f(p.dentro)`), um
+/// elemento (`f(xs[1])`) ou o receptor de `df.metodo(...)`, desde que o tipo
+/// naquela posição seja `{T}`/`{K: V}`/`record`/`Opaque`.
+///
+/// Existe porque todo parâmetro composto é `&mut T` (T30, decisão 4), então a
+/// chamada sai `f(&mut ...)` por [`emit_place_mut`] — e emprestar `&mut` de
+/// uma ligação `let` sem `mut` é `E0596`, que o `rustc` recusa em inglês.
+///
+/// Para um `local` o checker já cobre este caso (marca a raiz composta em
+/// `assigned` ao tipar a chamada, e `fixup_mutability` emite `let mut`), mas
+/// os nomes ligados pelo `for`-in (T71) e pelo padrão de um `match` (T77)
+/// **não** são `TypedStat::Decl`: não passam pelo fix-up, e a mutabilidade
+/// deles é decidida aqui, no codegen. Daí a pergunta precisar existir dos
+/// dois lados.
+///
+/// A **raiz** é o que conta, e não o nome inteiro: `&mut c.dentro` exige que
+/// `c` seja `mut` tanto quanto `&mut c` exigiria — em Rust, emprestar um
+/// campo mutavelmente empresta o caminho todo. É a mesma noção de raiz de
+/// [`escreve_atraves_no_stat`], aplicada a argumento em vez de alvo de
+/// atribuição.
+fn passa_como_composto_no_stat(stat: &TypedStat, nome: &str) -> bool {
+    fn no_stat(stat: &TypedStat, nome: &str) -> bool {
+        match stat {
+            TypedStat::Block { stats, .. } => stats.iter().any(|s| no_stat(s, nome)),
+            TypedStat::If {
+                thens, elsestat, ..
+            } => {
+                thens.iter().any(|t| {
+                    passa_como_composto_na_exp(&t.condition, nome) || no_stat(&t.block, nome)
+                }) || elsestat.as_ref().is_some_and(|e| no_stat(e, nome))
+            }
+            TypedStat::While {
+                condition, block, ..
+            } => passa_como_composto_na_exp(condition, nome) || no_stat(block, nome),
+            TypedStat::Repeat {
+                block, condition, ..
+            } => no_stat(block, nome) || passa_como_composto_na_exp(condition, nome),
+            TypedStat::For {
+                start,
+                finish,
+                inc,
+                block,
+                ..
+            } => {
+                passa_como_composto_na_exp(start, nome)
+                    || passa_como_composto_na_exp(finish, nome)
+                    || passa_como_composto_na_exp(inc, nome)
+                    || no_stat(block, nome)
+            }
+            // O container do `for`-in sai por `.iter()`, que empresta `&` e
+            // não `&mut` — percorrer um array não exige que ele seja `mut`.
+            TypedStat::ForIn {
+                container, block, ..
+            } => passa_como_composto_na_exp(container, nome) || no_stat(block, nome),
+            TypedStat::Match { exp, arms, .. } => {
+                passa_como_composto_na_exp(exp, nome)
+                    || arms.iter().any(|arm| no_stat(&arm.body, nome))
+            }
+            TypedStat::Assign { target, value, .. } => {
+                no_lvalue(target, nome) || passa_como_composto_na_exp(value, nome)
+            }
+            TypedStat::AssignMulti {
+                targets, values, ..
+            } => {
+                targets.iter().any(|t| no_lvalue(t, nome))
+                    || nos_valores_multiplos(values, nome)
+            }
+            TypedStat::Decl { value, .. } => passa_como_composto_na_exp(value, nome),
+            TypedStat::DeclMulti { values, .. } => nos_valores_multiplos(values, nome),
+            TypedStat::Call { call, .. } => passa_como_composto_na_exp(call, nome),
+            TypedStat::Return { exps, .. } => {
+                exps.iter().any(|e| passa_como_composto_na_exp(e, nome))
+            }
+            TypedStat::Break { .. } | TypedStat::Continue { .. } => false,
+        }
+    }
+    /// O índice de um alvo (`xs[f(p)] = 1`) é uma expressão como outra
+    /// qualquer, e pode conter a chamada que empresta o nome.
+    fn no_lvalue(target: &TypedLValue, nome: &str) -> bool {
+        match target {
+            TypedLValue::Name(_) => false,
+            TypedLValue::Index { base, index } => {
+                passa_como_composto_na_exp(base, nome)
+                    || passa_como_composto_na_exp(index, nome)
+            }
+            TypedLValue::Field { base, .. } => passa_como_composto_na_exp(base, nome),
+        }
+    }
+    fn nos_valores_multiplos(values: &TypedMultiValues, nome: &str) -> bool {
+        match values {
+            TypedMultiValues::Call(exp) => passa_como_composto_na_exp(exp, nome),
+            TypedMultiValues::List(exps) => {
+                exps.iter().any(|e| passa_como_composto_na_exp(e, nome))
+            }
+        }
+    }
+    no_stat(stat, nome)
+}
+
+/// O lado-expressão de [`passa_como_composto_no_stat`]: encontra a chamada e
+/// pergunta de cada argumento se é o nome inteiro com tipo composto.
+fn passa_como_composto_na_exp(exp: &TypedExp, nome: &str) -> bool {
+    /// A raiz de uma cadeia de acessos: `c` em `c.dentro[2].x`. `None` para
+    /// o que não nasce de um nome (uma chamada, um literal), porque aí o
+    /// `&mut` recai sobre um temporário e não sobre ligação nenhuma.
+    fn raiz(exp: &TypedExp) -> Option<&str> {
+        match &exp.kind {
+            TypedExpKind::Var(n) => Some(n.as_str()),
+            TypedExpKind::Index { base, .. } | TypedExpKind::Field { base, .. } => raiz(base),
+            _ => None,
+        }
+    }
+    let arg_e_o_nome =
+        |a: &TypedExp| is_composite(&a.ty) && raiz(a) == Some(nome);
+    match &exp.kind {
+        TypedExpKind::Call { callee, args } => {
+            // O receptor de `df.soma(...)` é `Opaque` — composto — e sai
+            // pela mesma máquina de lugares que um argumento (T42).
+            let recv = match callee {
+                Callee::Method { recv, .. } => {
+                    arg_e_o_nome(recv) || passa_como_composto_na_exp(recv, nome)
+                }
+                _ => false,
+            };
+            recv || args
+                .iter()
+                .any(|a| arg_e_o_nome(a) || passa_como_composto_na_exp(a, nome))
+        }
+        TypedExpKind::Concat(parts) => {
+            parts.iter().any(|p| passa_como_composto_na_exp(p, nome))
+        }
+        TypedExpKind::Binop { lhs, rhs, .. } => {
+            passa_como_composto_na_exp(lhs, nome) || passa_como_composto_na_exp(rhs, nome)
+        }
+        TypedExpKind::Unop { exp, .. } => passa_como_composto_na_exp(exp, nome),
+        TypedExpKind::Index { base, index } => {
+            passa_como_composto_na_exp(base, nome) || passa_como_composto_na_exp(index, nome)
+        }
+        TypedExpKind::Field { base, .. } => passa_como_composto_na_exp(base, nome),
+        TypedExpKind::ArrayLit(exps) => {
+            exps.iter().any(|e| passa_como_composto_na_exp(e, nome))
+        }
+        TypedExpKind::RecordLit { fields, .. } => fields
+            .iter()
+            .any(|(_, e)| passa_como_composto_na_exp(e, nome)),
+        TypedExpKind::MapLit(entries) => entries.iter().any(|(k, v)| {
+            passa_como_composto_na_exp(k, nome) || passa_como_composto_na_exp(v, nome)
+        }),
+        TypedExpKind::Adjust(inner)
+        | TypedExpKind::Extra { exp: inner, .. }
+        | TypedExpKind::SomeOf(inner)
+        | TypedExpKind::Cast { exp: inner, .. } => passa_como_composto_na_exp(inner, nome),
+        TypedExpKind::VariantLit { args, .. } => {
+            args.iter().any(|a| passa_como_composto_na_exp(a, nome))
+        }
+        TypedExpKind::Match { exp, arms } => {
+            passa_como_composto_na_exp(exp, nome)
+                || arms
+                    .iter()
+                    .any(|arm| passa_como_composto_na_exp(&arm.body, nome))
+        }
+        TypedExpKind::Var(_)
+        | TypedExpKind::Nil
+        | TypedExpKind::Bool(_)
+        | TypedExpKind::Integer(_)
+        | TypedExpKind::Float(_)
+        | TypedExpKind::String(_) => false,
+    }
 }
 
 /// Escreve `valor` — texto Rust **já emitido** — no lugar designado por
@@ -3750,6 +3944,199 @@ end"#;
         let stdout = String::from_utf8_lossy(&output.stdout);
         // 1*2 + 2*2 = 6, e o container segue intacto.
         assert_eq!(stdout, "s: 6\nv1: 1\n", "stdout: {stdout}");
+    }
+
+    /// Passar a variável do laço a uma função que recebe **composto** exige
+    /// `let mut` tanto quanto escrever nela: todo parâmetro composto é
+    /// `&mut T` (T30, decisão 4), então a chamada sai `f(&mut p)` — e
+    /// emprestar `&mut` de uma ligação sem `mut` é `E0596`, que o `rustc`
+    /// recusaria em inglês.
+    ///
+    /// Para um `local` o checker já cobria este caso (marca a raiz composta
+    /// em `assigned` ao tipar a chamada); a variável do `for`-in é
+    /// `SymbolKind::ForVar`, não passa pelo fix-up de mutabilidade, e a
+    /// pergunta precisou ser feita aqui.
+    #[test]
+    fn passar_a_variavel_do_for_in_a_funcao_com_record_emite_let_mut() {
+        let source = r#"record P
+    x: integer
+end
+
+function mostrar(p: P): string
+    return "" .. p.x
+end
+
+function main(args: {string}): integer
+    local ps: {P} = {}
+    ps[#ps + 1] = {x = 1}
+    ps[#ps + 1] = {x = 2}
+    for p in ps do
+        print(mostrar(p))
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("let mut p: P = titan_forin_p.clone();"),
+            "{rust}"
+        );
+        let (avisos, output) = compila_e_executa(&rust, "for-in-arg-composto");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\n");
+    }
+
+    /// O mesmo para o `for`-in sobre map, e com a assimetria que prova que a
+    /// pergunta é por **nome** e não por tipo: `v` vai para a função (sai
+    /// `mut`), `k` só é concatenado (continua `let`). Um `mut` a mais aqui
+    /// dispararia `unused_mut`, contra o critério da T69.
+    #[test]
+    fn no_for_in_de_map_so_o_nome_passado_a_funcao_ganha_mut() {
+        let source = r#"record P
+    x: integer
+end
+
+function mostrar(p: P): string
+    return "" .. p.x
+end
+
+function main(args: {string}): integer
+    local m: {string: P} = {}
+    m["a"] = {x = 3}
+    for k, v in m do
+        print(k .. "=" .. mostrar(v))
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("let mut v: P = titan_forin_v.clone();"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("let k: String = titan_forin_k.clone();"),
+            "a chave só é lida, então não pode sair `mut`:\n{rust}"
+        );
+        let (avisos, output) = compila_e_executa(&rust, "for-in-map-arg-composto");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "a=3\n");
+    }
+
+    /// E o mesmo para o campo ligado por um braço de `match` (T77), que tem
+    /// a ligação análoga e caía no mesmo `E0596` pela mesma razão.
+    #[test]
+    fn passar_campo_ligado_por_match_a_funcao_com_record_emite_let_mut() {
+        let source = r#"record P
+    x: integer
+end
+
+enum E
+    Um(P)
+    Nenhum
+end
+
+function mostrar(p: P): string
+    return "" .. p.x
+end
+
+function main(args: {string}): integer
+    local e: E = Um({x = 7})
+    match e with
+        Um(p) then print(mostrar(p))
+        Nenhum then print("nenhum")
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("let mut p: P = titan_match_p.clone();"),
+            "{rust}"
+        );
+        let (avisos, output) = compila_e_executa(&rust, "match-arg-composto");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+    }
+
+    /// Passar um **campo** do nome do laço (`f(c.dentro)`) exige `mut` tanto
+    /// quanto passar o nome inteiro: `&mut c.dentro` empresta o caminho todo,
+    /// e o `rustc` recusa com "cannot borrow `c.dentro` as mutable, as `c` is
+    /// not declared as mutable". Por isso a pergunta olha a **raiz** da
+    /// cadeia, e não o nome inteiro — este teste é o que fixa a diferença.
+    #[test]
+    fn passar_campo_do_nome_do_laco_tambem_exige_mut() {
+        let source = r#"record Interno
+    v: integer
+end
+
+record Caixa
+    dentro: Interno
+end
+
+function mostrar(i: Interno): string
+    return "" .. i.v
+end
+
+function main(args: {string}): integer
+    local cs: {Caixa} = {}
+    cs[#cs + 1] = {dentro = {v = 4}}
+    for c in cs do
+        print(mostrar(c.dentro))
+    end
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("let mut c: Caixa = titan_forin_c.clone();"),
+            "emprestar `c.dentro` mutavelmente exige `c` mutável:\n{rust}"
+        );
+        let (avisos, output) = compila_e_executa(&rust, "for-in-campo-exige-mut");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "4\n");
+    }
+
+    /// O outro lado da pergunta: um nome de laço **composto** que nunca vai
+    /// para uma função — só é lido, campo a campo — continua `let` puro. Sem
+    /// esta contraprova, "todo composto sai `mut`" passaria nos testes
+    /// acima e encheria o Rust gerado de `unused_mut`, contra o critério da
+    /// T69.
+    #[test]
+    fn nome_composto_do_for_in_so_lido_nao_ganha_mut() {
+        let source = r#"record P
+    x: integer
+end
+
+function main(args: {string}): integer
+    local ps: {P} = {}
+    ps[#ps + 1] = {x = 9}
+    local s: integer = 0
+    for p in ps do
+        s = s + p.x
+    end
+    print("s: " .. s)
+    return 0
+end"#;
+        let rust = generate_source(source);
+        assert!(
+            rust.contains("let p: P = titan_forin_p.clone();"),
+            "ninguém empresta `p`, então não pode sair `mut`:\n{rust}"
+        );
+        let (avisos, output) = compila_e_executa(&rust, "for-in-composto-so-lido");
+        assert!(
+            avisos.is_empty(),
+            "warnings no Rust gerado:\n{avisos}\n{rust}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "s: 9\n");
     }
 
     /// Variável só escrita, nunca lida, ainda precisa da ligação: é o caso

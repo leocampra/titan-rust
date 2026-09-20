@@ -1,16 +1,26 @@
 import ast
+import io
+import lexer
 
 -- Driver do titanc auto-hospedado (PRD.md, Parte C).
 --
--- Na T84 ele e o programa minimo que faz o projeto `selfhost/` compilar como um
--- todo: monta a `Exp` recursiva de `1 + 2 * 3` com o `enum` da ast e a percorre
--- com `match`, imprimindo a arvore reparentizada e o numero de nos. E a mesma
--- construcao que o teste de integracao confere, so que pela linha de comando:
+-- Cresce uma tarefa de cada vez. Hoje ele faz duas coisas, conforme receba um
+-- arquivo ou nao:
 --
---     titanc --manifesto selfhost --out /tmp/x && /tmp/x/titanself
+--   titanc --manifesto selfhost --out /tmp/x
+--   /tmp/x/titanself                        -> a demonstracao da ast (T84)
+--   /tmp/x/titanself examples/nucleo.titan  -> a lista de tokens (T85)
 --
--- As tarefas seguintes o substituem pelo driver de verdade: lexer (T85),
--- parser (T86) e checker (T87) encadeados sobre um arquivo passado em `args`.
+-- Sem argumento ele monta a `Exp` recursiva de `1 + 2 * 3` com o `enum` da ast
+-- e a percorre com `match`, imprimindo a arvore reparentizada e o numero de
+-- nos — a mesma construcao que o teste de integracao da T84 confere, e que
+-- continua valendo palavra por palavra.
+--
+-- Com um arquivo, tokeniza-o com selfhost/lexer.titan e imprime uma linha por
+-- token, no formato de examples/lexer.titan — o que o teste de equivalencia da
+-- T85 compara com a saida do lexer da Fase 4.
+--
+-- As tarefas seguintes encadeiam o resto: parser (T86) e checker (T87).
 
 function exemplo(): ast.Exp
     -- 1 + 2 * 3, com a precedencia ja resolvida na forma da arvore: o `*`
@@ -29,10 +39,35 @@ function exemplo(): ast.Exp
     return ast.binop(l, "+", um, dois_vezes_tres)
 end
 
-function main(args: {string}): integer
+-- A demonstracao da T84: constroi a arvore e a percorre com `match`.
+function demonstrar_ast(): nil
     local e: ast.Exp = exemplo()
     print("arvore: " .. ast.exp_para_texto(e))
     print("nos: " .. ast.tamanho_da_exp(e))
     print("linha: " .. ast.loc_da_exp(e).linha)
+end
+
+-- A demonstracao da T85: tokeniza o arquivo e imprime um token por linha.
+--
+-- Um `print` por token, e nao um `print` de `lexer.tokens_para_texto` inteiro:
+-- aquela funcao termina cada linha com `\n`, e `print` acrescenta mais um — a
+-- saida sairia com uma linha em branco no fim e a comparacao com o lexer da
+-- Fase 4 falharia por um byte. A capability `io` nao tem escrita em stdout sem
+-- quebra de linha, e acrescentar uma esta fora do escopo desta tarefa.
+-- `tokens_para_texto` continua sendo o que o teste de equivalencia usa.
+function tokenizar_arquivo(caminho: string): nil
+    local fonte: string = io.ler_arquivo(caminho)
+    local tokens: {lexer.Token} = lexer.tokenizar(fonte)
+    for t in tokens do
+        print(lexer.token_para_texto(t))
+    end
+end
+
+function main(args: {string}): integer
+    if #args < 1 then
+        demonstrar_ast()
+        return 0
+    end
+    tokenizar_arquivo(args[1])
     return 0
 end

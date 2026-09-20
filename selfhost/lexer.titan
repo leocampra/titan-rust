@@ -1,0 +1,417 @@
+import texto
+
+-- Lexer do Titan escrito em Titan, no estilo da Fase 5 (PRD.md, T85).
+--
+-- O port de examples/lexer.titan (Fase 4, T56), que continua no repositorio
+-- **intocado**: ele e a evidencia empirica que o ADR 0020 cita para justificar
+-- os tipos soma, e o ADR 0027 aponta um arquivo para o outro. Este aqui e o
+-- outro lado da comparacao — o mesmo lexer, o mesmo subconjunto da linguagem
+-- reconhecido, a mesma lista de tokens na saida, escrito com o que a Fase 5
+-- acrescentou:
+--
+--   examples/lexer.titan (Fase 4)          | selfhost/lexer.titan (Fase 5)
+--   ---------------------------------------|------------------------------------
+--   `TokenKind` e `integer`, e cada valor   | `enum TokenKind` de verdade. Nada
+--   vira uma funcao sem argumento:          | de constante-como-funcao:
+--     function TK_NAME(): integer           |   enum TokenKind
+--         return 1                          |       TkEof
+--     end                                   |       TkName
+--                                           |       ...
+--                                           |   end
+--   ---------------------------------------|------------------------------------
+--   Ler o kind e um `if` encadeado sobre    | `match` com exaustividade conferida
+--   inteiros (`nome_kind`, :240-253);       | pelo checker: acrescentar uma
+--   esquecer um caso cai no `return         | variante quebra a compilacao aqui,
+--   "SIMBOLO"` final, em silencio.          | em portugues, apontando o que falta.
+--   ---------------------------------------|------------------------------------
+--   A posicao da varredura anda num         | Retornos multiplos (T65-T67): cada
+--   `record Estado` **mutavel** passado por | funcao recebe a `Pos` e devolve a
+--   parametro e alterado por efeito         | `Pos` seguinte junto com o que leu.
+--   colateral (`avancar(e)` escreve em      | `Pos` e imutavel; quem chama liga o
+--   `e.pos`), porque reatribuir um          | resultado com `local p, t = ...`.
+--   parametro escalar e proibido            | O estado deixa de ser contorno e
+--   (checker.rs:1293-1296) e a linguagem    | volta a ser o que era: um valor de
+--   nao tinha retorno multiplo.             | entrada e um valor de saida.
+--   ---------------------------------------|------------------------------------
+--   Percorrer os tokens e `for i = 1,       | `for`-in (T71): `for t in tokens do`.
+--   #tokens do ... tokens[i] ... end`.      |
+--
+-- ESCOPO: identico ao da Fase 4, de proposito — o criterio de aceite da T85 e
+-- produzir **a mesma lista de tokens** que examples/lexer.titan produz para
+-- examples/nucleo.titan, e ampliar o reconhecido invalidaria a comparacao.
+-- Cobre identificadores e palavras-chave, inteiros, strings entre aspas duplas
+-- com os escapes `\n \" \\`, comentarios de linha `--` e os simbolos de um e
+-- dois caracteres do idioma das Fases 1/2. Sem aspa simples, sem long string
+-- `[[...]]`, sem float, sem numero hexadecimal.
+--
+-- As palavras-chave da Fase 5 (`enum`, `match`, `with`, `for`-in...) tambem
+-- **nao** entram, pela mesma razao: `eh_palavra_chave` e copia literal da lista
+-- da Fase 4. Quem ampliar esta lista tem de ampliar os dois arquivos no mesmo
+-- commit, ou o teste de equivalencia acusa.
+
+---------------------------------------------------------------------------
+-- Tokens
+---------------------------------------------------------------------------
+
+-- A classe de um token.
+--
+-- O contraste mais curto com a Fase 4, onde isto era `integer` e cada valor
+-- uma funcao (`function TK_NAME(): integer return 1 end`). O `enum` nao e so
+-- mais curto: como o checker confere a exaustividade do `match`, a funcao
+-- `nome_kind` abaixo nao tem caso-padrao nenhum, e acrescentar uma variante
+-- aqui passa a ser um erro de compilacao la — nao um caso que cai no `else`.
+enum TokenKind
+    TkEof
+    TkName
+    TkInteger
+    TkString
+    TkKeyword
+    TkSymbol
+end
+
+-- Um token: a classe, o texto lido e onde ele comecou.
+--
+-- Continua `record`, e nao `enum`: as quatro formas de token nao carregam
+-- campos diferentes umas das outras — todas tem lexeme e posicao. Tipo soma
+-- nao e martelo universal, e o `kind` acima ja e o tipo soma que faltava.
+record Token
+    kind: TokenKind
+    lexeme: string
+    linha: integer
+    coluna: integer
+end
+
+-- O nome da classe, como o teste de equivalencia e o `main` imprimem.
+--
+-- `match` sem `_`: a exaustividade e conferida pelo checker (T76). Compare com
+-- examples/lexer.titan:240-253, onde o mesmo mapeamento e um `if` encadeado
+-- sobre inteiros terminado num `return "SIMBOLO"` que engole todo caso novo.
+function nome_kind(k: TokenKind): string
+    match k with
+        TkEof then return "EOF"
+        TkName then return "NOME"
+        TkInteger then return "INTEIRO"
+        TkString then return "STRING"
+        TkKeyword then return "PALAVRA_CHAVE"
+        TkSymbol then return "SIMBOLO"
+    end
+end
+
+-- Um token formatado como examples/lexer.titan:255-257 o imprime. A igualdade
+-- byte a byte desta linha com a do lexer da Fase 4 e o criterio de aceite.
+function token_para_texto(t: Token): string
+    return nome_kind(t.kind) .. " '" .. t.lexeme .. "' " .. t.linha .. ":" .. t.coluna
+end
+
+-- Se o token e o fim do arquivo — o laco de `tokenizar` precisa perguntar isso,
+-- e `==` nao esta definido sobre `enum` (a comparacao de variante se faz com
+-- `match`, que e o que esta funcao encapsula).
+function eh_eof(t: Token): boolean
+    match t.kind with
+        TkEof then return true
+        _ then return false
+    end
+end
+
+---------------------------------------------------------------------------
+-- Posicao da varredura
+--
+-- Onde a Fase 4 tinha um `record Estado` mutavel passado por parametro e
+-- alterado por efeito colateral, aqui ha um record **imutavel** que entra e
+-- sai das funcoes. `fonte` nao mora mais nele: e o mesmo texto do inicio ao
+-- fim da varredura, entao e parametro, nao estado.
+---------------------------------------------------------------------------
+
+record Pos
+    pos: integer
+    linha: integer
+    coluna: integer
+end
+
+function inicio(): Pos
+    return {pos = 1, linha = 1, coluna = 1}
+end
+
+function fim(fonte: string, p: Pos): boolean
+    return p.pos > texto.tamanho(fonte)
+end
+
+-- O byte sob o cursor, ou 0 no fim do arquivo.
+function atual(fonte: string, p: Pos): integer
+    if fim(fonte, p) then
+        return 0
+    end
+    return texto.byte(fonte, p.pos)
+end
+
+-- O byte seguinte ao cursor, ou 0 se nao houver. Na Fase 4 cada ponto que
+-- precisava espiar escrevia `e.pos + 1 <= e.tamanho and texto.byte(e.fonte,
+-- e.pos + 1) == X` inteiro — seis vezes, em `lex_simbolo`.
+function espiar(fonte: string, p: Pos): integer
+    if p.pos + 1 > texto.tamanho(fonte) then
+        return 0
+    end
+    return texto.byte(fonte, p.pos + 1)
+end
+
+-- A posicao seguinte. Compare com `avancar(e: Estado): nil` da Fase 4
+-- (:57-65), que devolvia `nil` e escrevia nos campos de quem a chamou: o
+-- avanco era invisivel na assinatura. Aqui ele e o valor de retorno.
+function avancar(fonte: string, p: Pos): Pos
+    if texto.byte(fonte, p.pos) == 10 then
+        return {pos = p.pos + 1, linha = p.linha + 1, coluna = 1}
+    end
+    return {pos = p.pos + 1, linha = p.linha, coluna = p.coluna + 1}
+end
+
+function avancar_duas_vezes(fonte: string, p: Pos): Pos
+    local um: Pos = avancar(fonte, p)
+    return avancar(fonte, um)
+end
+
+---------------------------------------------------------------------------
+-- Classificacao de bytes
+--
+-- Sem mudanca de estilo em relacao a Fase 4: sao predicados sobre um inteiro,
+-- e ja estavam certos la.
+---------------------------------------------------------------------------
+
+function eh_digito(b: integer): boolean
+    return b >= 48 and b <= 57
+end
+
+function eh_letra_ou_underscore(b: integer): boolean
+    return (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
+end
+
+function eh_alfanumerico(b: integer): boolean
+    return eh_letra_ou_underscore(b) or eh_digito(b)
+end
+
+function eh_espaco(b: integer): boolean
+    return b == 32 or b == 9 or b == 10 or b == 13
+end
+
+function eh_simbolo_de_um_char(b: integer): boolean
+    return b == 40 or b == 41 or b == 123 or b == 125 or b == 91 or b == 93
+        or b == 44 or b == 58 or b == 59 or b == 46 or b == 35
+        or b == 43 or b == 45 or b == 42 or b == 47 or b == 37 or b == 94
+        or b == 61 or b == 60 or b == 62 or b == 126
+end
+
+-- Copia literal de examples/lexer.titan:100-108. Nao inclui as palavras-chave
+-- que a propria Fase 5 acrescentou (`enum`, `match`, `with`, `in`, `repeat`,
+-- `until`, `continue`, `foreign`): ampliar a lista aqui e nao la faria o teste
+-- de equivalencia falhar em qualquer fonte que as use. O parser da T86 herda
+-- este escopo.
+function eh_palavra_chave(nome: string): boolean
+    return nome == "function" or nome == "local" or nome == "return" or nome == "end"
+        or nome == "true" or nome == "false" or nome == "nil"
+        or nome == "and" or nome == "or" or nome == "not"
+        or nome == "if" or nome == "then" or nome == "elseif" or nome == "else"
+        or nome == "while" or nome == "do" or nome == "for"
+        or nome == "boolean" or nome == "integer" or nome == "float" or nome == "string" or nome == "value"
+        or nome == "record" or nome == "as" or nome == "import" or nome == "break"
+end
+
+---------------------------------------------------------------------------
+-- Varredura
+--
+-- Toda funcao daqui para baixo tem a mesma forma: recebe `(fonte, p)` e
+-- devolve `(Pos, ...)` — a posicao depois do que consumiu, mais o que leu. E o
+-- que os retornos multiplos compraram: na Fase 4 a posicao voltava por efeito
+-- colateral no `record Estado`, e a assinatura nao dizia nada sobre isso.
+---------------------------------------------------------------------------
+
+-- Consome espacos e comentarios de linha `-- ate o fim da linha`.
+function pular_trivia(fonte: string, p: Pos): Pos
+    local cur: Pos = p
+    while true do
+        if eh_espaco(atual(fonte, cur)) then
+            cur = avancar(fonte, cur)
+        elseif atual(fonte, cur) == 45 and espiar(fonte, cur) == 45 then
+            cur = avancar_duas_vezes(fonte, cur)
+            while not fim(fonte, cur) and atual(fonte, cur) ~= 10 do
+                cur = avancar(fonte, cur)
+            end
+        else
+            break
+        end
+    end
+    return cur
+end
+
+function lex_nome_ou_palavra_chave(fonte: string, p: Pos): Pos, Token
+    local comeco: integer = p.pos
+    local cur: Pos = p
+    while not fim(fonte, cur) and eh_alfanumerico(atual(fonte, cur)) do
+        cur = avancar(fonte, cur)
+    end
+    local nome: string = texto.sub(fonte, comeco, cur.pos - 1)
+    if eh_palavra_chave(nome) then
+        return cur, {kind = TkKeyword, lexeme = nome, linha = p.linha, coluna = p.coluna}
+    end
+    return cur, {kind = TkName, lexeme = nome, linha = p.linha, coluna = p.coluna}
+end
+
+function lex_numero(fonte: string, p: Pos): Pos, Token
+    local comeco: integer = p.pos
+    local cur: Pos = p
+    while not fim(fonte, cur) and eh_digito(atual(fonte, cur)) do
+        cur = avancar(fonte, cur)
+    end
+    local lexeme: string = texto.sub(fonte, comeco, cur.pos - 1)
+    return cur, {kind = TkInteger, lexeme = lexeme, linha = p.linha, coluna = p.coluna}
+end
+
+-- O escape apontado pelo byte seguinte a `\`. Na Fase 4 este mapeamento era um
+-- `if`/`elseif` no meio de `lex_string`, que ja cuidava do laco, do estado e
+-- da aspa de fechamento; separa-lo custa nada e deixa cada funcao com um
+-- assunto.
+function escape_de(fonte: string, p: Pos, prox: integer): string
+    if prox == 110 then
+        return "\n"
+    elseif prox == 34 then
+        return "\""
+    elseif prox == 92 then
+        return "\\"
+    end
+    -- Escape desconhecido: o proprio caractere, como na Fase 4 (:152).
+    return texto.sub(fonte, p.pos + 1, p.pos + 1)
+end
+
+-- Strings curtas entre aspas duplas, com os escapes `\n \" \\`. Subconjunto
+-- deliberado, identico ao da Fase 4: sem aspa simples, sem long string.
+function lex_string(fonte: string, p: Pos): Pos, Token
+    local cur: Pos = avancar(fonte, p) -- consome a aspa de abertura
+    local conteudo: string = ""
+    while not fim(fonte, cur) and atual(fonte, cur) ~= 34 do
+        if atual(fonte, cur) == 92 and cur.pos + 1 <= texto.tamanho(fonte) then
+            -- O `prox` num `local` em vez de `escape_de(fonte, cur,
+            -- espiar(fonte, cur))`: passar `cur` para a chamada de fora e para
+            -- a de dentro faz o codegen emitir dois `&mut cur` vivos ao mesmo
+            -- tempo (ADR 0007), e o rustc reclama em ingles. Com o `local` as
+            -- chamadas ficam sequenciadas e cada emprestimo termina antes do
+            -- proximo. E a mesma razao que desencaixa as chamadas em
+            -- selfhost/main.titan.
+            local prox: integer = espiar(fonte, cur)
+            conteudo = conteudo .. escape_de(fonte, cur, prox)
+            cur = avancar_duas_vezes(fonte, cur)
+        else
+            conteudo = conteudo .. texto.sub(fonte, cur.pos, cur.pos)
+            cur = avancar(fonte, cur)
+        end
+    end
+    if fim(fonte, cur) then
+        print("erro lexico: string nao terminada na linha " .. p.linha)
+    else
+        cur = avancar(fonte, cur) -- consome a aspa de fechamento
+    end
+    return cur, {kind = TkString, lexeme = conteudo, linha = p.linha, coluna = p.coluna}
+end
+
+-- O simbolo de dois caracteres que comeca em `p`, ou "" se nao houver.
+--
+-- Na Fase 4 eram cinco blocos `if` de quatro linhas cada, todos com o mesmo
+-- `e.pos + 1 <= e.tamanho and texto.byte(...)` escrito por extenso
+-- (:177-201). Aqui a pergunta e uma so, e `lex_simbolo` fica com o tamanho de
+-- uma decisao.
+function simbolo_de_dois_chars(fonte: string, p: Pos): string
+    local b: integer = atual(fonte, p)
+    local prox: integer = espiar(fonte, p)
+    if b == 46 and prox == 46 then
+        return ".."
+    elseif b == 61 and prox == 61 then
+        return "=="
+    elseif b == 126 and prox == 61 then
+        return "~="
+    elseif b == 60 and prox == 61 then
+        return "<="
+    elseif b == 62 and prox == 61 then
+        return ">="
+    end
+    return ""
+end
+
+-- Simbolos de um ou dois caracteres do subconjunto (Fases 1/2): parenteses,
+-- chaves, colchetes, virgula, dois-pontos, ponto-e-virgula, `.`/`..`, `#`,
+-- aritmeticos, relacionais e `=`. `~` isolado (fora de `~=`) sai como simbolo
+-- de um caractere, exatamente como na Fase 4.
+function lex_simbolo(fonte: string, p: Pos): Pos, Token
+    local dois: string = simbolo_de_dois_chars(fonte, p)
+    if dois ~= "" then
+        local depois: Pos = avancar_duas_vezes(fonte, p)
+        return depois, {kind = TkSymbol, lexeme = dois, linha = p.linha, coluna = p.coluna}
+    end
+    local lexeme: string = texto.sub(fonte, p.pos, p.pos)
+    local depois: Pos = avancar(fonte, p)
+    return depois, {kind = TkSymbol, lexeme = lexeme, linha = p.linha, coluna = p.coluna}
+end
+
+-- O proximo token a partir de `p`, e a posicao depois dele.
+function proximo_token(fonte: string, p: Pos): Pos, Token
+    local cur: Pos = pular_trivia(fonte, p)
+    if fim(fonte, cur) then
+        return cur, {kind = TkEof, lexeme = "", linha = cur.linha, coluna = cur.coluna}
+    end
+    -- Cada braco desempacota os dois valores num `local ... , ...` e devolve
+    -- os dois de volta, em vez de escrever `return lex_numero(fonte, cur)`:
+    -- uma chamada de dois retornos em posicao de expressao e **ajustada para o
+    -- primeiro valor** (`ExpAdjust`, T65), e nao repassada como par. A forma
+    -- curta compilaria como "retornou 1 valor, mas a funcao espera 2".
+    local b: integer = atual(fonte, cur)
+    if eh_letra_ou_underscore(b) then
+        local depois: Pos, t: Token = lex_nome_ou_palavra_chave(fonte, cur)
+        return depois, t
+    end
+    if eh_digito(b) then
+        local depois: Pos, t: Token = lex_numero(fonte, cur)
+        return depois, t
+    end
+    if b == 34 then
+        local depois: Pos, t: Token = lex_string(fonte, cur)
+        return depois, t
+    end
+    if eh_simbolo_de_um_char(b) then
+        local depois: Pos, t: Token = lex_simbolo(fonte, cur)
+        return depois, t
+    end
+    -- Caractere fora do subconjunto: avisa, consome e segue, como na Fase 4
+    -- (:233-237). O lexer nao aborta — quem decide o que fazer com um fonte
+    -- ilegivel e o driver (T88).
+    local depois: Pos = avancar(fonte, cur)
+    print("erro lexico: caractere inesperado (byte " .. b .. ") na linha " .. cur.linha)
+    return depois, {kind = TkSymbol, lexeme = "?", linha = cur.linha, coluna = cur.coluna}
+end
+
+-- A lista completa de tokens do fonte, terminada pelo `TkEof`.
+--
+-- E a funcao que o parser (T86) chama. Na Fase 4 nao havia equivalente: o laco
+-- morava dentro do `main` (:269-275), junto com a leitura do arquivo e a
+-- impressao, porque o lexer era um programa e nao um modulo.
+function tokenizar(fonte: string): {Token}
+    local tokens: {Token} = {}
+    local cur: Pos = inicio()
+    while true do
+        local depois: Pos, t: Token = proximo_token(fonte, cur)
+        cur = depois
+        tokens[#tokens + 1] = t
+        if eh_eof(t) then
+            break
+        end
+    end
+    return tokens
+end
+
+-- A lista de tokens formatada, uma linha por token — a saida que o teste de
+-- equivalencia compara com a de examples/lexer.titan.
+--
+-- `for t in tokens do` (T71) onde a Fase 4 escrevia `for i = 1, #tokens do` e
+-- indexava (:277-279).
+function tokens_para_texto(tokens: {Token}): string
+    local s: string = ""
+    for t in tokens do
+        s = s .. token_para_texto(t) .. "\n"
+    end
+    return s
+end

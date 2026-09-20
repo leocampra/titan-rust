@@ -3021,3 +3021,301 @@ fn t84_lexer_titan_da_fase_4_continua_com_o_estilo_antigo_como_registro() {
         "a variante recursiva é o resultado mensurável da fase"
     );
 }
+
+/// Critério de aceite da T85: `selfhost/lexer.titan` — o lexer no estilo da
+/// Fase 5 — tokeniza `examples/nucleo.titan` produzindo **a mesma lista** que
+/// `examples/lexer.titan`, o lexer da Fase 4.
+///
+/// É o teste que mantém o port honesto: o estilo mudou inteiro (tag inteira →
+/// `enum`, record de estado mutável → retornos múltiplos, `for` indexado →
+/// `for`-in), e a saída não mudou em um byte. Qualquer regressão na varredura
+/// — um símbolo de dois caracteres que deixa de ser reconhecido, uma coluna
+/// que anda errado depois de um escape — aparece aqui como divergência.
+///
+/// Os dois lexers são compilados pelo `titanc` do próprio teste, e não lidos
+/// dos executáveis versionados na raiz: comparar binários velhos compararia o
+/// compilador de ontem com o de hoje.
+#[test]
+fn t85_selfhost_lexer_titan_produz_os_mesmos_tokens_que_o_lexer_da_fase_4() {
+    let fase4_dir = temp_dir("t85-lexer-fase4");
+    let fase5_dir = temp_dir("t85-lexer-fase5");
+
+    // O lexer da Fase 4: um programa de arquivo único.
+    let compila_fase4 = Command::new(titanc_bin())
+        .arg(examples_dir().join("lexer.titan"))
+        .arg("--out")
+        .arg(&fase4_dir)
+        .output()
+        .expect("invoca titanc examples/lexer.titan");
+    assert_never_panics(&compila_fase4);
+    assert!(
+        compila_fase4.status.success(),
+        "titanc falhou ao compilar examples/lexer.titan: {}",
+        String::from_utf8_lossy(&compila_fase4.stderr)
+    );
+
+    // O da Fase 5: um módulo do projeto `selfhost/`, exercitado pelo `main`.
+    let compila_fase5 = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(selfhost_dir())
+        .arg("--out")
+        .arg(&fase5_dir)
+        .output()
+        .expect("invoca titanc --manifesto selfhost");
+    assert_never_panics(&compila_fase5);
+    assert!(
+        compila_fase5.status.success(),
+        "titanc falhou ao compilar o projeto selfhost: {}",
+        String::from_utf8_lossy(&compila_fase5.stderr)
+    );
+
+    let antigo = fase4_dir.join("lexer");
+    let novo = fase5_dir.join("titanself");
+
+    // `nucleo.titan` é o alvo que a T85 nomeia; `lexer.titan` vai junto porque
+    // exercita o que ele não tem — string com escape, comentário e a lista
+    // inteira de símbolos — e é o maior fonte do repositório (~1800 tokens).
+    //
+    // `hello.titan` fica de fora de propósito: ele tem "Olá", e os dois lexers
+    // varrem **bytes**, então ambos morrem no `texto.sub` que corta o `á` ao
+    // meio. A limitação é da Fase 4 e foi herdada intacta — o teste seguinte a
+    // fixa como comportamento idêntico, em vez de escondê-la aqui numa
+    // comparação de dois stdout vazios.
+    for exemplo in ["nucleo.titan", "lexer.titan"] {
+        let fonte = examples_dir().join(exemplo);
+        let saida_antiga = Command::new(&antigo)
+            .arg(&fonte)
+            .output()
+            .expect("executa o lexer da Fase 4");
+        let saida_nova = Command::new(&novo)
+            .arg(&fonte)
+            .output()
+            .expect("executa o lexer da Fase 5");
+
+        let tokens_antigos = String::from_utf8_lossy(&saida_antiga.stdout);
+        let tokens_novos = String::from_utf8_lossy(&saida_nova.stdout);
+        assert_eq!(
+            tokens_antigos, tokens_novos,
+            "os dois lexers divergiram em {exemplo}"
+        );
+        assert_eq!(saida_antiga.status.code(), saida_nova.status.code());
+        // Sem isto, dois lexers que não rodassem passariam comparando vazio
+        // com vazio.
+        assert!(
+            tokens_novos.lines().count() > 20,
+            "esperava a lista de tokens de {exemplo}, veio: {tokens_novos}"
+        );
+        assert!(
+            tokens_novos.ends_with("EOF '' 33:1\n") || exemplo != "nucleo.titan",
+            "a lista de {exemplo} tem de terminar no EOF: {tokens_novos}"
+        );
+    }
+
+    // E o mesmo vale para o fonte da própria T85: o lexer novo se tokeniza.
+    let a_si_mesmo = Command::new(&novo)
+        .arg(selfhost_dir().join("lexer.titan"))
+        .output()
+        .expect("o lexer da Fase 5 tokeniza o próprio fonte");
+    let pelo_antigo = Command::new(&antigo)
+        .arg(selfhost_dir().join("lexer.titan"))
+        .output()
+        .expect("o lexer da Fase 4 tokeniza o fonte da Fase 5");
+    assert_eq!(
+        String::from_utf8_lossy(&pelo_antigo.stdout),
+        String::from_utf8_lossy(&a_si_mesmo.stdout),
+        "o lexer novo diverge do antigo ao ler o próprio fonte"
+    );
+
+    let _ = std::fs::remove_dir_all(&fase4_dir);
+    let _ = std::fs::remove_dir_all(&fase5_dir);
+}
+
+/// O estilo é o resultado mensurável da T85, então ele também é conferido: o
+/// `enum` no lugar da tag inteira, os retornos múltiplos no lugar do record de
+/// estado mutável, e o `for`-in no lugar do `for` indexado.
+///
+/// E, do outro lado, `examples/lexer.titan` continua **intocado** — o ADR 0020
+/// o cita como evidência empírica de que faltavam tipos soma, e o teste da T84
+/// já guarda essa metade.
+#[test]
+fn t85_selfhost_lexer_titan_usa_o_idioma_da_fase_5() {
+    let novo =
+        std::fs::read_to_string(selfhost_dir().join("lexer.titan")).expect("lê selfhost/lexer.titan");
+
+    // `TokenKind` é um `enum` de verdade, e não `integer` com constantes.
+    assert!(
+        novo.contains("enum TokenKind"),
+        "TokenKind tem de ser um enum na Fase 5"
+    );
+    // A constante-como-função da Fase 4, procurada como *declaração* — as
+    // linhas de código, não os comentários, que citam o estilo antigo de
+    // propósito para contrastá-lo.
+    assert!(
+        !novo
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .any(|l| l.contains("): integer return")),
+        "não pode sobrar constante-como-função do estilo da Fase 4"
+    );
+    // Retornos múltiplos (T65-T67) onde o record de estado era contorno.
+    assert!(
+        novo.contains("): Pos, Token"),
+        "a varredura devolve a posição seguinte junto com o token"
+    );
+    // `for`-in (T71) onde a Fase 4 indexava.
+    assert!(
+        novo.contains("for t in tokens do"),
+        "a travessia dos tokens usa for-in"
+    );
+    assert!(
+        !novo.contains("for i: integer = 1, #tokens"),
+        "não pode sobrar o for indexado da Fase 4"
+    );
+
+    // O registro histórico segue como estava — a outra metade da comparação.
+    let antigo = std::fs::read_to_string(examples_dir().join("lexer.titan"))
+        .expect("lê examples/lexer.titan");
+    assert!(
+        antigo.contains("function TK_NAME(): integer return 1 end"),
+        "examples/lexer.titan é o registro da Fase 4 e não pode ser 'consertado'"
+    );
+    assert!(
+        !antigo.contains("enum "),
+        "examples/lexer.titan tem de permanecer sem tipo soma"
+    );
+}
+
+/// A limitação que o port **herdou de propósito**: os dois lexers varrem
+/// bytes, então `examples/hello.titan` — que tem "Olá, mundo!" — mata os dois
+/// no `texto.sub` que corta o `á` ao meio, com a mesma mensagem e o mesmo
+/// código de saída.
+///
+/// Fixar isso como teste é o que separa "herdado" de "regressão": a T85 pede
+/// equivalência com a Fase 4, e tratar UTF-8 só no lexer novo seria divergir.
+/// Quando o suporte a multi-byte entrar, este teste é o que avisa que os dois
+/// arquivos precisam andar juntos — ou que a equivalência virou escolha.
+#[test]
+fn t85_os_dois_lexers_tropecam_igual_em_utf8_multibyte() {
+    let fase4_dir = temp_dir("t85-utf8-fase4");
+    let fase5_dir = temp_dir("t85-utf8-fase5");
+
+    let compila_fase4 = Command::new(titanc_bin())
+        .arg(examples_dir().join("lexer.titan"))
+        .arg("--out")
+        .arg(&fase4_dir)
+        .output()
+        .expect("invoca titanc examples/lexer.titan");
+    assert!(compila_fase4.status.success());
+
+    let compila_fase5 = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(selfhost_dir())
+        .arg("--out")
+        .arg(&fase5_dir)
+        .output()
+        .expect("invoca titanc --manifesto selfhost");
+    assert!(compila_fase5.status.success());
+
+    let fonte = examples_dir().join("hello.titan");
+    let antigo = Command::new(fase4_dir.join("lexer"))
+        .arg(&fonte)
+        .output()
+        .expect("executa o lexer da Fase 4");
+    let novo = Command::new(fase5_dir.join("titanself"))
+        .arg(&fonte)
+        .output()
+        .expect("executa o lexer da Fase 5");
+
+    assert_eq!(
+        String::from_utf8_lossy(&antigo.stderr),
+        String::from_utf8_lossy(&novo.stderr),
+        "os dois lexers têm de falhar com a mesma mensagem"
+    );
+    assert_eq!(antigo.status.code(), novo.status.code());
+    assert!(
+        String::from_utf8_lossy(&novo.stderr).contains("UTF-8 multi-byte"),
+        "esperava a mensagem do runtime sobre multi-byte: {}",
+        String::from_utf8_lossy(&novo.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&fase4_dir);
+    let _ = std::fs::remove_dir_all(&fase5_dir);
+}
+
+/// Regressão do `E0596` que o port da T85 desenterrou: passar o nome ligado
+/// por um `for`-in (T71) ou pelo padrão de um `match` (T77) a uma função que
+/// recebe composto emitia `f(&mut x)` sobre uma ligação `let` **sem** `mut`,
+/// e o `rustc` recusava o programa em inglês — exatamente o que este projeto
+/// existe para não fazer.
+///
+/// O checker aceitava o programa, então o erro só aparecia no `cargo build`
+/// do projeto gerado: por isso o teste vai até a execução, e não para no
+/// `--emit-rust`. As três ligações (array, map e braço de `match`) estão no
+/// mesmo fonte porque a causa é uma só, e os testes de unidade do
+/// `codegen.rs` já separam os casos.
+#[test]
+fn passar_nome_ligado_por_for_in_ou_match_a_funcao_com_composto_compila_e_roda() {
+    let dir = temp_dir("mut-de-nome-ligado");
+    let fonte = write_source(
+        &dir,
+        "prog.titan",
+        r#"record P
+    x: integer
+end
+
+enum E
+    Um(P)
+    Nenhum
+end
+
+function mostrar(p: P): string
+    return "" .. p.x
+end
+
+function main(args: {string}): integer
+    local ps: {P} = {}
+    ps[#ps + 1] = {x = 1}
+    for p in ps do
+        print("array: " .. mostrar(p))
+    end
+
+    local m: {string: P} = {}
+    m["a"] = {x = 2}
+    for k, v in m do
+        print("map: " .. k .. "=" .. mostrar(v))
+    end
+
+    local e: E = Um({x = 3})
+    match e with
+        Um(p) then print("match: " .. mostrar(p))
+        Nenhum then print("match: nenhum")
+    end
+    return 0
+end
+"#,
+    );
+
+    let compila = Command::new(titanc_bin())
+        .arg(&fonte)
+        .arg("--out")
+        .arg(&dir)
+        .output()
+        .expect("invoca titanc");
+    assert_never_panics(&compila);
+    assert!(
+        compila.status.success(),
+        "o Rust gerado não compilou: {}",
+        String::from_utf8_lossy(&compila.stderr)
+    );
+
+    let execucao = Command::new(dir.join("prog"))
+        .output()
+        .expect("executa ./prog");
+    assert_eq!(
+        String::from_utf8_lossy(&execucao.stdout),
+        "array: 1\nmap: a=2\nmatch: 3\n"
+    );
+    assert_eq!(execucao.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
