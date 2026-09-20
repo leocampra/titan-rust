@@ -1,0 +1,1206 @@
+import ast
+import lexer
+import texto
+
+-- Parser do Titan escrito em Titan, por descida recursiva (PRD.md, T86).
+--
+-- Consome a lista de tokens que selfhost/lexer.titan (T85) produz e devolve a
+-- AST de selfhost/ast.titan (T84): `{ast.TopLevel}`. E a peca do meio do
+-- pipeline auto-hospedado — lexer (T85) -> parser (T86) -> checker (T87) —, e a
+-- primeira em que a recursao da gramatica encontra a recursao do tipo soma.
+--
+-- ESCOPO: o subconjunto que aparece em examples/*.titan, que e o que o
+-- criterio de aceite da T86 nomeia. Concretamente:
+--
+--   - topo: `function`/`local function`, `record`, `import`, variavel de topo;
+--   - comandos: `local`, `return`, `if`/`elseif`/`else`, `while`, `for`
+--     numerico (com e sem passo), `for`-in, atribuicao, chamada, `break`;
+--   - expressoes: a cascata de precedencia inteira de crates/titanc/src/
+--     parser.rs:1102-1300, incluindo `..`, `as`, `^` a direita e os
+--     relacionais que nao encadeiam;
+--   - sufixos: `f(x)`, `v[i]`, `r.c`, `{...}` como literal de record/array.
+--
+-- Fora do escopo, de proposito e por herdar o limite do lexer da T85: `enum`,
+-- `match`, `repeat`/`until`, `continue`, `foreign function`, metodos
+-- (`ArgsMethod`) e `local x?`. Nao e omissao a corrigir sem pensar: o
+-- `eh_palavra_chave` de selfhost/lexer.titan e copia literal da lista da Fase
+-- 4, e ampliar la faria o teste de equivalencia da T85 acusar. Os construtores
+-- e as variantes existem na ast (T84) para quando a lista crescer; aqui o
+-- parser simplesmente nunca ve esses tokens, porque o lexer os entrega como
+-- `TkName`. `local function` e o caso visivel disso: `function` e palavra-
+-- chave da lista da Fase 4, entao ele passa.
+--
+-- Bitwise (`| & ~ << >>`) esta na cascata porque a gramatica o tem, mas o
+-- lexer da Fase 4 nao lexa `|`, `&`, `<<` nem `>>` — sao bytes fora de
+-- `eh_simbolo_de_um_char`. Os niveis ficam escritos assim mesmo: eles custam
+-- tres funcoes de tres linhas e mantem a cascata **identica** a do parser.rs,
+-- que e o que a T88 vai comparar. `~` isolado o lexer entrega, e o nivel de
+-- XOR o consome.
+--
+-- ERROS: linha e coluna, em portugues, na mesma convencao do compilador em
+-- Rust ("esperava 'end', encontrado ..."). E o parser **nao aborta**: acumula
+-- os erros num `{Erro}` e segue, porque o criterio de aceite pede erro claro
+-- para `end` faltando *sem* abortar. O contorno de recuperacao e o mais
+-- simples que nao gira: quem detecta um token inesperado o consome antes de
+-- seguir (`erro_e_avanca`), de modo que o indice sempre anda.
+
+---------------------------------------------------------------------------
+-- Estado da analise
+--
+-- A posicao na lista de tokens e um `integer` que entra e sai de cada funcao,
+-- e nao um record mutavel: `(ts, i) -> (i', no)` e a forma de toda a descida,
+-- pelos retornos multiplos da T65-T67 — o mesmo movimento que a T85 fez no
+-- lexer, onde `record Estado` virou `Pos` imutavel.
+--
+-- Os erros, ao contrario, vao num `{Erro}` que atravessa a descida inteira e e
+-- escrito no lugar: array e referencia, entao `erros[#erros + 1] = ...` dentro
+-- de uma funcao chamada aparece para quem chamou. E o que permite acumular sem
+-- devolver um terceiro valor em cada uma das ~40 funcoes.
+---------------------------------------------------------------------------
+
+record Erro
+    linha: integer
+    coluna: integer
+    msg: string
+end
+
+-- O token em `i`, ou o ultimo da lista (que e sempre o `TkEof` que
+-- `lexer.tokenizar` poe) quando o indice passa do fim. Devolver o EOF em vez
+-- de estourar e o que deixa cada funcao perguntar `eh_simbolo(ts, i, ")")`
+-- sem antes conferir o limite.
+function em(ts: {lexer.Token}, i: integer): lexer.Token
+    if i > #ts then
+        return ts[#ts]
+    end
+    if i < 1 then
+        return ts[1]
+    end
+    return ts[i]
+end
+
+-- O lexeme do token em `i`.
+--
+-- O `"" ..` nao e enfeite: ler um campo `string` de um record que veio por
+-- parametro e um *move* no Rust emitido, e o rustc recusa em ingles
+-- ("cannot move out of ... behind a mutable reference"). A concatenacao forca
+-- uma copia. E o mesmo tipo de contorno que os `local` de selfhost/main.titan
+-- fazem para o ADR 0007 — limite do codegen, nao da gramatica.
+function lexeme(ts: {lexer.Token}, i: integer): string
+    local t: lexer.Token = em(ts, i)
+    return "" .. t.lexeme
+end
+
+function loc_em(ts: {lexer.Token}, i: integer): ast.Loc
+    local t: lexer.Token = em(ts, i)
+    return ast.loc(t.linha, t.coluna)
+end
+
+function eh_eof(ts: {lexer.Token}, i: integer): boolean
+    local t: lexer.Token = em(ts, i)
+    return lexer.eh_eof(t)
+end
+
+-- As tres perguntas de classe. `match` sem `_` nos dois primeiros: a
+-- exaustividade e conferida pelo checker, entao uma variante nova em
+-- `lexer.TokenKind` quebra a compilacao aqui, em portugues.
+function eh_nome(ts: {lexer.Token}, i: integer): boolean
+    local t: lexer.Token = em(ts, i)
+    match t.kind with
+        TkName then return true
+        _ then return false
+    end
+end
+
+function eh_inteiro(ts: {lexer.Token}, i: integer): boolean
+    local t: lexer.Token = em(ts, i)
+    match t.kind with
+        TkInteger then return true
+        _ then return false
+    end
+end
+
+function eh_texto(ts: {lexer.Token}, i: integer): boolean
+    local t: lexer.Token = em(ts, i)
+    match t.kind with
+        TkString then return true
+        _ then return false
+    end
+end
+
+-- Palavra-chave e simbolo se distinguem pela classe **e** pelo lexeme: o lexer
+-- entrega `end` como `TkKeyword "end"` e `(` como `TkSymbol "("`. Comparar so
+-- o lexeme confundiria o identificador `x` com nada, mas confundiria uma
+-- string `"end"` com a palavra-chave — dai o par.
+function eh_kw(ts: {lexer.Token}, i: integer, kw: string): boolean
+    local t: lexer.Token = em(ts, i)
+    match t.kind with
+        TkKeyword then return lexeme(ts, i) == kw
+        _ then return false
+    end
+end
+
+function eh_simbolo(ts: {lexer.Token}, i: integer, s: string): boolean
+    local t: lexer.Token = em(ts, i)
+    match t.kind with
+        TkSymbol then return lexeme(ts, i) == s
+        _ then return false
+    end
+end
+
+---------------------------------------------------------------------------
+-- Erros
+--
+-- A convencao das mensagens e a do compilador em Rust: em portugues, com o
+-- que se esperava e o que veio. `descreve` da nome ao token encontrado para
+-- que a mensagem nunca termine em "encontrado " vazio no fim do arquivo.
+---------------------------------------------------------------------------
+
+-- O nome do token em `i`, para entrar numa mensagem de erro.
+--
+-- Toda chamada a esta funcao aparece no fonte como um `local achado: string =
+-- descreve(ts, i)` na linha de cima, e nao encaixada no argumento de
+-- `erro_em`/`erro_e_avanca`. E o ADR 0007 outra vez: as duas chamadas recebem
+-- `ts`, e encaixadas fazem o codegen emitir dois `&mut ts` vivos ao mesmo
+-- tempo, com o rustc recusando o programa em ingles. O `local` sequencia as
+-- chamadas e cada emprestimo termina antes do proximo — o mesmo contorno que
+-- selfhost/main.titan e selfhost/lexer.titan ja documentam.
+function descreve(ts: {lexer.Token}, i: integer): string
+    if eh_eof(ts, i) then
+        return "fim do arquivo"
+    end
+    return "'" .. lexeme(ts, i) .. "'"
+end
+
+function registra(erros: {Erro}, l: ast.Loc, msg: string): nil
+    erros[#erros + 1] = {linha = l.linha, coluna = l.coluna, msg = msg}
+end
+
+function erro_em(ts: {lexer.Token}, i: integer, erros: {Erro}, msg: string): nil
+    local l: ast.Loc = loc_em(ts, i)
+    registra(erros, l, msg)
+end
+
+-- Registra o erro **e devolve o indice adiantado de um**.
+--
+-- E toda a recuperacao que este parser faz, e ela existe por uma razao
+-- mecanica: sem consumir o token que nao se esperava, um laco como o de
+-- `parse_bloco` — que roda enquanto nao ve `end` — giraria para sempre sobre o
+-- mesmo token quando o `end` nunca chega. Consumir garante que o indice anda,
+-- entao todo laco termina, no pior caso no EOF. Nao e recuperacao esperta
+-- (nao sincroniza em ponto de comando); e a que torna "erro claro sem
+-- abortar", do criterio de aceite, um comportamento e nao uma promessa.
+function erro_e_avanca(ts: {lexer.Token}, i: integer, erros: {Erro}, msg: string): integer
+    erro_em(ts, i, erros, msg)
+    if eh_eof(ts, i) then
+        return i
+    end
+    return i + 1
+end
+
+-- Consome o simbolo esperado, ou registra o erro e segue de onde estava.
+--
+-- Nao avanca no caso de erro (ao contrario de `erro_e_avanca`): quem chama
+-- `espera_simbolo` ja esta num ponto onde o token atual pertence a outra
+-- producao — comer aqui atrapalharia quem vem depois. Os lacos que precisam da
+-- garantia de avanco chamam `erro_e_avanca` diretamente.
+function espera_simbolo(ts: {lexer.Token}, i: integer, erros: {Erro}, s: string): integer
+    if eh_simbolo(ts, i, s) then
+        return i + 1
+    end
+    local achado: string = descreve(ts, i)
+    erro_em(ts, i, erros, "esperava '" .. s .. "', encontrado " .. achado)
+    return i
+end
+
+function espera_kw(ts: {lexer.Token}, i: integer, erros: {Erro}, kw: string): integer
+    if eh_kw(ts, i, kw) then
+        return i + 1
+    end
+    local achado: string = descreve(ts, i)
+    erro_em(ts, i, erros, "esperava '" .. kw .. "', encontrado " .. achado)
+    return i
+end
+
+-- Consome um identificador e devolve o indice seguinte junto com o texto lido.
+-- No erro devolve o mesmo indice e `""`, para que quem chama monte um no com
+-- nome vazio e a descida continue.
+function espera_nome(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, string
+    if eh_nome(ts, i) then
+        local n: string = lexeme(ts, i)
+        return i + 1, n
+    end
+    local achado: string = descreve(ts, i)
+    erro_em(ts, i, erros, "esperava um nome, encontrado " .. achado)
+    return i, ""
+end
+
+---------------------------------------------------------------------------
+-- Tipos
+--
+-- `parse_type` do parser.rs. As formas do subconjunto: os primitivos, o nome
+-- (`Ponto`) e o nome qualificado (`mod.Ponto`), o array `{T}`, o mapa
+-- `{K: V}` e o sufixo `?`.
+---------------------------------------------------------------------------
+
+-- `{T}` e `{K: V}` compartilham a abertura, entao um so lugar decide: le o
+-- primeiro tipo e o token seguinte diz se ele era o elemento (`}`) ou a chave
+-- (`:`).
+function parse_tipo_entre_chaves(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Tipo
+    local l: ast.Loc = loc_em(ts, i)
+    local abre: integer = i + 1
+    local depois: integer, primeiro: ast.Tipo = parse_tipo(ts, abre, erros)
+    if eh_simbolo(ts, depois, ":") then
+        local apos_dois_pontos: integer, valor: ast.Tipo = parse_tipo(ts, depois + 1, erros)
+        local fecha: integer = espera_simbolo(ts, apos_dois_pontos, erros, "}")
+        return fecha, ast.tipo_map(l, primeiro, valor)
+    end
+    local fecha: integer = espera_simbolo(ts, depois, erros, "}")
+    return fecha, ast.tipo_array(l, primeiro)
+end
+
+-- O nome de tipo, que pode vir qualificado por um modulo (`data.DataFrame`).
+-- O `.` so conta como qualificacao se houver um nome depois dele.
+function parse_tipo_nomeado(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Tipo
+    local l: ast.Loc = loc_em(ts, i)
+    local apos: integer, n: string = espera_nome(ts, i, erros)
+    if eh_simbolo(ts, apos, ".") and eh_nome(ts, apos + 1) then
+        local apos_campo: integer, campo: string = espera_nome(ts, apos + 1, erros)
+        return apos_campo, ast.tipo_qual(l, n, campo)
+    end
+    return apos, ast.tipo_nome(l, n)
+end
+
+-- Um tipo sem o sufixo `?`, que `parse_tipo` acrescenta.
+function parse_tipo_base(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Tipo
+    local l: ast.Loc = loc_em(ts, i)
+    if eh_kw(ts, i, "nil") then
+        return i + 1, ast.tipo_nil(l)
+    end
+    if eh_kw(ts, i, "boolean") then
+        return i + 1, ast.tipo_boolean(l)
+    end
+    if eh_kw(ts, i, "integer") then
+        return i + 1, ast.tipo_integer(l)
+    end
+    if eh_kw(ts, i, "float") then
+        return i + 1, ast.tipo_float(l)
+    end
+    if eh_kw(ts, i, "string") then
+        return i + 1, ast.tipo_string(l)
+    end
+    if eh_kw(ts, i, "value") then
+        return i + 1, ast.tipo_value(l)
+    end
+    if eh_simbolo(ts, i, "{") then
+        local depois: integer, t: ast.Tipo = parse_tipo_entre_chaves(ts, i, erros)
+        return depois, t
+    end
+    if eh_nome(ts, i) then
+        local depois: integer, t: ast.Tipo = parse_tipo_nomeado(ts, i, erros)
+        return depois, t
+    end
+    -- Nao ha tipo nenhum aqui. Devolve `TipoValue` como no de escape — o
+    -- parser nao decide tipo, so forma, e o checker (T87) nao vai ver este no
+    -- porque o programa ja tem erro registrado.
+    --
+    -- O que NAO se faz aqui e consumir o token: se ele fecha um bloco (`end`,
+    -- `else`, ...), come-lo tira de quem chamou o terminador que ele espera, e
+    -- o erro vira uma cascata — um `record` com um campo sem tipo engoliria o
+    -- arquivo inteiro, um erro por token ate o EOF. Parar deixa o `end` para o
+    -- laco de `parse_record`/`parse_bloco`, que entao termina na hora. Os
+    -- lacos nao giram por causa disso porque todos tem a guarda de avanco
+    -- (`if depois == cur then erro_e_avanca`), que e onde o indice anda quando
+    -- nenhuma producao consumiu nada.
+    local achado: string = descreve(ts, i)
+    erro_em(ts, i, erros, "esperava um tipo, encontrado " .. achado)
+    if fecha_bloco(ts, i) then
+        return i, ast.tipo_value(l)
+    end
+    if eh_eof(ts, i) then
+        return i, ast.tipo_value(l)
+    end
+    return i + 1, ast.tipo_value(l)
+end
+
+function parse_tipo(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Tipo
+    local l: ast.Loc = loc_em(ts, i)
+    local depois: integer, base: ast.Tipo = parse_tipo_base(ts, i, erros)
+    if eh_simbolo(ts, depois, "?") then
+        return depois + 1, ast.tipo_opcional(l, base)
+    end
+    return depois, base
+end
+
+---------------------------------------------------------------------------
+-- Expressoes: a cascata de precedencia
+--
+-- Copia da cascata de crates/titanc/src/parser.rs:1102-1300, nivel por nivel
+-- e na mesma ordem, porque a T88 vai comparar a forma das duas arvores:
+--
+--   or -> and -> relacional -> | -> ~ -> & -> << >> -> .. -> + - ->
+--   * / // % -> unario -> ^ -> as -> simples -> sufixos
+--
+-- Cada nivel binario associativo a esquerda tem o mesmo corpo de cinco linhas.
+-- O parser.rs fatora isso num `parse_left_assoc_binop` que recebe a funcao do
+-- nivel seguinte como valor; aqui nao da — Titan nao tem funcao de primeira
+-- classe de usuario —, entao a repeticao fica a vista. E o custo mais visivel
+-- que o self-hosting cobra hoje, e um item concreto para a Fase 6, junto com o
+-- `MatchArm<T>` generico que a ast (T84) ja registrou.
+---------------------------------------------------------------------------
+
+function parse_exp(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local depois: integer, e: ast.Exp = parse_or(ts, i, erros)
+    return depois, e
+end
+
+function parse_or(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_and(ts, i, erros)
+    while eh_kw(ts, cur, "or") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_and(ts, cur + 1, erros)
+        acc = ast.binop(l, "or", acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+function parse_and(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_rel(ts, i, erros)
+    while eh_kw(ts, cur, "and") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_rel(ts, cur + 1, erros)
+        acc = ast.binop(l, "and", acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+-- O operador relacional em `i`, ou "" se nao houver. Os seis do subconjunto;
+-- `~=` e `<=`/`>=` chegam do lexer como simbolo de dois caracteres.
+function op_relacional(ts: {lexer.Token}, i: integer): string
+    if eh_simbolo(ts, i, "==") then
+        return "=="
+    elseif eh_simbolo(ts, i, "~=") then
+        return "~="
+    elseif eh_simbolo(ts, i, "<=") then
+        return "<="
+    elseif eh_simbolo(ts, i, ">=") then
+        return ">="
+    elseif eh_simbolo(ts, i, "<") then
+        return "<"
+    elseif eh_simbolo(ts, i, ">") then
+        return ">"
+    end
+    return ""
+end
+
+-- Relacionais **nao encadeiam**, igual ao parser.rs:1145: `a == b == c` nao e
+-- `(a == b) == c`. O `if` no lugar do `while` e a diferenca inteira, e ela e
+-- deliberada — o segundo `==` fica para quem chamou, que nao o espera, e o
+-- erro sai de la.
+function parse_rel(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, esq: ast.Exp = parse_bor(ts, i, erros)
+    local op: string = op_relacional(ts, cur)
+    if op == "" then
+        return cur, esq
+    end
+    local l: ast.Loc = loc_em(ts, cur)
+    local depois: integer, dir: ast.Exp = parse_bor(ts, cur + 1, erros)
+    return depois, ast.binop(l, op, esq, dir)
+end
+
+-- Os tres niveis bitwise e o de deslocamento. O lexer da Fase 4 nao entrega
+-- `|`, `&`, `<<` nem `>>` (ver o cabecalho), entao na pratica so o `~` binario
+-- passa por aqui; os niveis existem para a cascata ficar identica a do
+-- parser.rs, que e o que a T88 compara.
+function parse_bor(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_bxor(ts, i, erros)
+    while eh_simbolo(ts, cur, "|") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_bxor(ts, cur + 1, erros)
+        acc = ast.binop(l, "|", acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+function parse_bxor(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_band(ts, i, erros)
+    while eh_simbolo(ts, cur, "~") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_band(ts, cur + 1, erros)
+        acc = ast.binop(l, "~", acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+function parse_band(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_shift(ts, i, erros)
+    while eh_simbolo(ts, cur, "&") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_shift(ts, cur + 1, erros)
+        acc = ast.binop(l, "&", acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+function parse_shift(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_concat(ts, i, erros)
+    while eh_simbolo(ts, cur, "<<") or eh_simbolo(ts, cur, ">>") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local op: string = lexeme(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_concat(ts, cur + 1, erros)
+        acc = ast.binop(l, op, acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+-- `..` achata todos os operandos num unico `ExpConcat`, como o parser.rs:1208
+-- e o `ast.lua` original: `a .. b .. c` da uma lista de tres, nao dois nos
+-- aninhados. Por isso a associatividade a direita do Titan nao muda nada
+-- observavel aqui.
+function parse_concat(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local l: ast.Loc = loc_em(ts, i)
+    local cur: integer, primeiro: ast.Exp = parse_add(ts, i, erros)
+    if not eh_simbolo(ts, cur, "..") then
+        return cur, primeiro
+    end
+    local partes: {ast.Exp} = {}
+    partes[#partes + 1] = primeiro
+    while eh_simbolo(ts, cur, "..") do
+        local depois: integer, p: ast.Exp = parse_add(ts, cur + 1, erros)
+        partes[#partes + 1] = p
+        cur = depois
+    end
+    return cur, ast.concat(l, partes)
+end
+
+function parse_add(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_mul(ts, i, erros)
+    while eh_simbolo(ts, cur, "+") or eh_simbolo(ts, cur, "-") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local op: string = lexeme(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_mul(ts, cur + 1, erros)
+        acc = ast.binop(l, op, acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+function eh_op_multiplicativo(ts: {lexer.Token}, i: integer): boolean
+    return eh_simbolo(ts, i, "*") or eh_simbolo(ts, i, "/") or eh_simbolo(ts, i, "%")
+end
+
+function parse_mul(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_unario(ts, i, erros)
+    while eh_op_multiplicativo(ts, cur) do
+        local l: ast.Loc = loc_em(ts, cur)
+        local op: string = lexeme(ts, cur)
+        local depois: integer, dir: ast.Exp = parse_unario(ts, cur + 1, erros)
+        acc = ast.binop(l, op, acc, dir)
+        cur = depois
+    end
+    return cur, acc
+end
+
+-- `(not | - | # | ~)* pow`. A repeticao vira recursao, entao `- -1` e
+-- `not not x` produzem `ExpUnop` aninhados, como no parser.rs:1247.
+function parse_unario(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local l: ast.Loc = loc_em(ts, i)
+    if eh_kw(ts, i, "not") then
+        local depois: integer, sub: ast.Exp = parse_unario(ts, i + 1, erros)
+        return depois, ast.unop(l, "not", sub)
+    end
+    if eh_simbolo(ts, i, "-") or eh_simbolo(ts, i, "#") or eh_simbolo(ts, i, "~") then
+        local op: string = lexeme(ts, i)
+        local depois: integer, sub: ast.Exp = parse_unario(ts, i + 1, erros)
+        return depois, ast.unop(l, op, sub)
+    end
+    local depois: integer, e: ast.Exp = parse_pow(ts, i, erros)
+    return depois, e
+end
+
+-- `^` e associativo **a direita** (`2 ^ 3 ^ 2` = `2 ^ (3 ^ 2)`), e o expoente
+-- volta ao nivel unario para aceitar `2 ^ -3` — as duas coisas iguais ao
+-- parser.rs:1267.
+function parse_pow(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, base: ast.Exp = parse_cast(ts, i, erros)
+    if not eh_simbolo(ts, cur, "^") then
+        return cur, base
+    end
+    local l: ast.Loc = loc_em(ts, cur)
+    local depois: integer, expoente: ast.Exp = parse_unario(ts, cur + 1, erros)
+    return depois, ast.binop(l, "^", base, expoente)
+end
+
+-- `simples (as tipo)*`: mais forte que todo operador e mais fraco que os
+-- sufixos, exatamente como o parser.rs:1298 — `-x as float` e
+-- `-(x as float)`, e `f() as integer` converte o retorno da chamada.
+function parse_cast(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_sufixada(ts, i, erros)
+    while eh_kw(ts, cur, "as") do
+        local l: ast.Loc = loc_em(ts, cur)
+        local depois: integer, alvo: ast.Tipo = parse_tipo(ts, cur + 1, erros)
+        acc = ast.cast(l, acc, alvo)
+        cur = depois
+    end
+    return cur, acc
+end
+
+---------------------------------------------------------------------------
+-- Expressoes primarias e sufixos
+---------------------------------------------------------------------------
+
+-- A lista de expressoes separadas por virgula de uma chamada ou de um
+-- `return`/`local`. Vazia quando o proximo token ja e o fechamento.
+function parse_lista_de_exps(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, {ast.Exp}
+    local exps: {ast.Exp} = {}
+    local cur: integer, primeira: ast.Exp = parse_exp(ts, i, erros)
+    exps[#exps + 1] = primeira
+    while eh_simbolo(ts, cur, ",") do
+        local depois: integer, e: ast.Exp = parse_exp(ts, cur + 1, erros)
+        exps[#exps + 1] = e
+        cur = depois
+    end
+    return cur, exps
+end
+
+-- Os argumentos de `f(...)`. O `(` ja foi visto por quem chamou.
+function parse_args(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Args
+    local l: ast.Loc = loc_em(ts, i)
+    local apos_abre: integer = i + 1
+    if eh_simbolo(ts, apos_abre, ")") then
+        local vazio: {ast.Exp} = {}
+        return apos_abre + 1, ast.args_func(l, vazio)
+    end
+    local depois: integer, exps: {ast.Exp} = parse_lista_de_exps(ts, apos_abre, erros)
+    local fecha: integer = espera_simbolo(ts, depois, erros, ")")
+    return fecha, ast.args_func(l, exps)
+end
+
+-- Um campo de literal `{...}`: `x = e` (nomeado) ou `e` (posicional).
+--
+-- A distincao so pode ser feita com um token de folga: `x` sozinho e uma
+-- expressao, `x =` e um nome de campo. Olhar `i + 1` resolve sem backtracking,
+-- que e o que o parser.rs tambem faz.
+function parse_campo(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Campo
+    local l: ast.Loc = loc_em(ts, i)
+    if eh_nome(ts, i) and eh_simbolo(ts, i + 1, "=") then
+        local apos_nome: integer, n: string = espera_nome(ts, i, erros)
+        local depois: integer, valor: ast.Exp = parse_exp(ts, apos_nome + 1, erros)
+        return depois, ast.campo_nomeado(l, n, valor)
+    end
+    local depois: integer, valor: ast.Exp = parse_exp(ts, i, erros)
+    return depois, ast.campo_posicional(l, valor)
+end
+
+-- `{}`, `{1, 2, 3}` e `{x = 1, y = 2}` — o mesmo no (`ExpInitList`) para
+-- array e record, como no ast.rs: quem decide qual dos dois e o checker, a
+-- partir do tipo esperado.
+--
+-- Separador: virgula ou ponto-e-virgula, os dois aceitos e os dois opcionais
+-- antes do `}` final, como no Titan original.
+function parse_initlist(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local l: ast.Loc = loc_em(ts, i)
+    local campos: {ast.Campo} = {}
+    local cur: integer = i + 1
+    while not eh_simbolo(ts, cur, "}") and not eh_eof(ts, cur) do
+        local depois: integer, c: ast.Campo = parse_campo(ts, cur, erros)
+        campos[#campos + 1] = c
+        if eh_simbolo(ts, depois, ",") or eh_simbolo(ts, depois, ";") then
+            cur = depois + 1
+        else
+            cur = depois
+            break
+        end
+    end
+    local fecha: integer = espera_simbolo(ts, cur, erros, "}")
+    return fecha, ast.initlist(l, campos)
+end
+
+-- A expressao sem sufixo: literal, `(e)` ou um nome.
+function parse_primaria(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local l: ast.Loc = loc_em(ts, i)
+    if eh_kw(ts, i, "nil") then
+        return i + 1, ast.nil_exp(l)
+    end
+    if eh_kw(ts, i, "true") then
+        return i + 1, ast.booleano(l, true)
+    end
+    if eh_kw(ts, i, "false") then
+        return i + 1, ast.booleano(l, false)
+    end
+    if eh_inteiro(ts, i) then
+        local texto_do_numero: string = lexeme(ts, i)
+        return i + 1, ast.inteiro(l, inteiro_de_texto(texto_do_numero))
+    end
+    if eh_texto(ts, i) then
+        local s: string = lexeme(ts, i)
+        return i + 1, ast.cadeia(l, s)
+    end
+    if eh_simbolo(ts, i, "{") then
+        local depois: integer, e: ast.Exp = parse_initlist(ts, i, erros)
+        return depois, e
+    end
+    if eh_simbolo(ts, i, "(") then
+        local depois: integer, dentro: ast.Exp = parse_exp(ts, i + 1, erros)
+        local fecha: integer = espera_simbolo(ts, depois, erros, ")")
+        -- `(f())` ajusta a chamada para um valor so — e o `ExpAdjust` da T65,
+        -- e o parenteses e onde ele nasce, igual ao parser.rs.
+        return fecha, ast.ajuste(l, dentro)
+    end
+    if eh_nome(ts, i) then
+        local n: string = lexeme(ts, i)
+        return i + 1, ast.nome(l, n)
+    end
+    -- Nem literal, nem parenteses, nem nome: o token nao comeca expressao
+    -- nenhuma. Consome para o laco de quem chamou andar e devolve `nil` como
+    -- no de escape.
+    local achado: string = descreve(ts, i)
+    local avancado: integer = erro_e_avanca(ts, i, erros, "esperava uma expressao, encontrado " .. achado)
+    return avancado, ast.nil_exp(l)
+end
+
+-- `primaria (sufixo)*`, onde sufixo e `(args)`, `[indice]` ou `.campo`.
+--
+-- E o nivel que `parse_stat` tambem chama diretamente para desambiguar chamada
+-- de atribuicao sem backtracking: parseia a sufixada e o token seguinte (`=`
+-- ou `,`) decide, exatamente como o parser.rs:632.
+function parse_sufixada(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Exp
+    local cur: integer, acc: ast.Exp = parse_primaria(ts, i, erros)
+    while true do
+        local l: ast.Loc = loc_em(ts, cur)
+        if eh_simbolo(ts, cur, "(") then
+            local depois: integer, args: ast.Args = parse_args(ts, cur, erros)
+            acc = ast.chamada(l, acc, args)
+            cur = depois
+        elseif eh_simbolo(ts, cur, "[") then
+            local depois: integer, indice: ast.Exp = parse_exp(ts, cur + 1, erros)
+            local fecha: integer = espera_simbolo(ts, depois, erros, "]")
+            -- Os `local v` desencaixam a chamada de dentro da de fora: as
+            -- duas recebem o mesmo `l`, e encaixadas fazem o codegen emitir
+            -- dois `&mut l` vivos ao mesmo tempo (ADR 0007). E a mesma razao
+            -- que sequencia as chamadas em selfhost/main.titan.
+            local v: ast.Var = ast.var_colchete(l, acc, indice)
+            acc = ast.exp_de_var(l, v)
+            cur = fecha
+        elseif eh_simbolo(ts, cur, ".") and eh_nome(ts, cur + 1) then
+            local apos_campo: integer, campo: string = espera_nome(ts, cur + 1, erros)
+            local v: ast.Var = ast.var_ponto(l, acc, campo)
+            acc = ast.exp_de_var(l, v)
+            cur = apos_campo
+        else
+            break
+        end
+    end
+    return cur, acc
+end
+
+-- O inteiro escrito no fonte, a partir do lexeme.
+--
+-- O lexer entrega o texto dos digitos, nao o valor: converter e do parser, e
+-- `texto` nao tem "para inteiro". A conta e a usual, byte a byte — e o
+-- subconjunto e so decimal sem sinal, porque `eh_digito` do lexer so aceita
+-- 48-57 e o `-` de `-1` e um unario que ja foi consumido acima.
+function inteiro_de_texto(s: string): integer
+    local total: integer = 0
+    local i: integer = 1
+    while i <= texto.tamanho(s) do
+        local b: integer = texto.byte(s, i)
+        total = total * 10 + (b - 48)
+        i = i + 1
+    end
+    return total
+end
+
+-- A expressao sufixada convertida em lugar atribuivel, para o lado esquerdo de
+-- uma atribuicao.
+--
+-- O parser monta `ExpVar` para nome, `[i]` e `.c`; a atribuicao precisa do
+-- `Var` de dentro. Qualquer outra forma (`f() = 1`) e erro, e o `_` devolve um
+-- `Var` de nome vazio para a descida seguir.
+function var_da_exp(e: ast.Exp, erros: {Erro}): ast.Var
+    match e with
+        ExpVar(l, v) then return v
+        _ then
+            local l: ast.Loc = ast.loc_da_exp(e)
+            registra(erros, l, "lado esquerdo de atribuicao tem de ser um nome, um indice ou um campo")
+            return ast.var_nome(l, "")
+    end
+end
+
+---------------------------------------------------------------------------
+-- Comandos
+--
+-- `parse_stat` do parser.rs:583: uma cadeia de `if`s sobre a palavra-chave
+-- que abre o comando, terminada pelo caso sem palavra-chave — chamada ou
+-- atribuicao, desambiguadas pelo token que segue a expressao sufixada.
+---------------------------------------------------------------------------
+
+-- Um bloco vai ate `end`, `elseif`, `else` ou o EOF. Quem consome (ou recusa)
+-- o terminador e quem chamou — igual ao parser.rs:565, e e o que permite ao
+-- `if` tratar `elseif` sem o bloco saber que existe `if`.
+--
+-- O `eh_eof` na condicao e o que faz "erro claro sem abortar" funcionar para
+-- `end` faltando: o bloco termina no fim do arquivo, e quem esperava o `end`
+-- registra o erro com a posicao do EOF.
+function fecha_bloco(ts: {lexer.Token}, i: integer): boolean
+    return eh_kw(ts, i, "end") or eh_kw(ts, i, "elseif") or eh_kw(ts, i, "else")
+        or eh_kw(ts, i, "until") or eh_eof(ts, i)
+end
+
+function parse_bloco(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    local corpo: {ast.Stat} = {}
+    local cur: integer = i
+    while not fecha_bloco(ts, cur) do
+        local depois: integer, s: ast.Stat = parse_stat(ts, cur, erros)
+        corpo[#corpo + 1] = s
+        -- Guarda contra laco infinito: toda producao de comando ou consome ao
+        -- menos um token ou registra erro via `erro_e_avanca`, que consome.
+        -- Se ainda assim o indice nao andou, forca o avanco aqui — e mais
+        -- barato do que provar a propriedade em cada uma das producoes, e o
+        -- programa ja esta em erro quando isso acontece.
+        if depois == cur then
+            local achado: string = descreve(ts, cur)
+            cur = erro_e_avanca(ts, cur, erros, "comando invalido em " .. achado)
+        else
+            cur = depois
+        end
+    end
+    return cur, ast.stat_bloco(l, corpo)
+end
+
+-- `local x: T = e`, `local x, y = a, b` e `local function f() ... end`.
+function parse_local(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    local decls: {ast.Decl} = {}
+    local cur: integer = i + 1
+    while true do
+        local l_decl: ast.Loc = loc_em(ts, cur)
+        local apos_nome: integer, n: string = espera_nome(ts, cur, erros)
+        if eh_simbolo(ts, apos_nome, ":") then
+            local apos_tipo: integer, t: ast.Tipo = parse_tipo(ts, apos_nome + 1, erros)
+            decls[#decls + 1] = ast.decl(l_decl, n, t)
+            cur = apos_tipo
+        else
+            decls[#decls + 1] = ast.decl_sem_tipo(l_decl, n)
+            cur = apos_nome
+        end
+        if not eh_simbolo(ts, cur, ",") then
+            break
+        end
+        cur = cur + 1
+    end
+    -- `local x: T` sem inicializador e valido na gramatica; a lista de
+    -- expressoes fica vazia e o checker (T87) decide se aceita.
+    if not eh_simbolo(ts, cur, "=") then
+        local vazio: {ast.Exp} = {}
+        return cur, ast.stat_decl(l, decls, vazio)
+    end
+    local depois: integer, exps: {ast.Exp} = parse_lista_de_exps(ts, cur + 1, erros)
+    return depois, ast.stat_decl(l, decls, exps)
+end
+
+-- `return` com zero, uma ou varias expressoes (T67). A lista termina onde o
+-- bloco termina, entao `return` seguido de `end` e um retorno vazio.
+function parse_return(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    local cur: integer = i + 1
+    if fecha_bloco(ts, cur) or eh_simbolo(ts, cur, ";") then
+        local vazio: {ast.Exp} = {}
+        if eh_simbolo(ts, cur, ";") then
+            return cur + 1, ast.stat_return(l, vazio)
+        end
+        return cur, ast.stat_return(l, vazio)
+    end
+    local depois: integer, exps: {ast.Exp} = parse_lista_de_exps(ts, cur, erros)
+    if eh_simbolo(ts, depois, ";") then
+        return depois + 1, ast.stat_return(l, exps)
+    end
+    return depois, ast.stat_return(l, exps)
+end
+
+-- `if c then B (elseif c then B)* (else B)? end`.
+--
+-- Os ramos `then` vao todos num `{Ramo}` e o `else` decide a variante
+-- (`StatIf` ou `StatIfElse`) — o desdobramento que a ast (T84) escolheu para
+-- nao precisar de `Stat?` dentro de record.
+function parse_if(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    local ramos: {ast.Ramo} = {}
+    local cur: integer = i + 1
+    while true do
+        local l_ramo: ast.Loc = loc_em(ts, cur)
+        local apos_cond: integer, cond: ast.Exp = parse_exp(ts, cur, erros)
+        local apos_then: integer = espera_kw(ts, apos_cond, erros, "then")
+        local apos_bloco: integer, bloco: ast.Stat = parse_bloco(ts, apos_then, erros)
+        ramos[#ramos + 1] = ast.ramo(l_ramo, cond, bloco)
+        if not eh_kw(ts, apos_bloco, "elseif") then
+            cur = apos_bloco
+            break
+        end
+        cur = apos_bloco + 1
+    end
+    if eh_kw(ts, cur, "else") then
+        local apos_senao: integer, senao: ast.Stat = parse_bloco(ts, cur + 1, erros)
+        local fim: integer = espera_kw(ts, apos_senao, erros, "end")
+        return fim, ast.stat_if_else(l, ramos, senao)
+    end
+    local fim: integer = espera_kw(ts, cur, erros, "end")
+    return fim, ast.stat_if(l, ramos)
+end
+
+function parse_while(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    local apos_cond: integer, cond: ast.Exp = parse_exp(ts, i + 1, erros)
+    local apos_do: integer = espera_kw(ts, apos_cond, erros, "do")
+    local apos_bloco: integer, corpo: ast.Stat = parse_bloco(ts, apos_do, erros)
+    local fim: integer = espera_kw(ts, apos_bloco, erros, "end")
+    return fim, ast.stat_while(l, cond, corpo)
+end
+
+-- `for` numerico: `for i = a, b do ... end` e `for i = a, b, p do ... end`.
+-- O `for`-in e uma producao a parte, decidida por `parse_for`.
+function parse_for_numerico(ts: {lexer.Token}, i: integer, erros: {Erro}, l: ast.Loc, d: ast.Decl): integer, ast.Stat
+    local apos_inicio: integer, inicio: ast.Exp = parse_exp(ts, i, erros)
+    local apos_virgula: integer = espera_simbolo(ts, apos_inicio, erros, ",")
+    local apos_limite: integer, limite: ast.Exp = parse_exp(ts, apos_virgula, erros)
+    if eh_simbolo(ts, apos_limite, ",") then
+        local apos_passo: integer, passo: ast.Exp = parse_exp(ts, apos_limite + 1, erros)
+        local apos_do: integer = espera_kw(ts, apos_passo, erros, "do")
+        local apos_bloco: integer, corpo: ast.Stat = parse_bloco(ts, apos_do, erros)
+        local fim: integer = espera_kw(ts, apos_bloco, erros, "end")
+        return fim, ast.stat_for(l, d, inicio, limite, passo, corpo)
+    end
+    local apos_do: integer = espera_kw(ts, apos_limite, erros, "do")
+    local apos_bloco: integer, corpo: ast.Stat = parse_bloco(ts, apos_do, erros)
+    local fim: integer = espera_kw(ts, apos_bloco, erros, "end")
+    return fim, ast.stat_for_sem_passo(l, d, inicio, limite, corpo)
+end
+
+-- `for x in v do ... end` e `for k, v in m do ... end` (T71).
+function parse_for_in(ts: {lexer.Token}, i: integer, erros: {Erro}, l: ast.Loc, decls: {ast.Decl}): integer, ast.Stat
+    local apos_container: integer, container: ast.Exp = parse_exp(ts, i, erros)
+    local apos_do: integer = espera_kw(ts, apos_container, erros, "do")
+    local apos_bloco: integer, corpo: ast.Stat = parse_bloco(ts, apos_do, erros)
+    local fim: integer = espera_kw(ts, apos_bloco, erros, "end")
+    return fim, ast.stat_for_in(l, decls, container, corpo)
+end
+
+function parse_for(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    local decls: {ast.Decl} = {}
+    local cur: integer = i + 1
+    while true do
+        local l_decl: ast.Loc = loc_em(ts, cur)
+        local apos_nome: integer, n: string = espera_nome(ts, cur, erros)
+        if eh_simbolo(ts, apos_nome, ":") then
+            local apos_tipo: integer, t: ast.Tipo = parse_tipo(ts, apos_nome + 1, erros)
+            decls[#decls + 1] = ast.decl(l_decl, n, t)
+            cur = apos_tipo
+        else
+            decls[#decls + 1] = ast.decl_sem_tipo(l_decl, n)
+            cur = apos_nome
+        end
+        if not eh_simbolo(ts, cur, ",") then
+            break
+        end
+        cur = cur + 1
+    end
+    -- `=` depois da lista: numerico (e a lista tem de ter um nome so). `in`:
+    -- for-in. A decisao e por um token, sem backtracking.
+    if eh_simbolo(ts, cur, "=") then
+        local d: ast.Decl = decls[1]
+        if #decls > 1 then
+            registra(erros, l, "o 'for' numerico tem uma variavel de controle so")
+        end
+        local depois: integer, s: ast.Stat = parse_for_numerico(ts, cur + 1, erros, l, d)
+        return depois, s
+    end
+    -- `in` nao esta na lista de palavras-chave da Fase 4 (ver o cabecalho),
+    -- entao o lexer o entrega como `TkName`. Aceitar as duas formas mantem o
+    -- parser correto agora e correto depois, quando a lista crescer.
+    if eh_kw(ts, cur, "in") or (eh_nome(ts, cur) and lexeme(ts, cur) == "in") then
+        local depois: integer, s: ast.Stat = parse_for_in(ts, cur + 1, erros, l, decls)
+        return depois, s
+    end
+    local achado: string = descreve(ts, cur)
+    local avancado: integer = erro_e_avanca(ts, cur, erros, "esperava '=' ou 'in' no 'for', encontrado " .. achado)
+    local vazio: {ast.Stat} = {}
+    return avancado, ast.stat_bloco(l, vazio)
+end
+
+-- Chamada ou atribuicao: parseia a sufixada e o token seguinte decide, sem
+-- backtracking (parser.rs:632). A virgula entra na desambiguacao porque
+-- `a, b = ...` (T67) e a unica forma que continua depois de uma sufixada sem
+-- um `=` imediato.
+function parse_chamada_ou_atribuicao(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    local cur: integer, primeira: ast.Exp = parse_sufixada(ts, i, erros)
+    if eh_simbolo(ts, cur, "=") or eh_simbolo(ts, cur, ",") then
+        local vars: {ast.Var} = {}
+        vars[#vars + 1] = var_da_exp(primeira, erros)
+        local pos: integer = cur
+        while eh_simbolo(ts, pos, ",") do
+            local depois: integer, outra: ast.Exp = parse_sufixada(ts, pos + 1, erros)
+            vars[#vars + 1] = var_da_exp(outra, erros)
+            pos = depois
+        end
+        local apos_igual: integer = espera_simbolo(ts, pos, erros, "=")
+        local depois: integer, exps: {ast.Exp} = parse_lista_de_exps(ts, apos_igual, erros)
+        return depois, ast.stat_assign(l, vars, exps)
+    end
+    -- Sem `=`: e um comando de chamada. Uma expressao que nao seja chamada em
+    -- posicao de comando (`x + 1` numa linha sozinha) e erro, e o `match`
+    -- abaixo o pega — o parser.rs faz a mesma checagem no mesmo ponto.
+    match primeira with
+        ExpCall(l_chamada, f, args) then
+            if eh_simbolo(ts, cur, ";") then
+                return cur + 1, ast.stat_call(l, primeira)
+            end
+            return cur, ast.stat_call(l, primeira)
+        _ then
+            registra(erros, l, "esta expressao nao e um comando; so chamada de funcao vale sozinha")
+            return cur, ast.stat_call(l, primeira)
+    end
+end
+
+function parse_stat(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.Stat
+    local l: ast.Loc = loc_em(ts, i)
+    if eh_simbolo(ts, i, ";") then
+        local vazio: {ast.Stat} = {}
+        return i + 1, ast.stat_bloco(l, vazio)
+    end
+    if eh_kw(ts, i, "local") then
+        local depois: integer, s: ast.Stat = parse_local(ts, i, erros)
+        return depois, s
+    end
+    if eh_kw(ts, i, "return") then
+        local depois: integer, s: ast.Stat = parse_return(ts, i, erros)
+        return depois, s
+    end
+    if eh_kw(ts, i, "if") then
+        local depois: integer, s: ast.Stat = parse_if(ts, i, erros)
+        return depois, s
+    end
+    if eh_kw(ts, i, "while") then
+        local depois: integer, s: ast.Stat = parse_while(ts, i, erros)
+        return depois, s
+    end
+    if eh_kw(ts, i, "for") then
+        local depois: integer, s: ast.Stat = parse_for(ts, i, erros)
+        return depois, s
+    end
+    if eh_kw(ts, i, "break") then
+        if eh_simbolo(ts, i + 1, ";") then
+            return i + 2, ast.stat_break(l)
+        end
+        return i + 1, ast.stat_break(l)
+    end
+    if eh_kw(ts, i, "do") then
+        local apos_bloco: integer, corpo: ast.Stat = parse_bloco(ts, i + 1, erros)
+        local fim: integer = espera_kw(ts, apos_bloco, erros, "end")
+        return fim, corpo
+    end
+    local depois: integer, s: ast.Stat = parse_chamada_ou_atribuicao(ts, i, erros)
+    return depois, s
+end
+
+---------------------------------------------------------------------------
+-- Topo do arquivo
+---------------------------------------------------------------------------
+
+-- A lista de parametros de uma funcao: `(x: T, y: U)`, com a anotacao
+-- obrigatoria — e onde o Titan difere de Lua, e o checker (T87) conta com
+-- isso.
+function parse_parametros(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, {ast.Decl}
+    local params: {ast.Decl} = {}
+    local apos_abre: integer = espera_simbolo(ts, i, erros, "(")
+    if eh_simbolo(ts, apos_abre, ")") then
+        return apos_abre + 1, params
+    end
+    local cur: integer = apos_abre
+    while true do
+        local l: ast.Loc = loc_em(ts, cur)
+        local apos_nome: integer, n: string = espera_nome(ts, cur, erros)
+        local apos_dois_pontos: integer = espera_simbolo(ts, apos_nome, erros, ":")
+        local apos_tipo: integer, t: ast.Tipo = parse_tipo(ts, apos_dois_pontos, erros)
+        params[#params + 1] = ast.decl(l, n, t)
+        cur = apos_tipo
+        if not eh_simbolo(ts, cur, ",") then
+            break
+        end
+        cur = cur + 1
+    end
+    local fecha: integer = espera_simbolo(ts, cur, erros, ")")
+    return fecha, params
+end
+
+-- Os tipos de retorno depois de `:`. Podem ser varios (T65), separados por
+-- virgula; a ausencia de `:` e a lista vazia — a funcao nao devolve nada.
+function parse_retornos(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, {ast.Tipo}
+    local retornos: {ast.Tipo} = {}
+    if not eh_simbolo(ts, i, ":") then
+        return i, retornos
+    end
+    local cur: integer, primeiro: ast.Tipo = parse_tipo(ts, i + 1, erros)
+    retornos[#retornos + 1] = primeiro
+    while eh_simbolo(ts, cur, ",") do
+        local depois: integer, t: ast.Tipo = parse_tipo(ts, cur + 1, erros)
+        retornos[#retornos + 1] = t
+        cur = depois
+    end
+    return cur, retornos
+end
+
+-- `function f(p: T): R ... end` e `local function f(...)`.
+--
+-- O `function` de topo cobre so a forma simples: metodo (`function P.soma()`)
+-- esta fora do escopo, e o nome qualificado que o abriria e recusado aqui com
+-- mensagem propria em vez de um erro generico tres tokens adiante.
+function parse_funcao(ts: {lexer.Token}, i: integer, erros: {Erro}, islocal: boolean): integer, ast.TopLevel
+    local l: ast.Loc = loc_em(ts, i)
+    local apos_nome: integer, n: string = espera_nome(ts, i + 1, erros)
+    if eh_simbolo(ts, apos_nome, ".") then
+        registra(erros, l, "metodo de topo ('function " .. n .. ".algo') esta fora do subconjunto desta fase")
+    end
+    local apos_params: integer, params: {ast.Decl} = parse_parametros(ts, apos_nome, erros)
+    local apos_retornos: integer, retornos: {ast.Tipo} = parse_retornos(ts, apos_params, erros)
+    local apos_bloco: integer, corpo: ast.Stat = parse_bloco(ts, apos_retornos, erros)
+    local fim: integer = espera_kw(ts, apos_bloco, erros, "end")
+    return fim, ast.toplevel_func(l, islocal, n, params, retornos, corpo)
+end
+
+-- `record P x: integer end`.
+function parse_record(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.TopLevel
+    local l: ast.Loc = loc_em(ts, i)
+    local apos_nome: integer, n: string = espera_nome(ts, i + 1, erros)
+    local campos: {ast.Decl} = {}
+    local cur: integer = apos_nome
+    while not eh_kw(ts, cur, "end") and not eh_eof(ts, cur) do
+        local l_campo: ast.Loc = loc_em(ts, cur)
+        local apos_campo: integer, campo: string = espera_nome(ts, cur, erros)
+        local apos_dois_pontos: integer = espera_simbolo(ts, apos_campo, erros, ":")
+        local apos_tipo: integer, t: ast.Tipo = parse_tipo(ts, apos_dois_pontos, erros)
+        campos[#campos + 1] = ast.decl(l_campo, campo, t)
+        if apos_tipo == cur then
+            local achado: string = descreve(ts, cur)
+            cur = erro_e_avanca(ts, cur, erros, "esperava um campo ou 'end', encontrado " .. achado)
+        else
+            cur = apos_tipo
+        end
+        if eh_simbolo(ts, cur, ",") or eh_simbolo(ts, cur, ";") then
+            cur = cur + 1
+        end
+    end
+    local fim: integer = espera_kw(ts, cur, erros, "end")
+    return fim, ast.toplevel_record(l, n, campos)
+end
+
+-- `import m` e `local m = import("mod")`.
+--
+-- So a primeira forma esta no subconjunto; e a que os examples usam e a que o
+-- ADR 0011 descreve como acucar. O nome local e o nome do modulo coincidem.
+function parse_import(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.TopLevel
+    local l: ast.Loc = loc_em(ts, i)
+    local apos_nome: integer, n: string = espera_nome(ts, i + 1, erros)
+    return apos_nome, ast.toplevel_import(l, n, n)
+end
+
+-- Variavel de topo: `x: T = e` ou `local x: T = e`.
+function parse_var_de_topo(ts: {lexer.Token}, i: integer, erros: {Erro}, islocal: boolean): integer, ast.TopLevel
+    local l: ast.Loc = loc_em(ts, i)
+    local apos_nome: integer, n: string = espera_nome(ts, i, erros)
+    local cur: integer = apos_nome
+    local tipo: ast.Tipo = ast.tipo_ausente()
+    if eh_simbolo(ts, cur, ":") then
+        local apos_tipo: integer, t: ast.Tipo = parse_tipo(ts, cur + 1, erros)
+        tipo = t
+        cur = apos_tipo
+    end
+    local apos_igual: integer = espera_simbolo(ts, cur, erros, "=")
+    local depois: integer, valor: ast.Exp = parse_exp(ts, apos_igual, erros)
+    -- O `local d` em vez de encaixar `ast.decl(...)` no argumento: uma chamada
+    -- que devolve composto so vale como argumento de outra depois de passar
+    -- por um nome (ADR 0007). Encaixada, ela quebra o codegen.
+    local d: ast.Decl = ast.decl(l, n, tipo)
+    return depois, ast.toplevel_var(l, islocal, d, valor)
+end
+
+function parse_toplevel(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, ast.TopLevel
+    local l: ast.Loc = loc_em(ts, i)
+    if eh_kw(ts, i, "function") then
+        local depois: integer, t: ast.TopLevel = parse_funcao(ts, i, erros, false)
+        return depois, t
+    end
+    if eh_kw(ts, i, "record") then
+        local depois: integer, t: ast.TopLevel = parse_record(ts, i, erros)
+        return depois, t
+    end
+    if eh_kw(ts, i, "import") then
+        local depois: integer, t: ast.TopLevel = parse_import(ts, i, erros)
+        return depois, t
+    end
+    if eh_kw(ts, i, "local") then
+        if eh_kw(ts, i + 1, "function") then
+            local depois: integer, t: ast.TopLevel = parse_funcao(ts, i + 1, erros, true)
+            return depois, t
+        end
+        local depois: integer, t: ast.TopLevel = parse_var_de_topo(ts, i + 1, erros, true)
+        return depois, t
+    end
+    if eh_nome(ts, i) then
+        local depois: integer, t: ast.TopLevel = parse_var_de_topo(ts, i, erros, false)
+        return depois, t
+    end
+    -- Nada de topo comeca aqui. Consome e devolve um `import` de nome vazio
+    -- como no de escape — o programa ja tem erro registrado, e o checker
+    -- (T87) nao chega a ver esta arvore.
+    local achado: string = descreve(ts, i)
+    local avancado: integer = erro_e_avanca(ts, i, erros, "esperava 'function', 'record', 'import' ou 'local', encontrado " .. achado)
+    return avancado, ast.toplevel_import(l, "", "")
+end
+
+---------------------------------------------------------------------------
+-- A API do modulo
+---------------------------------------------------------------------------
+
+-- O programa inteiro: a lista de declaracoes de topo.
+--
+-- Um programa Titan nao tem no `Program` — nem no ast.lua original, nem no
+-- ast.rs, nem na ast da T84 —, entao o parser devolve `{TopLevel}` direto, e
+-- os erros vao no `{Erro}` que o chamador passa. Quem quiser saber se o
+-- programa e valido olha `#erros`, e nao o valor de retorno: o parser sempre
+-- devolve uma arvore, ainda que parcial. E o que o criterio de aceite pede —
+-- erro claro **sem abortar**.
+function parse_programa(ts: {lexer.Token}, erros: {Erro}): {ast.TopLevel}
+    local topos: {ast.TopLevel} = {}
+    local cur: integer = 1
+    while not eh_eof(ts, cur) do
+        local depois: integer, t: ast.TopLevel = parse_toplevel(ts, cur, erros)
+        topos[#topos + 1] = t
+        if depois == cur then
+            local achado: string = descreve(ts, cur)
+            cur = erro_e_avanca(ts, cur, erros, "declaracao de topo invalida em " .. achado)
+        else
+            cur = depois
+        end
+    end
+    return topos
+end
+
+-- Lexa e parseia um fonte de uma vez — a forma que o driver (T88) chama.
+function parse_fonte(fonte: string, erros: {Erro}): {ast.TopLevel}
+    local tokens: {lexer.Token} = lexer.tokenizar(fonte)
+    return parse_programa(tokens, erros)
+end
+
+-- Um erro formatado na convencao do compilador em Rust: "erro de sintaxe
+-- (linha L, coluna C): msg".
+function erro_para_texto(e: Erro): string
+    return "erro de sintaxe (linha " .. e.linha .. ", coluna " .. e.coluna .. "): " .. e.msg
+end

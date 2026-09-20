@@ -3179,6 +3179,26 @@ lista** que `examples/lexer.titan` produz; teste comparando as duas saídas.
 **Critério de aceite:** parseia `examples/hello.titan` e `examples/nucleo.titan`
 sem erro; erro claro (sem abortar) para `end` faltando.
 
+**Nota de execução (UTF-8):** `examples/hello.titan` tem `"Olá, mundo!"`, e o
+lexer da T85 varre bytes — `texto.sub` aborta ao cortar o `á` ao meio, o que a
+T85 fixou em teste como limitação herdada da Fase 4. Para cumprir este critério,
+a T86 fez `lex_string` (e **só** ele) copiar o caractere multi-byte inteiro, via
+`bytes_do_caractere`. A equivalência que a T85 mede não muda: `nucleo.titan` e
+`examples/lexer.titan` são ASCII puro, e os acentos de `selfhost/lexer.titan`
+estão todos em comentário, que `pular_trivia` descarta sem chamar `texto.sub` —
+os três seguem com listas de tokens idênticas byte a byte. O que mudou é o
+desfecho de um fonte com acento **dentro de string**: o lexer da Fase 4 continua
+abortando, o da Fase 5 lê. O teste `t85_os_dois_lexers_tropecam_igual_em_utf8_
+multibyte` virou `t86_so_o_lexer_da_fase_5_le_utf8_multibyte_dentro_de_string`,
+como o comentário dele previa. A T88 compara sobre fontes ASCII, então o oráculo
+não é afetado.
+
+**Nota de execução (`StatFor`):** a T84 escreveu `StatFor(Loc, Decl, Exp, Exp,
+Exp)` sem o corpo, mas `ast.rs:194-201` tem `block: Box<Stat>`. A T86 acrescentou
+o campo (`StatFor(..., Stat)` e `StatForSemPasso(..., Stat)`), porque a
+alternativa — embrulhar `for` e corpo num `StatBlock` de dois — criaria uma
+divergência estrutural artificial justamente no nó que a T88 vai comparar.
+
 **Depende de:** T85.
 
 **Skills:** `test-driven-development` · `clean-code` · `architecture`

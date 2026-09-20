@@ -1,26 +1,36 @@
 import ast
 import io
 import lexer
+import parser
+import texto
 
 -- Driver do titanc auto-hospedado (PRD.md, Parte C).
 --
--- Cresce uma tarefa de cada vez. Hoje ele faz duas coisas, conforme receba um
--- arquivo ou nao:
+-- Cresce uma tarefa de cada vez. Hoje ele faz tres coisas, conforme os
+-- argumentos:
 --
 --   titanc --manifesto selfhost --out /tmp/x
---   /tmp/x/titanself                        -> a demonstracao da ast (T84)
---   /tmp/x/titanself examples/nucleo.titan  -> a lista de tokens (T85)
+--   /tmp/x/titanself                                -> a demonstracao da ast (T84)
+--   /tmp/x/titanself --tokens examples/nucleo.titan -> a lista de tokens (T85)
+--   /tmp/x/titanself examples/nucleo.titan          -> a arvore sintatica (T86)
 --
 -- Sem argumento ele monta a `Exp` recursiva de `1 + 2 * 3` com o `enum` da ast
 -- e a percorre com `match`, imprimindo a arvore reparentizada e o numero de
 -- nos — a mesma construcao que o teste de integracao da T84 confere, e que
 -- continua valendo palavra por palavra.
 --
--- Com um arquivo, tokeniza-o com selfhost/lexer.titan e imprime uma linha por
--- token, no formato de examples/lexer.titan — o que o teste de equivalencia da
--- T85 compara com a saida do lexer da Fase 4.
+-- Com `--tokens` e um arquivo, tokeniza-o com selfhost/lexer.titan e imprime
+-- uma linha por token, no formato de examples/lexer.titan — o que o teste de
+-- equivalencia da T85 compara com a saida do lexer da Fase 4. A T85 nao tinha
+-- a flag (o arquivo sozinho bastava); a T86 a introduziu ao dar ao arquivo
+-- sozinho o significado novo de "parseia", e o teste de equivalencia passou a
+-- chamar com ela.
 --
--- As tarefas seguintes encadeiam o resto: parser (T86) e checker (T87).
+-- Com um arquivo e mais nada, lexa, parseia com selfhost/parser.titan e
+-- imprime a arvore — ou os erros de sintaxe, um por linha, saindo com 1. E o
+-- criterio de aceite da T86.
+--
+-- A tarefa seguinte encadeia o resto: o checker (T87).
 
 function exemplo(): ast.Exp
     -- 1 + 2 * 3, com a precedencia ja resolvida na forma da arvore: o `*`
@@ -63,11 +73,54 @@ function tokenizar_arquivo(caminho: string): nil
     end
 end
 
+-- A demonstracao da T86: parseia o arquivo e imprime a arvore.
+--
+-- O codigo de saida distingue os dois desfechos, porque e o que um driver de
+-- compilador deve fazer e o que a T88 vai comparar com o `titanc`: 0 quando o
+-- fonte parseia, 1 quando ha erro de sintaxe. Os erros saem todos, e nao so o
+-- primeiro — o parser acumula em vez de abortar (T86).
+function parsear_arquivo(caminho: string): integer
+    local fonte: string = io.ler_arquivo(caminho)
+    local erros: {parser.Erro} = {}
+    local topos: {ast.TopLevel} = parser.parse_fonte(fonte, erros)
+    if #erros > 0 then
+        for e in erros do
+            print(parser.erro_para_texto(e))
+        end
+        return 1
+    end
+    -- Um `print` por declaracao de topo, e nao um `print` do programa inteiro:
+    -- `programa_para_texto` termina cada linha com `\n` e `print` acrescenta
+    -- outro. E a mesma razao que fez `tokenizar_arquivo` imprimir token a
+    -- token, e o mesmo limite da capability `io`.
+    for t in topos do
+        local txt: string = ast.toplevel_para_texto(t)
+        print(texto_sem_quebra_final(txt))
+    end
+    return 0
+end
+
+-- O texto sem o `\n` final, para o `print` nao dobrar a quebra de linha.
+function texto_sem_quebra_final(s: string): string
+    local n: integer = texto.tamanho(s)
+    if n > 0 and texto.byte(s, n) == 10 then
+        return texto.sub(s, 1, n - 1)
+    end
+    return s
+end
+
 function main(args: {string}): integer
     if #args < 1 then
         demonstrar_ast()
         return 0
     end
-    tokenizar_arquivo(args[1])
-    return 0
+    if args[1] == "--tokens" then
+        if #args < 2 then
+            print("uso: titanself --tokens <arquivo.titan>")
+            return 1
+        end
+        tokenizar_arquivo(args[2])
+        return 0
+    end
+    return parsear_arquivo(args[1])
 end
