@@ -2905,3 +2905,119 @@ fn t81_import_desconhecido_lista_capabilities_e_modulos_do_manifesto() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Diretório do projeto auto-hospedado (`selfhost/`), que a Parte C preenche
+/// módulo a módulo — ao contrário dos projetos das T81/T82, este mora no
+/// repositório, e não num diretório temporário.
+fn selfhost_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../selfhost")
+}
+
+/// Critério de aceite da T84: `selfhost/ast.titan` — a AST do Titan escrita em
+/// Titan — compila como módulo do projeto `selfhost/`, e um programa constrói
+/// uma `Exp` **recursiva** (`1 + 2 * 3`) e a percorre com `match`.
+///
+/// É a prova de que os tipos soma da Parte A (T74-T77) resolveram o problema
+/// que o ADR 0020 registrou: `ExpBinop(Loc, string, Exp, Exp)` carrega os dois
+/// operandos como `Exp` de verdade, sem a tag inteira de `examples/lexer.titan`
+/// e sem record gordo. O `Box` que fecha a recursão em Rust (ADR 0026) é do
+/// codegen — não aparece no fonte Titan.
+#[test]
+fn t84_selfhost_ast_titan_compila_e_percorre_exp_recursiva_com_match() {
+    let out_dir = temp_dir("t84-selfhost-ast");
+
+    // Primeiro o `--emit-rust`: o que interessa ver é a recursão encaixotada
+    // pelo codegen e o `enum` saindo como `enum` Rust, dentro do `mod ast`.
+    let emitido = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(selfhost_dir())
+        .arg("--emit-rust")
+        .output()
+        .expect("invoca titanc --emit-rust --manifesto selfhost");
+    assert_never_panics(&emitido);
+    assert!(
+        emitido.status.success(),
+        "titanc falhou ao emitir o projeto selfhost: {}",
+        String::from_utf8_lossy(&emitido.stderr)
+    );
+    let rust = String::from_utf8_lossy(&emitido.stdout);
+    assert!(
+        rust.contains("pub mod ast {"),
+        "faltou o módulo ast:\n{rust}"
+    );
+    // A variante recursiva, com o `Box` posto pela emissão (ADR 0026) — a
+    // prova de que `Exp` é recursivo de verdade, e não uma tag mais campos.
+    assert!(
+        rust.contains("ExpBinop(Loc, String, Box<Exp>, Box<Exp>)"),
+        "esperava a variante recursiva encaixotada:\n{rust}"
+    );
+    // `Loc` continua `record` → `struct`: tipo soma não é martelo universal.
+    assert!(
+        rust.contains("pub struct Loc {"),
+        "Loc deveria continuar um record:\n{rust}"
+    );
+    // E a travessia do outro módulo chega qualificada.
+    assert!(
+        rust.contains("crate::ast::titan_exp_para_texto("),
+        "a travessia entre módulos tem de sair qualificada:\n{rust}"
+    );
+
+    // Depois a compilação de verdade e a execução: a `Exp` de `1 + 2 * 3`
+    // montada com os construtores da ast e percorrida por `match`.
+    let output = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(selfhost_dir())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("invoca titanc --manifesto selfhost");
+    assert_never_panics(&output);
+    assert!(
+        output.status.success(),
+        "titanc falhou ao compilar o projeto selfhost: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let binario = out_dir.join("titanself");
+    assert!(binario.exists(), "esperava executável em {binario:?}");
+    let execucao = Command::new(&binario)
+        .output()
+        .expect("executa ./titanself");
+    // A árvore reparentizada prova a precedência na *forma* da árvore (o `*`
+    // é filho do `+`, não irmão); `nos: 5` prova que a travessia recursiva
+    // desceu nos dois lados do `ExpBinop`.
+    assert_eq!(
+        String::from_utf8_lossy(&execucao.stdout),
+        "arvore: (1 + (2 * 3))\nnos: 5\nlinha: 1\n"
+    );
+    assert_eq!(execucao.status.code(), Some(0));
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// O contraste que a T84 pede medir: `examples/lexer.titan` — o registro
+/// histórico que o ADR 0020 cita — continua **intocado**, com a tag inteira e
+/// as constantes-como-função que a Fase 5 tornou desnecessárias. Apagá-lo
+/// destruiria a evidência empírica que justifica esta fase (T85).
+#[test]
+fn t84_lexer_titan_da_fase_4_continua_com_o_estilo_antigo_como_registro() {
+    let antigo = std::fs::read_to_string(examples_dir().join("lexer.titan"))
+        .expect("lê examples/lexer.titan");
+    assert!(
+        antigo.contains("function TK_NAME(): integer return 1 end"),
+        "o registro histórico da Fase 4 não pode ser 'consertado'"
+    );
+    assert!(
+        !antigo.contains("enum "),
+        "examples/lexer.titan tem de permanecer sem tipo soma"
+    );
+
+    // E o novo faz o oposto: `enum` de verdade, com a variante recursiva
+    // escrita sem nenhum encaixotamento à vista.
+    let novo =
+        std::fs::read_to_string(selfhost_dir().join("ast.titan")).expect("lê selfhost/ast.titan");
+    assert!(
+        novo.contains("ExpBinop(Loc, string, Exp, Exp)"),
+        "a variante recursiva é o resultado mensurável da fase"
+    );
+}

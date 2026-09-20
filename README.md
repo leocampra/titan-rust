@@ -116,6 +116,39 @@ deliberadamente deselegante (constantes como função no lugar de tipo soma,
 estado da varredura num `record` passado por parâmetro no lugar de retorno
 múltiplo) — evidência do que falta para a Fase 5, não defeito desta.
 
+## Como rodar o projeto da Fase 5 (self-hosting: AST em Titan)
+
+```bash
+./target/release/titanc --manifesto selfhost --out .
+./titanself
+# → arvore: (1 + (2 * 3))
+# → nos: 5
+# → linha: 1
+echo $?
+# → 0
+```
+
+`selfhost/` é um projeto multi-módulo declarado por
+[`titan.toml`](selfhost/titan.toml), e não um arquivo solto: é assim que um
+compilador escrito em Titan passa a caber em mais de um arquivo. Na Fase 5 ele
+traz `selfhost/ast.titan` — a AST do Titan escrita em Titan, com `enum Exp`
+**recursivo de verdade** (`ExpBinop(Loc, string, Exp, Exp)`), `enum Stat`,
+`enum TopLevel`, `enum Var`, `enum Tipo` e `record Loc`. O `main.titan` monta a
+expressão `1 + 2 * 3` com esses construtores e a percorre com `match`.
+
+Vale ler `selfhost/ast.titan` lado a lado com `examples/lexer.titan`: o mesmo
+compilador, antes e depois dos tipos soma. Lá, `TokenKind` é `integer` e cada
+constante vira uma função sem argumento
+(`function TK_NAME(): integer return 1 end`); aqui, cada variante carrega
+exatamente os campos que tem, e esquecer um caso no `match` é erro do checker,
+em português. O `Box` que fecha a recursão no Rust gerado é do codegen
+([ADR 0026](docs/adr/0026-enum-recursivo-com-box-na-emissao.md)) — não aparece
+no fonte Titan.
+
+`examples/lexer.titan` continua **intocado**: é o registro histórico que o
+[ADR 0020](docs/adr/0020-self-hosting-por-etapas.md) cita como evidência
+empírica de que faltavam tipos soma. Consertá-lo destruiria a comparação.
+
 O `titanc` lê o `.titan`, gera um projeto Cargo temporário em `build/<nome>/`,
 compila-o com `cargo build --release` e copia o binário resultante para o
 diretório atual como `<nome>`.
@@ -530,8 +563,12 @@ titan-rust/
 │   ├── nucleo.titan
 │   ├── compostos.titan
 │   ├── dados.titan
-│   ├── lexer.titan
+│   ├── lexer.titan      # registro histórico da Fase 4 — não é "consertado"
 │   └── vendas.csv
+├── selfhost/            # o titanc escrito em Titan: projeto multi-módulo
+│   ├── titan.toml       # manifesto: nome → caminho de cada módulo
+│   ├── ast.titan        # a AST do Titan em Titan, sobre tipos soma
+│   └── main.titan
 ├── docs/
 │   ├── arquitetura.md
 │   └── adr/
