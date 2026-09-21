@@ -64,7 +64,23 @@
 //!   lexer (T59), parser (T60) e agora checker/codegen — o caminho feliz é
 //!   provado por execução real em
 //!   `compila_e_executa_bitwise_e_divisao_inteira`, com `-7 // 2` dando -4
-//!   (piso, não truncagem).
+//!   (piso, não truncagem);
+//! - curadoria da Fase 5 (PRD.md, T90), as duas metades do fechamento:
+//!   `CASOS_FORA_DE_ESCOPO_FASE_5` recolhe os negativos que os mecanismos
+//!   **novos** da fase criaram (variante que o `enum` não tem, cast que `as`
+//!   não faz), e `CASOS_NEGATIVOS_DE_PROJETO` cobre os três erros de módulo
+//!   da Parte B — ciclo, módulo não declarado no manifesto e nome colidindo
+//!   com capability —, que precisam de vários arquivos e de um `titan.toml`
+//!   e por isso têm helper próprio, `verifica_caso_negativo_de_projeto`.
+//!   Do outro lado, os comentários das tabelas da Fase 4 deixaram de dizer
+//!   que tipos soma estão pendentes: o que era fora de escopo virou caminho
+//!   feliz, e o que ficou é só o negativo que o mecanismo trouxe.
+//!   **Disciplina de custo (risco 4 da fase):** todo caso negativo roda com
+//!   `--emit-rust` — os que ainda usavam só `--out` (mutação no `for`-in,
+//!   fronteira de FFI, os dois de módulo da T81, a grafia antiga de
+//!   `foreign import` e o arquivo inexistente) foram convertidos na T90.
+//!   Eles já falhavam antes do `cargo`, mas agora isso está escrito na
+//!   chamada em vez de depender de onde a falha para.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1289,11 +1305,20 @@ fn construcoes_fora_de_escopo_da_fase_3_produzem_erro_claro_sem_panic() {
 /// segue exatamente o mesmo desenho: aceito dentro de laço, rejeitado fora
 /// dele pelo checker, com a mesma mensagem em português. Os últimos três
 /// casos são a curadoria da T57 (risco 5 à parte, coberto em
-/// `compila_e_executa_hello_titan_conferindo_stdout_e_exit_code`): tipos soma
-/// e `match` seguem sem sintaxe própria (Fase 5, pendente — PRD.md linha
-/// 1889), `.titan` importando `.titan` cai na mesma rejeição de `import` com
+/// `compila_e_executa_hello_titan_conferindo_stdout_e_exit_code`):
+/// `.titan` importando `.titan` cai na mesma rejeição de `import` com
 /// string (T35) e `s[i]` é indexação de string, fora de escopo por decisão
 /// explícita do checker.
+///
+/// A curadoria da T90 reviu o que a T57 tinha escrito aqui sobre tipos soma:
+/// eles **deixaram** de estar fora de escopo — ganharam sintaxe na T75,
+/// tipagem na T76 e emissão com `Box` na T77, e o caminho feliz vive em
+/// `emit_rust_de_enum_recursivo_sai_com_box_e_match`. O que sobrou deles
+/// nesta tabela são os negativos que o mecanismo **criou** (`match` sobre
+/// não-`enum`, não exaustivo, aridade errada de variante, a seta no lugar do
+/// `then`), pelo mesmo movimento de `indexacao_de_array` na T30 e `break` na
+/// T55; a variante inexistente e o cast que não existe entraram na
+/// [`CASOS_FORA_DE_ESCOPO_FASE_5`].
 const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
     CasoNegativo {
         nome: "break_fora_de_laco",
@@ -1383,9 +1408,12 @@ const CASOS_FORA_DE_ESCOPO_FASE_4: &[CasoNegativo] = &[
         trecho_esperado: "Esperava 'with' após a expressão do 'match'",
     },
     CasoNegativo {
-        // `.titan` importando `.titan` cairia exatamente na forma `import`
-        // com string (T35): não há mecanismo de módulo de usuário na Fase 4,
-        // só as capabilities embutidas (`data`, `texto`, `io`).
+        // `.titan` importando `.titan` cai na forma `import` com string
+        // (T35). A razão mudou com a Parte B e o caso ficou: módulo de
+        // usuário **existe** desde a T79, mas se importa pelo **nome**
+        // declarado no `titan.toml` (`import lexer`), nunca pelo caminho do
+        // arquivo — o manifesto é a única fonte do mapeamento nome →
+        // caminho, e é justamente isso que esta rejeição protege.
         nome: "titan_importando_titan",
         fonte: "import \"outro.titan\"\n\nfunction main(args: {string}): integer\n    return 0\nend",
         trecho_esperado: "nome de string não é suportado",
@@ -1405,6 +1433,313 @@ fn construcoes_fora_de_escopo_da_fase_4_produzem_erro_claro_sem_panic() {
     for caso in CASOS_FORA_DE_ESCOPO_FASE_4 {
         verifica_caso_negativo(caso, "fora-de-escopo-fase-4");
     }
+}
+
+/// Curadoria da Fase 5 (PRD.md, T90): o que a fase **abriu** saiu das tabelas
+/// acima para caminho feliz — `enum`/`match` (T75–T77), `continue` (T63),
+/// `repeat`/`until` (T64), `for`-in (T62), retornos múltiplos (T65/T66),
+/// multi-assign (T67), `integer?` (T68/T69), `as` (T70), alias e `:` de
+/// capability (T72), `foreign function` (T73) e módulos de usuário
+/// (T79–T82); esta tabela é o outro lado do movimento, os negativos que a
+/// fase **criou**.
+///
+/// São as construções que só passaram a existir com os mecanismos da Fase 5
+/// e que, por isso, só agora podem errar: a variante que o `enum` não tem
+/// (T76) e o cast entre tipos que `as` não converte (T70). Os demais itens
+/// que a T90 nomeia já vivem onde a camada que os rejeita os colocou, e
+/// mover cada um para cá só espalharia a mesma prova por dois lugares:
+///
+/// - `match` não exaustivo, aridade errada de variante e `match` sobre
+///   não-`enum` → [`CASOS_FORA_DE_ESCOPO_FASE_4`], junto dos negativos de
+///   `break`/`continue`/`repeat` que a T57 já agrupava;
+/// - `continue` fora de laço → mesma tabela, ao lado de `break_fora_de_laco`,
+///   que é o mesmo mecanismo do checker;
+/// - bitwise com float → `bitwise_com_float` em
+///   [`CASOS_FORA_DE_ESCOPO_FASE_2`], ao lado do positivo que o `&` ganhou
+///   na T61;
+/// - `foreign import` com tipo composto na fronteira →
+///   `t73_tipo_composto_na_fronteira_produz_erro_claro_do_checker`, que
+///   confere as duas metades da mensagem (o record e a lista do que
+///   atravessa);
+/// - mutar container durante `for`-in →
+///   `mutar_o_container_durante_o_for_in_produz_erro_claro_em_portugues`,
+///   que varre as três formas de mutação (atribuir ao container, escrever num
+///   elemento, passá-lo como argumento) e não caberia numa linha de tabela;
+/// - ciclo de módulos, módulo não declarado no manifesto e nome de módulo
+///   colidindo com capability → [`CASOS_NEGATIVOS_DE_PROJETO`], que precisa
+///   de vários arquivos e de um `titan.toml`, e por isso tem helper próprio.
+const CASOS_FORA_DE_ESCOPO_FASE_5: &[CasoNegativo] = &[
+    CasoNegativo {
+        // Variante que o `enum` não tem, escrita como **padrão** de `match`
+        // (T76). É distinta de `tipo_soma_construcao_com_aridade_errada`
+        // (a variante existe, os campos é que não batem) e de escrever
+        // `Roxo` como expressão, que cai no "não foi declarado" genérico do
+        // escopo: aqui o checker sabe de que enum se trata e diz qual é.
+        nome: "tipo_soma_variante_inexistente_em_padrao",
+        fonte: "enum Cor\n    Vermelho\n    Verde\nend\n\nfunction main(args: {string}): integer\n    local c: Cor = Vermelho\n    match c with\n        Vermelho then\n            return 0\n        Verde then\n            return 1\n        Roxo then\n            return 2\n    end\nend",
+        trecho_esperado: "o enum 'Cor' não tem variante 'Roxo'",
+    },
+    CasoNegativo {
+        // O `as` da T70 converte entre números e de/para `value` — não
+        // reinterpreta `boolean`. O irmão deste caso é
+        // `cast_de_string_para_numero`, na tabela da Fase 2: lá a origem é
+        // texto, aqui é um tipo que simplesmente não entra na conversão.
+        nome: "cast_de_boolean_para_numero",
+        fonte: "function main(args: {string}): integer\n    local b: boolean = true\n    local n: integer = b as integer\n    return 0\nend",
+        trecho_esperado: "não existe cast de boolean para integer",
+    },
+];
+
+#[test]
+fn construcoes_fora_de_escopo_da_fase_5_produzem_erro_claro_sem_panic() {
+    for caso in CASOS_FORA_DE_ESCOPO_FASE_5 {
+        verifica_caso_negativo(caso, "fora-de-escopo-fase-5");
+    }
+}
+
+/// Um caso negativo de **projeto**: vários arquivos e um `titan.toml`, em vez
+/// da fonte única de [`CasoNegativo`]. Os erros de módulo da Parte B (T79–T82)
+/// não têm como caber na outra forma — um ciclo precisa de dois arquivos que
+/// se importem, e uma colisão com capability precisa da seção `[modulos]`.
+struct CasoNegativoDeProjeto {
+    nome: &'static str,
+    arquivos: &'static [(&'static str, &'static str)],
+    trecho_esperado: &'static str,
+}
+
+/// A mesma tripla de [`verifica_caso_negativo`] — falha sem panic, stderr com
+/// o trecho esperado, nenhum `build/` para trás — sobre um projeto com
+/// manifesto. `--emit-rust` também aqui (disciplina de custo da T90): os três
+/// casos param no manifesto ou no grafo, antes de qualquer codegen, mas a
+/// flag deixa escrito que nenhum deles pode chegar ao `cargo`.
+fn verifica_caso_negativo_de_projeto(caso: &CasoNegativoDeProjeto, label: &str) {
+    let dir = temp_dir(&format!("{label}-{}", caso.nome));
+    write_projeto(&dir, caso.arquivos);
+
+    let output = Command::new(titanc_bin())
+        .arg("--manifesto")
+        .arg(&dir)
+        .arg("--emit-rust")
+        .output()
+        .unwrap_or_else(|e| panic!("[{}] falha ao invocar titanc: {e}", caso.nome));
+
+    assert_never_panics(&output);
+    assert!(
+        !output.status.success(),
+        "[{}] esperava falha, titanc reportou sucesso",
+        caso.nome
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(caso.trecho_esperado),
+        "[{}] esperava stderr contendo '{}', obteve: {stderr}",
+        caso.nome,
+        caso.trecho_esperado
+    );
+    assert!(
+        !dir.join("build").exists(),
+        "[{}] erro não deveria deixar build/ para trás",
+        caso.nome
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Os três negativos de módulo que a T90 nomeia, cada um parando numa etapa
+/// diferente do pipeline da Parte B — é essa diferença que justifica os três,
+/// e não um só:
+///
+/// - **colisão com capability** para no `manifesto.rs`, ao ler o `titan.toml`,
+///   antes de abrir qualquer `.titan`;
+/// - **módulo não declarado** para no `grafo.rs`, ao resolver um `import`
+///   contra as duas fontes (capabilities e `[modulos]`);
+/// - **ciclo** para no `grafo.rs` também, mas depois, na ordenação
+///   topológica — os dois arquivos existem e estão declarados, o que não
+///   existe é uma ordem de compilação.
+///
+/// Nenhum chega ao checker, e é isso que a tripla prova.
+const CASOS_NEGATIVOS_DE_PROJETO: &[CasoNegativoDeProjeto] = &[
+    CasoNegativoDeProjeto {
+        nome: "ciclo_de_modulos",
+        arquivos: &[
+            (
+                "src/a.titan",
+                "import b\nfunction fa(): integer\n    return b.fb()\nend\n",
+            ),
+            (
+                "src/b.titan",
+                "import a\nfunction fb(): integer\n    return 1\nend\n",
+            ),
+            (
+                "src/main.titan",
+                "import a\nfunction main(args: {string}): integer\n    return a.fa()\nend\n",
+            ),
+            (
+                "titan.toml",
+                "[pacote]\nnome = \"prog\"\nprincipal = \"src/main.titan\"\n\n\
+                 [modulos]\na = \"src/a.titan\"\nb = \"src/b.titan\"\n",
+            ),
+        ],
+        trecho_esperado: "os imports formam um ciclo: a → b → a",
+    },
+    CasoNegativoDeProjeto {
+        // O arquivo existe em `src/`, o que falta é a linha em `[modulos]`:
+        // o manifesto é a **única** fonte de módulos de usuário (ADR 0025),
+        // e um `.titan` solto no diretório não vira módulo por estar lá.
+        nome: "modulo_nao_declarado_no_manifesto",
+        arquivos: &[
+            (
+                "src/b.titan",
+                "function fb(): integer\n    return 2\nend\n",
+            ),
+            (
+                "src/main.titan",
+                "import b\nfunction main(args: {string}): integer\n    return b.fb()\nend\n",
+            ),
+            (
+                "titan.toml",
+                "[pacote]\nnome = \"prog\"\nprincipal = \"src/main.titan\"\n\n[modulos]\n",
+            ),
+        ],
+        trecho_esperado: "o módulo 'b' não existe",
+    },
+    CasoNegativoDeProjeto {
+        // `texto` é capability do compilador (T53): deixar um módulo de
+        // usuário tomar o nome faria `import texto` virar ambíguo, então o
+        // manifesto recusa antes — e a mensagem lista as capabilities, para
+        // que o autor saiba quais nomes estão tomados.
+        nome: "modulo_colidindo_com_capability",
+        arquivos: &[
+            (
+                "src/texto.titan",
+                "function f(): integer\n    return 1\nend\n",
+            ),
+            (
+                "src/main.titan",
+                "function main(args: {string}): integer\n    return 0\nend\n",
+            ),
+            (
+                "titan.toml",
+                "[pacote]\nnome = \"prog\"\nprincipal = \"src/main.titan\"\n\n\
+                 [modulos]\ntexto = \"src/texto.titan\"\n",
+            ),
+        ],
+        trecho_esperado:
+            "'texto' é o nome de uma capability do compilador e não pode nomear um módulo de usuário",
+    },
+];
+
+#[test]
+fn casos_negativos_de_projeto_produzem_erro_claro_sem_panic() {
+    for caso in CASOS_NEGATIVOS_DE_PROJETO {
+        verifica_caso_negativo_de_projeto(caso, "negativo-projeto");
+    }
+}
+
+/// O critério de aceite da T90 que a suíte não conseguiria provar rodando —
+/// "nenhum caso negativo invoca o `cargo build` do projeto gerado" é uma
+/// afirmação sobre o que **não** acontece, e um teste que só olha o
+/// resultado não distingue "falhou antes do cargo" de "pagou o cargo e
+/// falhou depois".
+///
+/// A prova está em `driver.rs`: com `emit_rust`, o driver retorna depois de
+/// imprimir o Rust e **antes** de escrever o `Cargo.toml` e invocar o
+/// `cargo` — é por isso que os dois helpers de caso negativo afirmam que
+/// nenhum `build/` ficou para trás. Resta garantir que todo negativo passe
+/// mesmo pela flag, e é isso que este teste varre: lê o próprio fonte desta
+/// suíte e exige `--emit-rust` em toda invocação do `titanc` que espera
+/// falha.
+///
+/// Sem esta varredura, a disciplina do risco 4 da fase depende de quem
+/// escreve o próximo caso lembrar dela; com ela, esquecer vira um teste
+/// vermelho com o nome da função onde o esquecimento está.
+#[test]
+fn t90_nenhuma_invocacao_que_espera_falha_paga_o_cargo_do_projeto_gerado() {
+    let fonte_completo = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration.rs"),
+    )
+    .expect("lê o próprio fonte da suíte");
+
+    // A varredura não pode se ler: as asserções deste teste citam
+    // `Command::new(titanc_bin())` e `!output.status.success()` como texto e
+    // casariam com os próprios padrões que procura. Recorta-se o corpo deste
+    // teste — e só ele, porque o resto da suíte vem **depois** dele no
+    // arquivo e precisa ser varrido.
+    const MARCA: &str = "fn t90_nenhuma_invocacao_que_espera_falha_paga_o_cargo_do_projeto_gerado";
+    let inicio = fonte_completo
+        .find(MARCA)
+        .expect("o próprio teste tem de estar no fonte");
+    let fim = fonte_completo[inicio..]
+        .find("\n}\n")
+        .map(|o| inicio + o)
+        .expect("o próprio teste tem de fechar");
+    let fonte = format!(
+        "{}{}",
+        &fonte_completo[..inicio],
+        &fonte_completo[fim..]
+    );
+    let fonte = fonte.as_str();
+
+    // Cada `Command::new(titanc_bin())` até o `.output()` que o fecha: é a
+    // unidade que ou leva `--emit-rust` ou não leva.
+    let mut faltando: Vec<String> = Vec::new();
+    for (i, _) in fonte.match_indices("Command::new(titanc_bin())") {
+        let resto = &fonte[i..];
+        let fim = resto.find(".output()").unwrap_or(resto.len());
+        let invocacao = &resto[..fim];
+
+        // Só interessam as que esperam falha. O sinal é a asserção que vem
+        // logo depois — `!output.status.success()` ou a mensagem dos
+        // helpers — **dentro da mesma função**. A janela termina no fim da
+        // função (`\n}\n`, a única chave na coluna 0) ou na próxima
+        // invocação do titanc, o que vier primeiro: sem esse segundo limite,
+        // um caminho feliz herdaria a asserção de falha do teste seguinte.
+        let depois = &resto[fim..];
+        let fim_da_funcao = depois.find("\n}\n").unwrap_or(depois.len());
+        let proxima_invocacao = depois
+            .find("Command::new(titanc_bin())")
+            .unwrap_or(depois.len());
+        let corpo = &depois[..fim_da_funcao.min(proxima_invocacao)];
+        let espera_falha = corpo.contains("!output.status.success()")
+            || corpo.contains("!compile_output.status.success()")
+            || corpo.contains("\"a compilação deveria falhar\"")
+            || corpo.contains("esperava falha");
+        if !espera_falha {
+            continue;
+        }
+
+        if !invocacao.contains("--emit-rust") {
+            // O nome da função que contém a invocação — o último `fn` antes
+            // dela. Mais útil que um número de linha, que o recorte deste
+            // próprio teste deslocaria.
+            let nome = fonte[..i]
+                .rfind("\nfn ")
+                .map(|p| {
+                    let resto = &fonte[p + 4..];
+                    let fim = resto.find('(').unwrap_or(0);
+                    resto[..fim].to_string()
+                })
+                .unwrap_or_else(|| "<função desconhecida>".to_string());
+
+            // A única isenção: invocar o titanc **sem argumento nenhum**
+            // para ver a mensagem de uso. Não há fonte, logo não há projeto
+            // gerado nem `cargo` a pagar — e passar `--emit-rust` ali seria
+            // mudar o cenário que o teste existe para exercitar.
+            if nome == "nenhum_argumento_produz_uso_sem_panic" {
+                continue;
+            }
+            faltando.push(nome);
+        }
+    }
+
+    assert!(
+        faltando.is_empty(),
+        "estas invocações esperam falha mas não passam `--emit-rust`, \
+         então podem pagar o `cargo build` do projeto gerado (T90, risco 4 \
+         da fase): {}",
+        faltando.join(", ")
+    );
 }
 
 /// Quebra compatível registrada pela T59 (Fase 5): `enum`, `match`,
@@ -1817,7 +2152,11 @@ fn mutar_o_container_durante_o_for_in_produz_erro_claro_em_portugues() {
     for (nome, fonte) in casos {
         let out_dir = temp_dir(&format!("for-in-mutacao-{nome}"));
         let source_path = write_source(&out_dir, "mutacao.titan", fonte);
+        // `--emit-rust` pela disciplina de custo da T90: o erro é do checker,
+        // então o `cargo` do projeto gerado nunca seria alcançado — a flag
+        // deixa isso escrito, em vez de depender de onde a falha para.
         let output = Command::new(titanc_bin())
+            .arg("--emit-rust")
             .arg("--out")
             .arg(&out_dir)
             .arg(&source_path)
@@ -1833,7 +2172,12 @@ fn mutar_o_container_durante_o_for_in_produz_erro_claro_em_portugues() {
             stderr.contains("não é possível modificar 'v' dentro do `for`-in"),
             "[{nome}] mensagem inesperada: {stderr}"
         );
-        // A convenção do projeto: nunca o erro do rustc em inglês.
+        // A convenção do projeto: nunca o erro do rustc em inglês. Com o
+        // `--emit-rust` da T90 o rustc nem chega a rodar, e é esse o ponto —
+        // a rejeição tem de vir do checker, antes de existir Rust para
+        // compilar. A asserção continua valendo como rede: se a checagem do
+        // `for`-in regredir, o erro passa a sair do rustc no caminho sem a
+        // flag, e a mensagem em português some daqui primeiro.
         assert!(
             !stderr.contains("cannot borrow"),
             "[{nome}] vazou erro do rustc: {stderr}"
@@ -2317,6 +2661,13 @@ const ARQUIVOS_QUE_A_FASE_2_ESPERA_COMPILAR: &[&str] =
 /// real no codegen (T30) — e sim: o titanc **nunca panica** e **nunca
 /// produz stderr vazio** ao processá-los, compilando com sucesso ou falhando
 /// com uma mensagem de erro clara.
+///
+/// Roda com `--emit-rust` desde a T90: a propriedade é sobre o **front-end**
+/// (não panicar, não calar), e dois destes três arquivos hoje compilam — sem
+/// a flag, o teste pagava dois `cargo build --release` inteiros para provar
+/// algo que o codegen já decidiu. O caminho feliz que precisa mesmo do
+/// executável é o do teste seguinte, `ARQUIVOS_QUE_A_FASE_2_ESPERA_COMPILAR`,
+/// e lá o custo é intencional.
 #[test]
 fn arquivos_reais_do_titan_original_nunca_panicam() {
     let titan_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../titan");
@@ -2343,6 +2694,7 @@ fn arquivos_reais_do_titan_original_nunca_panicam() {
         ));
 
         let output = Command::new(titanc_bin())
+            .arg("--emit-rust")
             .arg("--out")
             .arg(&out_dir)
             .arg(&source_path)
@@ -2450,7 +2802,10 @@ function main(args: {string}): integer
 end"#;
     let source_path = write_source(&out_dir, "titan_original.titan", source);
 
+    // `--emit-rust` pela disciplina de custo da T90: a grafia antiga morre no
+    // parser, muito antes de existir projeto a compilar.
     let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
         .arg("--out")
         .arg(&out_dir)
         .arg(&source_path)
@@ -2548,7 +2903,10 @@ function main(args: {string}): integer
 end"#;
     let source_path = write_source(&out_dir, "fronteira.titan", source);
 
+    // `--emit-rust` pela disciplina de custo da T90: a fronteira é conferida
+    // pelo checker, antes de qualquer `cargo`.
     let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
         .arg("--out")
         .arg(&out_dir)
         .arg(&source_path)
@@ -2571,6 +2929,7 @@ fn arquivo_de_entrada_inexistente_produz_erro_claro_sem_panic() {
     let out_dir = temp_dir("arquivo-inexistente");
 
     let output = Command::new(titanc_bin())
+        .arg("--emit-rust")
         .arg("--out")
         .arg(&out_dir)
         .arg(out_dir.join("nao_existe.titan"))
@@ -2839,11 +3198,12 @@ fn t81_local_function_de_outro_modulo_da_erro_claro_na_cli() {
         ],
     );
 
+    // `--emit-rust` pela disciplina de custo da T90: a visibilidade é regra
+    // do checker entre módulos, resolvida antes de haver o que compilar.
     let output = Command::new(titanc_bin())
         .arg("--manifesto")
         .arg(&dir)
-        .arg("--out")
-        .arg(&dir)
+        .arg("--emit-rust")
         .output()
         .expect("invoca titanc --manifesto");
     assert_never_panics(&output);
@@ -2883,11 +3243,12 @@ fn t81_import_desconhecido_lista_capabilities_e_modulos_do_manifesto() {
         ],
     );
 
+    // `--emit-rust` pela disciplina de custo da T90: o `import` não resolve
+    // no grafo, e o grafo vem antes do codegen.
     let output = Command::new(titanc_bin())
         .arg("--manifesto")
         .arg(&dir)
-        .arg("--out")
-        .arg(&dir)
+        .arg("--emit-rust")
         .output()
         .expect("invoca titanc --manifesto");
     assert_never_panics(&output);
