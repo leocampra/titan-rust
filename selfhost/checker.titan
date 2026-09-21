@@ -1,0 +1,2110 @@
+import ast
+
+-- Checker do Titan escrito em Titan, a analise semantica da Parte C
+-- (PRD.md, T87).
+--
+-- A terceira peca do pipeline auto-hospedado — lexer (T85) -> parser (T86) ->
+-- checker (T87) —, e a que finalmente da **significado** a arvore: o parser
+-- aceita `1 + "a"` sem pestanejar porque a forma esta certa; quem recusa e
+-- este arquivo.
+--
+-- ESCOPO: **o subconjunto que o parser da T86 aceita**, e nada alem — nao as
+-- 4498 linhas de crates/titanc/src/checker.rs. Isso e dado da tarefa, nao
+-- defeito dela: o risco 5 da fase e justamente a ambiguidade que o ADR 0020
+-- teve de esclarecer depois, e o ADR 0027 registra o mesmo limite do lado de
+-- la. Concretamente, o que este checker confere:
+--
+--   - duas passadas: records e assinaturas de topo primeiro, corpos depois —
+--     a mesma estrategia de `run` (checker.rs:5806), e o que permite a uma
+--     funcao chamar outra declarada mais adiante no arquivo;
+--   - simbolos em pilha, com escopo de bloco;
+--   - tipos do nucleo: `nil`, `boolean`, `integer`, `float`, `string`,
+--     `value`, `{T}`, `{K: V}`, record nomeado e `T?`;
+--   - aritmetica, comparacao, ordem, logica (`and`/`or` boolean estrito),
+--     concatenacao, bitwise, unarios, cast;
+--   - `if`/`while`/`for` numerico/`for`-in, `local`, atribuicao, chamada,
+--     `return`, `break`;
+--   - chamadas com aridade e tipo de argumento conferidos, indexacao de
+--     array e de map, campo de record, literal `{...}` decidido por contexto.
+--
+-- Fora do escopo, porque o parser da T86 nao os produz: `enum`/`match`,
+-- metodos, `import` de capability com resolucao de membro (o `import` e
+-- aceito e registra o nome do modulo, mas os membros nao sao tipados),
+-- `repeat`/`until`, `continue`, `foreign function`, multi-retorno de chamada
+-- (`ExpExtra`), estreitamento de fluxo de `T?` (T68) e rastreio de
+-- mutabilidade (que e assunto do codegen, nao da analise).
+--
+-- As mensagens sao as do compilador em Rust, palavra por palavra onde a regra
+-- e a mesma — "erro de tipo (linha L, coluna C): ...". Nao e cosmetica: a T88
+-- compara o conjunto de erros dos dois pipelines sobre o mesmo fonte, e uma
+-- mensagem diferente e uma divergencia de teste.
+--
+-- A T88 acrescentou `checa_e_anota`, que faz o que `checa_programa` faz e
+-- ainda devolve uma linha por declaracao de topo com o tipo resolvido — o que
+-- o driver imprime como "a AST tipada". Sao as **assinaturas**, e nao o tipo
+-- de cada expressao: `checa_exp` devolve um `T` que quem a chamou consome e
+-- descarta, e faze-la guarda-lo exigiria uma arvore paralela que so o driver
+-- leria. `checa_programa` continua existindo, e agora chama `checa_e_anota`
+-- descartando as anotacoes — os testes da T87 nao mudaram uma linha.
+--
+-- A UNICA DIVERGENCIA DE CONTEUDO, e a T88 precisa sabe-la: uma declaracao
+-- que erra o tipo **entra no escopo assim mesmo** aqui, com o tipo anotado,
+-- enquanto o `titanc` a descarta e reporta um segundo erro em cada uso
+-- posterior do nome. O conjunto de erros deste checker e, por isso, um
+-- **subconjunto** do de la — nunca um erro que la nao exista. `checa_decl`
+-- explica por que, e a excecao (a variavel de topo) esta em
+-- `coleta_assinaturas`.
+--
+-- DUAS NOTAS SOBRE A FRONTEIRA COM O PARSER, que a T88 vai encontrar:
+--
+--   1. O parser da T86 e **mais permissivo** que o do `titanc` em dois
+--      pontos, e cada um deles tem de ser resolvido aqui ou o pipeline
+--      aceitaria o que o compilador em Rust recusa. `local x: integer` sem
+--      inicializador e um deles, e `checa_decl` o recusa (o `titanc` recusa
+--      na sintaxe; o veredito e o mesmo, a fase e outra). O outro e o bloco
+--      `do ... end`, que o parser da T86 aceita e o parser do `titanc`
+--      recusa — este aqui o checker **aceita**, porque `do ... end` e
+--      Titan valido e a ausencia do lado de la e uma lacuna do parser em
+--      Rust, nao uma regra. E a unica construcao em que os dois pipelines
+--      divergem no desfecho.
+--
+--   2. Os bracos de `TMap` em `checa_initlist` nao sao exercitados pelo
+--      pipeline auto-hospedado: `{["a"] = 1}` nao parseia no lexer da Fase 4
+--      (que nao lexa a chave entre colchetes), entao um literal de map nunca
+--      chega ate aqui. Eles existem porque `ast.NomeDeCampo` tem a variante
+--      `NomeExp` e o `match` e exaustivo — e porque a alternativa, um
+--      `registra` dizendo "fora do subconjunto", estaria errada: a regra do
+--      literal de map e sabida, e escreve-la agora e mais barato do que
+--      descobri-la de novo quando o lexer crescer.
+
+---------------------------------------------------------------------------
+-- O tipo semantico
+--
+-- `ast.Tipo` e a anotacao **escrita** no fonte — sintaxe, com `Loc` e com a
+-- variante `TipoAusente` para a anotacao que o autor omitiu. `T` aqui e o que
+-- o checker deduz e compara: sem posicao, sem ausencia, e com `TInvalido`
+-- para o no que ja errou (o `Type::Invalid` de types.rs).
+--
+-- Sao dois tipos de verdade, e nao um so reaproveitado, pela mesma razao que
+-- separa `ast::Type` de `types::Type` no compilador em Rust: `{integer}`
+-- escrito em duas linhas diferentes e a mesma coisa para a comparacao, e
+-- `TipoAusente` nao e um tipo que um valor possa ter.
+---------------------------------------------------------------------------
+
+enum T
+    TInvalido
+    TNil
+    TBoolean
+    TInteger
+    TFloat
+    TString
+    TValue
+    TArray(T)
+    TMap(T, T)
+    -- Record e **nominal** (ADR 0009): a identidade e o nome, e os campos
+    -- moram na tabela de records do contexto. Guardar os campos aqui faria o
+    -- tipo recursivo de um record que se referencia, e a comparacao nao
+    -- terminaria — o mesmo motivo pelo qual `Type::Record` compara so `name`.
+    TRecord(string)
+    TFuncao({T}, {T})
+    TOpcional(T)
+    -- Um nome de modulo importado em posicao de valor. Nao e um tipo que um
+    -- valor tenha: e o que `texto` designa em `texto.tamanho(s)`, e existe
+    -- para a mensagem "'texto' e um modulo, nao um valor" poder ser dada
+    -- (checker.rs: `SymbolKind::Module`).
+    TModulo(string)
+end
+
+-- O nome do tipo como as mensagens de erro o escrevem — a copia de
+-- `type_name` (checker.rs:5783), inclusive no `map {K: V}` que difere da
+-- sintaxe do fonte (`{K: V}`) de proposito, la e aqui.
+function tipo_para_texto(t: T): string
+    match t with
+        TInvalido then return "<invalido>"
+        TNil then return "nil"
+        TBoolean then return "boolean"
+        TInteger then return "integer"
+        TFloat then return "float"
+        TString then return "string"
+        TValue then return "value"
+        TArray(elem) then return "{" .. tipo_para_texto(elem) .. "}"
+        TMap(chave, valor) then
+            local kt: string = tipo_para_texto(chave)
+            local vt: string = tipo_para_texto(valor)
+            return "map {" .. kt .. ": " .. vt .. "}"
+        TRecord(n) then return n
+        TFuncao(params, retornos) then return "function"
+        TOpcional(base) then return tipo_para_texto(base) .. "?"
+        TModulo(n) then return "module " .. n
+    end
+end
+
+-- A **chave de identidade** de um tipo: dois tipos sao iguais exatamente
+-- quando esta funcao devolve o mesmo texto para os dois.
+--
+-- Separada de `tipo_para_texto` de proposito, e a razao e concreta: aquela
+-- escreve toda funcao como `function`, porque e o que `type_name`
+-- (checker.rs:5790) escreve nas mensagens — dizer a assinatura inteira numa
+-- mensagem de erro ajudaria pouco e encompridaria muito. Usar o texto de
+-- mensagem como identidade fazia `main(args: {string}): integer` e
+-- `main(args: {string}): boolean` serem "o mesmo tipo", e `confere_main`
+-- aceitava a segunda calada. As duas funcoes coincidem em tudo o mais; so
+-- `TFuncao` as separa.
+function assinatura_do_tipo(t: T): string
+    match t with
+        TFuncao(params, retornos) then
+            local texto_dos_params: string = ""
+            for p in params do
+                texto_dos_params = texto_dos_params .. assinatura_do_tipo(p) .. ","
+            end
+            local texto_dos_retornos: string = ""
+            for r in retornos do
+                texto_dos_retornos = texto_dos_retornos .. assinatura_do_tipo(r) .. ","
+            end
+            return "function(" .. texto_dos_params .. "):" .. texto_dos_retornos
+        TArray(elem) then return "{" .. assinatura_do_tipo(elem) .. "}"
+        TMap(chave, valor) then
+            local kt: string = assinatura_do_tipo(chave)
+            local vt: string = assinatura_do_tipo(valor)
+            return "map {" .. kt .. ": " .. vt .. "}"
+        TOpcional(base) then return assinatura_do_tipo(base) .. "?"
+        _ then return tipo_para_texto(t)
+    end
+end
+
+-- Igualdade estrutural de tipos (`Type::equals`, types.rs:66).
+--
+-- A comparacao e feita sobre o **texto canonico** dos dois tipos, e nao por
+-- um `match` sobre o par. Nao e preguica: Titan casa um escrutinado por vez,
+-- entao comparar duas arvores exigiria um `match` aninhado por nivel, com um
+-- braco por combinacao — dezenas de bracos para dizer o que uma igualdade de
+-- string diz. E `assinatura_do_tipo` e canonica por construcao: cada
+-- variante escreve um prefixo que so ela escreve, entao dois tipos iguais
+-- tem o mesmo texto e dois textos iguais so podem vir de tipos iguais.
+--
+-- O preco e a alocacao de duas strings por comparacao. Num checker que roda
+-- sobre arquivos de milhares de linhas isso e visivel; num que roda sobre o
+-- subconjunto desta fase, nao — e a Fase 6, que vai querer `match` sobre
+-- tupla, e o lugar de trocar.
+function tipos_iguais(a: T, b: T): boolean
+    return assinatura_do_tipo(a) == assinatura_do_tipo(b)
+end
+
+-- Se `t` e `integer` ou `float` — `is_numeric` (checker.rs:5424).
+function eh_numerico(t: T): boolean
+    match t with
+        TInteger then return true
+        TFloat then return true
+        _ then return false
+    end
+end
+
+function eh_value(t: T): boolean
+    match t with
+        TValue then return true
+        _ then return false
+    end
+end
+
+function eh_invalido(t: T): boolean
+    match t with
+        TInvalido then return true
+        _ then return false
+    end
+end
+
+-- Consistencia a la gradual typing (`Type::compatible`, types.rs:122):
+-- `value` combina com qualquer tipo; o resto e igualdade.
+--
+-- **Nao ha coercao integer -> float aqui**, e isso e deliberado la e aqui:
+-- `local x: float = 1` e erro de tipo no Titan, e quem quer o float escreve
+-- `1.0` ou o cast. A promocao int->float existe so **dentro** da aritmetica
+-- (`numeric_result`), onde os dois operandos ja sao numericos.
+function compativel(esperado: T, achado: T): boolean
+    if eh_value(esperado) or eh_value(achado) then
+        return true
+    end
+    -- Um no que ja errou nao gera um segundo erro em cascata: `TInvalido`
+    -- combina com tudo, como o `Type::Invalid` do compilador em Rust.
+    if eh_invalido(esperado) or eh_invalido(achado) then
+        return true
+    end
+    return tipos_iguais(esperado, achado)
+end
+
+-- Se um valor de tipo `achado` **cabe** num destino escrito como `esperado`.
+--
+-- E `compativel` mais a injecao `T -> T?` e `nil -> T?` da T68
+-- (`widen_to_option`, checker.rs:3229): `local x: integer? = 10` e
+-- `local x: integer? = nil` valem os dois, e `compativel` sozinho recusaria
+-- os dois — `Option` e invariante la (ADR 0008) e tem de continuar sendo,
+-- senao `{integer}?` aceitaria `{value}?`. O que falta nao e variancia, e a
+-- **injecao**, que so vale num sentido e so onde o destino esta escrito: a
+-- declaracao com anotacao, o argumento, o alvo de atribuicao e o `return`.
+-- Sao os quatro pontos que chamam esta funcao; o resto do checker usa
+-- `compativel`.
+--
+-- O compilador em Rust marca a injecao com um no (`SomeOf`) porque o codegen
+-- precisa emitir o `Some(...)`; aqui nao ha codegen, entao basta a resposta.
+function cabe_no_destino(esperado: T, achado: T): boolean
+    if compativel(esperado, achado) then
+        return true
+    end
+    match esperado with
+        TOpcional(base) then
+            -- `nil` nao vira `Some(nil)`: vira a ausencia, e cabe em todo
+            -- `T?`.
+            match achado with
+                TNil then return true
+                _ then return compativel(base, achado)
+            end
+        _ then return false
+    end
+end
+
+-- O tipo do resultado de `+ - * % //` (`numeric_result`, checker.rs:5724):
+-- int com int da int, qualquer float promove tudo a float.
+function resultado_numerico(a: T, b: T): T
+    match a with
+        TInteger then
+            match b with
+                TInteger then return TInteger
+                _ then return TFloat
+            end
+        _ then return TFloat
+    end
+end
+
+---------------------------------------------------------------------------
+-- Erros
+--
+-- Mesmo contrato do parser (T86): um `{ErroDeTipo}` que atravessa a descida
+-- inteira e e escrito no lugar, porque array e referencia. O checker **nao
+-- aborta** — acumula e segue, para que um fonte com tres erros de tipo
+-- mostre os tres.
+---------------------------------------------------------------------------
+
+record ErroDeTipo
+    linha: integer
+    coluna: integer
+    msg: string
+end
+
+function registra(erros: {ErroDeTipo}, l: ast.Loc, msg: string): nil
+    erros[#erros + 1] = {linha = l.linha, coluna = l.coluna, msg = msg}
+end
+
+-- Um erro formatado na convencao do compilador em Rust (checker.rs:77) —
+-- "erro de tipo (linha L, coluna C): msg". E o que a T88 compara.
+function erro_para_texto(e: ErroDeTipo): string
+    return "erro de tipo (linha " .. e.linha .. ", coluna " .. e.coluna .. "): " .. e.msg
+end
+
+---------------------------------------------------------------------------
+-- Simbolos em pilha
+--
+-- A symtab de `symtab.lua`, com duas diferencas de mecanica impostas pela
+-- linguagem de hoje. Nenhuma das duas muda o que a symtab **e** — pilha com
+-- sombreamento e escopo de bloco —, so como ela e escrita.
+--
+-- 1. **Arrays em Titan nao encolhem.** `array_set` escreve em `1..#v` e faz
+--    append em `#v + 1`; nao ha remocao. Entao fechar um bloco nao pode ser
+--    um `pop`: cada simbolo carrega a marca `vivo`, fechar um bloco apaga a
+--    marca de tudo que entrou depois da abertura, e a busca anda **de tras
+--    para frente** ignorando os mortos. O sombreamento sai de graca — o
+--    `local x` de dentro e achado antes do `x` de fora, e volta a ser o de
+--    fora quando o bloco fecha.
+--
+-- 2. **Arrays paralelos, e nao um array de records.** A symtab seria um
+--    `{Simbolo}` se `ctx.simbolos[i].vivo = false` funcionasse; nao funciona
+--    — indexar um array que e **campo de outro record** e depois pegar um
+--    campo do elemento perde os campos do tipo, e o compilador recusa com "o
+--    record 'Simbolo' nao tem campo 'vivo'". O mesmo acesso sobre um array
+--    que e um nome (`xs[1].vivo`) passa, o que localiza o limite: e a
+--    resolucao do tipo do campo, nao a indexacao. Quatro arrays de
+--    primitivos contornam sem inventar nada, e o dia em que o limite cair
+--    eles voltam a ser um `{Simbolo}` sem que nenhuma funcao daqui mude de
+--    significado.
+---------------------------------------------------------------------------
+
+-- Como um nome entrou no escopo. Decide o que uma atribuicao a ele significa
+-- (`SymbolKind`, checker.rs:93).
+enum Especie
+    -- Funcao de topo ou builtin. Atribuir a ela e erro.
+    EspGlobal
+    -- Parametro de funcao. Atribuir e recusado nesta fase, como no
+    -- compilador em Rust: nao ha rastreio de mutabilidade de parametro, e o
+    -- Rust gerado nao compilaria.
+    EspParam
+    -- `local` e variavel de topo: atribuivel.
+    EspLocal
+    -- Variavel de controle de `for` (numerico ou `for`-in): atribuivel.
+    EspControle
+    -- Nome de modulo importado. Nao e um valor.
+    EspModulo
+end
+
+-- O contexto da checagem: tudo que as duas passadas compartilham.
+--
+-- Um record de arrays, e nao arrays soltos por parametro: seriam oito, e
+-- repeti-los em cada uma das ~40 funcoes da descida seria ruido. Os campos
+-- sao arrays **de proposito** — array e referencia em Titan, entao escrever
+-- em `ctx.erros` dentro de uma funcao chamada aparece para quem chamou, que
+-- e o mesmo mecanismo com que o parser (T86) acumula erros.
+record Contexto
+    erros: {ErroDeTipo}
+    -- A symtab, em arrays paralelos (ver a nota 2 acima). O simbolo `i` e
+    -- `(sim_nomes[i], sim_tipos[i], sim_especies[i], sim_vivos[i])`.
+    sim_nomes: {string}
+    sim_tipos: {T}
+    sim_especies: {Especie}
+    sim_vivos: {boolean}
+    -- Os campos de todos os records, numa tabela plana
+    -- `(dono, nome) -> tipo`. Plana, e nao um record com os campos dentro,
+    -- porque a busca e sempre pelas duas chaves juntas — e porque map nao
+    -- serve: ler chave ausente num map Titan **aborta** o programa
+    -- (`map_get`, titan-runtime), e "este campo existe?" e exatamente a
+    -- pergunta que o checker precisa fazer sem abortar.
+    campo_donos: {string}
+    campo_nomes: {string}
+    campo_tipos: {T}
+    -- Os nomes de record declarados, para `resolve_tipo` distinguir `Ponto`
+    -- de um nome que ninguem declarou.
+    records: {string}
+end
+
+function contexto_novo(): Contexto
+    local erros: {ErroDeTipo} = {}
+    local sim_nomes: {string} = {}
+    local sim_tipos: {T} = {}
+    local sim_especies: {Especie} = {}
+    local sim_vivos: {boolean} = {}
+    local campo_donos: {string} = {}
+    local campo_nomes: {string} = {}
+    local campo_tipos: {T} = {}
+    local records: {string} = {}
+    return {
+        erros = erros,
+        sim_nomes = sim_nomes,
+        sim_tipos = sim_tipos,
+        sim_especies = sim_especies,
+        sim_vivos = sim_vivos,
+        campo_donos = campo_donos,
+        campo_nomes = campo_nomes,
+        campo_tipos = campo_tipos,
+        records = records,
+    }
+end
+
+-- A marca de abertura de bloco: o tamanho da pilha agora.
+function abre_bloco(ctx: Contexto): integer
+    return #ctx.sim_nomes
+end
+
+-- Fecha o bloco aberto em `marca`: tudo que entrou depois dela morre.
+function fecha_bloco(ctx: Contexto, marca: integer): nil
+    local i: integer = #ctx.sim_nomes
+    while i > marca do
+        ctx.sim_vivos[i] = false
+        i = i - 1
+    end
+end
+
+function declara(ctx: Contexto, nome: string, t: T, especie: Especie): nil
+    local n: integer = #ctx.sim_nomes + 1
+    ctx.sim_nomes[n] = nome
+    ctx.sim_tipos[n] = t
+    ctx.sim_especies[n] = especie
+    ctx.sim_vivos[n] = true
+end
+
+-- O indice do simbolo vivo mais recente com este nome, ou 0.
+--
+-- De tras para frente: e o que faz o sombreamento funcionar sem a symtab ter
+-- de saber o que e um bloco.
+function indice_do_simbolo(ctx: Contexto, nome: string): integer
+    local i: integer = #ctx.sim_nomes
+    while i >= 1 do
+        if ctx.sim_vivos[i] and ctx.sim_nomes[i] == nome then
+            return i
+        end
+        i = i - 1
+    end
+    return 0
+end
+
+function existe_simbolo(ctx: Contexto, nome: string): boolean
+    return indice_do_simbolo(ctx, nome) > 0
+end
+
+-- O tipo de um nome. Um nome ausente devolve `TInvalido`, que e o tipo que
+-- nao gera erro em cascata; quem precisa distinguir "ausente" de "invalido"
+-- pergunta antes com `existe_simbolo`.
+function tipo_do_simbolo(ctx: Contexto, nome: string): T
+    local i: integer = indice_do_simbolo(ctx, nome)
+    if i == 0 then
+        return TInvalido
+    end
+    return ctx.sim_tipos[i]
+end
+
+function especie_do_simbolo(ctx: Contexto, nome: string): Especie
+    local i: integer = indice_do_simbolo(ctx, nome)
+    if i == 0 then
+        return EspLocal
+    end
+    return ctx.sim_especies[i]
+end
+
+-- **Nao ha checagem de redeclaracao dentro de uma funcao**, e a ausencia e
+-- deliberada: o compilador em Rust so reporta "'x' ja foi declarado antes."
+-- em declaracoes de **topo** (`collect_signature`, checker.rs:1577), e
+-- aceita tanto `local x` duas vezes no mesmo bloco quanto dois parametros de
+-- mesmo nome — e o sombreamento do Lua, em que a declaracao nova simplesmente
+-- esconde a anterior. A pilha daqui ja faz isso sozinha: `declara` empilha e
+-- `indice_do_simbolo` acha o mais recente.
+--
+-- A primeira versao desta tarefa recusava o caso, por parecer mais rigoroso.
+-- Rigor que o oraculo da T88 nao confirma nao e rigor, e um erro a mais que
+-- o `titanc` nao da — e a divergencia apareceria la, como falha de teste, em
+-- vez de aqui, como decisao.
+
+---------------------------------------------------------------------------
+-- Records
+---------------------------------------------------------------------------
+
+function existe_record(ctx: Contexto, nome: string): boolean
+    for r in ctx.records do
+        if r == nome then
+            return true
+        end
+    end
+    return false
+end
+
+-- O indice do campo `dono.campo` na tabela plana, ou 0.
+function indice_do_campo(ctx: Contexto, dono: string, campo: string): integer
+    local i: integer = 1
+    while i <= #ctx.campo_donos do
+        if ctx.campo_donos[i] == dono and ctx.campo_nomes[i] == campo then
+            return i
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+function declara_campo(ctx: Contexto, dono: string, campo: string, t: T): nil
+    local n: integer = #ctx.campo_donos + 1
+    ctx.campo_donos[n] = dono
+    ctx.campo_nomes[n] = campo
+    ctx.campo_tipos[n] = t
+end
+
+---------------------------------------------------------------------------
+-- Da anotacao escrita ao tipo semantico
+--
+-- `resolve_type` (checker.rs): traduz o `ast.Tipo` que o parser produziu no
+-- `T` com que o checker compara, reclamando do nome que nao designa record
+-- nenhum.
+---------------------------------------------------------------------------
+
+function resolve_tipo(ctx: Contexto, t: ast.Tipo): T
+    match t with
+        -- A anotacao que o autor nao escreveu. Quem chama decide o que fazer
+        -- com a ausencia — inferir do valor (`local x = 1`) ou reclamar —,
+        -- entao aqui ela vira `TInvalido`, que nao casa com nada e nao gera
+        -- cascata.
+        TipoAusente then return TInvalido
+        TipoNil(l) then return TNil
+        TipoBoolean(l) then return TBoolean
+        TipoInteger(l) then return TInteger
+        TipoFloat(l) then return TFloat
+        TipoString(l) then return TString
+        TipoValue(l) then return TValue
+        TipoName(l, n) then
+            if existe_record(ctx, n) then
+                return TRecord(n)
+            end
+            registra(ctx.erros, l, "tipo '" .. n .. "' desconhecido.")
+            return TInvalido
+        -- `mod.Tipo`: o tipo opaco de uma capability (`data.DataFrame`).
+        -- Esta fase aceita o `import` mas nao tipa os membros do modulo (ver
+        -- o cabecalho), entao o tipo qualificado vira `value` — o tipo que
+        -- combina com tudo — em vez de um erro que recusaria um programa
+        -- correto.
+        TipoQualName(l, modulo, n) then return TValue
+        TipoArray(l, elem) then
+            local e: T = resolve_tipo(ctx, elem)
+            return TArray(e)
+        TipoMap(l, chave, valor) then
+            local k: T = resolve_tipo(ctx, chave)
+            local v: T = resolve_tipo(ctx, valor)
+            return TMap(k, v)
+        TipoOption(l, base) then
+            local b: T = resolve_tipo(ctx, base)
+            return TOpcional(b)
+        -- O parser da T86 nao produz `TipoFunction` — nao ha sintaxe de tipo
+        -- de funcao no subconjunto. O braco existe porque o `match` e
+        -- exaustivo, e devolve `value` pela mesma razao do qualificado.
+        TipoFunction(l, params, retornos) then return TValue
+    end
+end
+
+-- Se a anotacao foi escrita (`local x: integer`) ou omitida (`local x`).
+function tipo_foi_escrito(t: ast.Tipo): boolean
+    match t with
+        TipoAusente then return false
+        _ then return true
+    end
+end
+
+---------------------------------------------------------------------------
+-- Expressoes
+--
+-- `check_exp` (checker.rs:3552) devolve o tipo de uma expressao, registrando
+-- os erros que achar pelo caminho. Duas convencoes atravessam tudo o que vem
+-- abaixo:
+--
+--   - **o tipo de um no que errou e `TInvalido`**, e `compativel` aceita
+--     `TInvalido` contra qualquer coisa. E o que faz um erro so produzir uma
+--     mensagem so: `1 + "a" + "b"` reclama do primeiro `+` e cala no
+--     segundo, em vez de dar tres mensagens sobre o mesmo engano;
+--   - **o tipo esperado desce**, como o parametro `context` que a T29
+--     acrescentou a `check_exp` no compilador em Rust. `{}` nao tem tipo
+--     proprio: `local p: Ponto = {x = 1}` e `local v: {integer} = {1}`
+--     escrevem o mesmo no, e quem decide qual dos dois e o destino.
+--     `TInvalido` como esperado quer dizer "sem contexto".
+---------------------------------------------------------------------------
+
+-- O tipo de uma expressao sem contexto de destino.
+function checa_exp(ctx: Contexto, e: ast.Exp): T
+    return checa_exp_com(ctx, e, TInvalido)
+end
+
+-- O operando de um operador aritmetico: numerico dos dois lados.
+-- `check_numeric_operands` (checker.rs:4128), inclusive na mensagem.
+function confere_numerico(ctx: Contexto, l: ast.Loc, op: string, t: T): boolean
+    if eh_numerico(t) or eh_value(t) or eh_invalido(t) then
+        return true
+    end
+    local achado: string = tipo_para_texto(t)
+    registra(ctx.erros, l, "operando de `" .. op .. "` precisa ser numérico (integer ou float), encontrado " .. achado .. ".")
+    return false
+end
+
+-- O operando de um operador bitwise: `integer` estrito, sem promocao de
+-- float (ADR 0021). Mensagem separada da numerica de proposito: ela precisa
+-- dizer `integer`, e nao "numerico".
+function confere_inteiro(ctx: Contexto, l: ast.Loc, op: string, t: T): boolean
+    if eh_value(t) or eh_invalido(t) or tipos_iguais(t, TInteger) then
+        return true
+    end
+    local achado: string = tipo_para_texto(t)
+    registra(ctx.erros, l, "operando de `" .. op .. "` precisa ser integer, encontrado " .. achado .. ".")
+    return false
+end
+
+function confere_boolean(ctx: Contexto, l: ast.Loc, op: string, t: T): boolean
+    if eh_value(t) or eh_invalido(t) or tipos_iguais(t, TBoolean) then
+        return true
+    end
+    local achado: string = tipo_para_texto(t)
+    registra(ctx.erros, l, "operando de `" .. op .. "` precisa ser boolean, encontrado " .. achado .. ".")
+    return false
+end
+
+-- Os operadores, agrupados pela regra de tipo que os rege. Cada grupo e uma
+-- funcao de predicado, e nao um `enum BinOp` com `from_source`: o parser
+-- entrega o operador como `string` (ast.rs faz o mesmo), e o que o checker
+-- precisa saber dele e so em qual dos seis grupos ele cai.
+function eh_op_aritmetico(op: string): boolean
+    return op == "+" or op == "-" or op == "*" or op == "%" or op == "//"
+end
+
+-- `/` e `^` promovem a float mesmo com os dois lados integer
+-- (`checker.lua:975-994`).
+function eh_op_de_divisao(op: string): boolean
+    return op == "/" or op == "^"
+end
+
+function eh_op_de_igualdade(op: string): boolean
+    return op == "==" or op == "~="
+end
+
+function eh_op_de_ordem(op: string): boolean
+    return op == "<" or op == ">" or op == "<=" or op == ">="
+end
+
+function eh_op_logico(op: string): boolean
+    return op == "and" or op == "or"
+end
+
+function eh_op_bitwise(op: string): boolean
+    return op == "&" or op == "|" or op == "~" or op == "<<" or op == ">>"
+end
+
+-- `check_binop` (checker.rs:3986), grupo a grupo.
+function checa_binop(ctx: Contexto, l: ast.Loc, op: string, esq: ast.Exp, dir: ast.Exp): T
+    local te: T = checa_exp(ctx, esq)
+    local td: T = checa_exp(ctx, dir)
+    -- As duas posicoes vao para `local` em vez de entrar encaixadas na
+    -- chamada de `confere_*`: uma chamada que devolve composto so vale como
+    -- argumento de outra depois de passar por um nome (ADR 0007), e
+    -- encaixada ela faz o codegen emitir um `&mut` sobre um temporario e o
+    -- rustc reclamar em ingles. E o mesmo contorno que o parser (T86) faz nos
+    -- sufixos e selfhost/main.titan na construcao da arvore.
+    --
+    -- Elas apontam o **operando culpado**, e nao o operador: em `1 + "a"` a
+    -- mensagem sai na coluna do `"a"`, como no compilador em Rust.
+    local l_esq: ast.Loc = ast.loc_da_exp(esq)
+    local l_dir: ast.Loc = ast.loc_da_exp(dir)
+
+    if eh_op_aritmetico(op) then
+        local ok_e: boolean = confere_numerico(ctx, l_esq, op, te)
+        local ok_d: boolean = confere_numerico(ctx, l_dir, op, td)
+        if not ok_e or not ok_d then
+            return TInvalido
+        end
+        return resultado_numerico(te, td)
+    end
+
+    if eh_op_de_divisao(op) then
+        local ok_e: boolean = confere_numerico(ctx, l_esq, op, te)
+        local ok_d: boolean = confere_numerico(ctx, l_dir, op, td)
+        if not ok_e or not ok_d then
+            return TInvalido
+        end
+        return TFloat
+    end
+
+    -- Igualdade: numero com numero (com promocao), ou duas strings, ou dois
+    -- booleans. `Ponto == Ponto` nao entra — records sao nominais e a
+    -- igualdade estrutural nao existe nesta fase.
+    if eh_op_de_igualdade(op) then
+        local ambos_num: boolean = eh_numerico(te) and eh_numerico(td)
+        local mesmo_primitivo: boolean = tipos_iguais(te, td)
+            and (tipos_iguais(te, TString) or tipos_iguais(te, TBoolean))
+        local com_value: boolean = eh_value(te) or eh_value(td)
+        local com_invalido: boolean = eh_invalido(te) or eh_invalido(td)
+        if ambos_num or mesmo_primitivo or com_value or com_invalido then
+            return TBoolean
+        end
+        local a: string = tipo_para_texto(te)
+        local b: string = tipo_para_texto(td)
+        registra(ctx.erros, l, "não é possível comparar " .. a .. " com " .. b .. " usando `" .. op .. "`.")
+        return TInvalido
+    end
+
+    -- Ordem: numero com numero (com promocao) ou string com string — nunca
+    -- boolean (`checker.lua:1010-1043`).
+    if eh_op_de_ordem(op) then
+        local ambos_num: boolean = eh_numerico(te) and eh_numerico(td)
+        local ambas_str: boolean = tipos_iguais(te, TString) and tipos_iguais(td, TString)
+        local com_value: boolean = eh_value(te) or eh_value(td)
+        local com_invalido: boolean = eh_invalido(te) or eh_invalido(td)
+        if ambos_num or ambas_str or com_value or com_invalido then
+            return TBoolean
+        end
+        local a: string = tipo_para_texto(te)
+        local b: string = tipo_para_texto(td)
+        registra(ctx.erros, l, "`" .. op .. "` compara número com número ou string com string, encontrado " .. a .. " e " .. b .. ".")
+        return TInvalido
+    end
+
+    -- Decisao 7 da Fase 1: `and`/`or` sao boolean estrito nos dois lados e
+    -- produzem boolean. Divergencia deliberada do truthy/falsy do Lua.
+    if eh_op_logico(op) then
+        local ok_e: boolean = confere_boolean(ctx, l_esq, op, te)
+        local ok_d: boolean = confere_boolean(ctx, l_dir, op, td)
+        if not ok_e or not ok_d then
+            return TInvalido
+        end
+        return TBoolean
+    end
+
+    if eh_op_bitwise(op) then
+        local ok_e: boolean = confere_inteiro(ctx, l_esq, op, te)
+        local ok_d: boolean = confere_inteiro(ctx, l_dir, op, td)
+        if not ok_e or not ok_d then
+            return TInvalido
+        end
+        return TInteger
+    end
+
+    registra(ctx.erros, l, "operador `" .. op .. "` não é suportado nesta fase.")
+    return TInvalido
+end
+
+-- `check_unop` (checker.rs:4279): `-`, `not`, `#` e `~`.
+function checa_unop(ctx: Contexto, l: ast.Loc, op: string, sub: ast.Exp): T
+    local t: T = checa_exp(ctx, sub)
+    local l_sub: ast.Loc = ast.loc_da_exp(sub)
+    if op == "-" then
+        if eh_numerico(t) or eh_value(t) or eh_invalido(t) then
+            return t
+        end
+        local achado: string = tipo_para_texto(t)
+        registra(ctx.erros, l_sub, "operando de `-` unário precisa ser numérico (integer ou float), encontrado " .. achado .. ".")
+        return TInvalido
+    end
+    if op == "not" then
+        if confere_boolean(ctx, l_sub, "not", t) then
+            return TBoolean
+        end
+        return TInvalido
+    end
+    if op == "~" then
+        if confere_inteiro(ctx, l_sub, "~", t) then
+            return TInteger
+        end
+        return TInvalido
+    end
+    if op == "#" then
+        -- `#` vale sobre array e sobre string, e sobre mais nada — map nao
+        -- tem tamanho no Titan.
+        match t with
+            TArray(elem) then return TInteger
+            TString then return TInteger
+            TValue then return TInteger
+            TInvalido then return TInvalido
+            _ then
+                local achado: string = tipo_para_texto(t)
+                registra(ctx.erros, l_sub, "`#` espera um array ou string, encontrado " .. achado .. ".")
+                return TInvalido
+        end
+    end
+    registra(ctx.erros, l, "operador unário `" .. op .. "` não é suportado nesta fase.")
+    return TInvalido
+end
+
+-- `..` (checker.rs:3581): cada operando precisa ser string, integer ou
+-- float, e o resultado e sempre string. Decisao 4 da Fase 1 — o numero e
+-- coagido a texto, o boolean nao.
+function checa_concat(ctx: Contexto, partes: {ast.Exp}): T
+    local ok: boolean = true
+    for p in partes do
+        local t: T = checa_exp(ctx, p)
+        local aceita: boolean = tipos_iguais(t, TString) or eh_numerico(t)
+            or eh_value(t) or eh_invalido(t)
+        if not aceita then
+            local achado: string = tipo_para_texto(t)
+            local l: ast.Loc = ast.loc_da_exp(p)
+            registra(ctx.erros, l, "operando de `..` precisa ser string, integer ou float, encontrado " .. achado .. ".")
+            ok = false
+        end
+    end
+    if not ok then
+        return TInvalido
+    end
+    return TString
+end
+
+---------------------------------------------------------------------------
+-- Lugares: nome, indice e campo
+---------------------------------------------------------------------------
+
+-- Se a expressao e o nome nu de um modulo importado — o `texto` de
+-- `texto.tamanho(s)`. Precisa ser perguntado **antes** de tipar a base de um
+-- `.`, porque um modulo nao tem tipo e tipa-lo daria "'texto' nao foi
+-- declarado" onde o programa esta certo.
+function eh_nome_de_modulo(ctx: Contexto, e: ast.Exp): boolean
+    match e with
+        ExpVar(l, v) then
+            match v with
+                VarName(lv, n) then
+                    if not existe_simbolo(ctx, n) then
+                        return false
+                    end
+                    match especie_do_simbolo(ctx, n) with
+                        EspModulo then return true
+                        _ then return false
+                    end
+                _ then return false
+            end
+        _ then return false
+    end
+end
+
+-- `check_var` (checker.rs:4375): o tipo de um lugar.
+function checa_var(ctx: Contexto, v: ast.Var): T
+    match v with
+        VarName(l, n) then
+            if not existe_simbolo(ctx, n) then
+                registra(ctx.erros, l, "'" .. n .. "' não foi declarado.")
+                return TInvalido
+            end
+            match especie_do_simbolo(ctx, n) with
+                EspModulo then
+                    registra(ctx.erros, l, "'" .. n .. "' é um módulo, não um valor.")
+                    return TInvalido
+                _ then return tipo_do_simbolo(ctx, n)
+            end
+        VarBracket(l, base, indice) then
+            local tb: T = checa_exp(ctx, base)
+            local ti: T = checa_exp(ctx, indice)
+            -- As duas posicoes que as mensagens daqui usam, e cada uma
+            -- aponta o que ela acusa: o indice errado sai na coluna do
+            -- indice, e "nao e possivel indexar" na coluna da base — que e
+            -- o que esta errado quando o que se indexa nao e indexavel.
+            local l_indice: ast.Loc = ast.loc_da_exp(indice)
+            local l_base: ast.Loc = ast.loc_da_exp(base)
+            match tb with
+                -- Array: o indice e integer e o resultado e o elemento.
+                -- Decisao 3 da T29 — o resultado e `T`, e nao `T?`: ler
+                -- fora da faixa aborta em runtime, com mensagem em
+                -- portugues, em vez de devolver ausencia.
+                TArray(elem) then
+                    if not tipos_iguais(ti, TInteger) and not eh_value(ti) and not eh_invalido(ti) then
+                        local achado: string = tipo_para_texto(ti)
+                        registra(ctx.erros, l_indice, "índice incompatível: esperado integer, encontrado " .. achado .. ".")
+                        return TInvalido
+                    end
+                    return elem
+                -- Map: o indice e a chave declarada e o resultado e o valor.
+                TMap(chave, valor) then
+                    if not compativel(chave, ti) then
+                        local esperado: string = tipo_para_texto(chave)
+                        local achado: string = tipo_para_texto(ti)
+                        registra(ctx.erros, l_indice, "índice incompatível: esperado " .. esperado .. ", encontrado " .. achado .. ".")
+                        return TInvalido
+                    end
+                    return valor
+                TValue then return TValue
+                TInvalido then return TInvalido
+                -- String indexada com `[]` tem mensagem propria no compilador
+                -- em Rust, e nao a generica: `s[1]` e um engano comum o
+                -- bastante (em Lua funciona) para merecer o "nesta fase" que
+                -- diz que a ausencia e temporaria. Quem quer o byte usa
+                -- `texto.byte`.
+                TString then
+                    registra(ctx.erros, l_base, "não é possível indexar uma string com `[]` nesta fase.")
+                    return TInvalido
+                _ then
+                    local achado: string = tipo_para_texto(tb)
+                    registra(ctx.erros, l_base, "não é possível indexar " .. achado .. ".")
+                    return TInvalido
+            end
+        VarDot(l, base, campo) then
+            -- `texto.tamanho` e `data.DataFrame`: o membro de um modulo. Esta
+            -- fase nao tipa os membros (ver o cabecalho), entao ele e
+            -- `value` — o tipo que combina com tudo — em vez de um erro que
+            -- recusaria um programa correto.
+            if eh_nome_de_modulo(ctx, base) then
+                return TValue
+            end
+            local tb: T = checa_exp(ctx, base)
+            match tb with
+                TRecord(dono) then
+                    local i: integer = indice_do_campo(ctx, dono, campo)
+                    if i == 0 then
+                        registra(ctx.erros, l, "o record '" .. dono .. "' não tem campo '" .. campo .. "'.")
+                        return TInvalido
+                    end
+                    return ctx.campo_tipos[i]
+                TValue then return TValue
+                TInvalido then return TInvalido
+                _ then
+                    local achado: string = tipo_para_texto(tb)
+                    registra(ctx.erros, l, "só é possível acessar campo de um record, encontrado " .. achado .. ".")
+                    return TInvalido
+            end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Chamadas
+---------------------------------------------------------------------------
+
+-- O nome escrito no callee, para a mensagem de erro. Vazio quando a chamada
+-- nao e por nome (`f()[1]()`, que o subconjunto nao produz).
+function nome_do_callee(e: ast.Exp): string
+    match e with
+        ExpVar(l, v) then
+            match v with
+                VarName(lv, n) then return n
+                VarDot(lv, base, campo) then return campo
+                _ then return ""
+            end
+        _ then return ""
+    end
+end
+
+-- Se o callee e um nome nu (`f(...)`), e nao um campo ou um indice. E a
+-- forma que `resolve_callee` trata como "chamada de funcao por nome", e a
+-- unica em que "funcao 'f' nao foi declarada" e a mensagem certa.
+function eh_callee_nu(e: ast.Exp): boolean
+    match e with
+        ExpVar(l, v) then
+            match v with
+                VarName(lv, n) then return true
+                _ then return false
+            end
+        _ then return false
+    end
+end
+
+-- As expressoes de argumento, tiradas do `Args`. `ArgsMethod` esta fora do
+-- subconjunto do parser (T86), mas o `match` e exaustivo e o braco tem de
+-- existir: ele devolve os argumentos escritos, que e o que ha de mais util a
+-- fazer com uma forma que nao chega aqui.
+function exps_dos_args(a: ast.Args): {ast.Exp}
+    match a with
+        ArgsFunc(l, exps) then return exps
+        ArgsMethod(l, metodo, exps) then return exps
+    end
+end
+
+-- `check_call` (checker.rs:4738): aridade primeiro, tipo de cada argumento
+-- depois.
+--
+-- Devolve o **primeiro** tipo de retorno, que e o tipo da chamada em posicao
+-- de expressao. Multi-retorno (`local a, b = f()`, T65-T67) esta fora do
+-- subconjunto desta fase: o parser produz a arvore, e o checker aqui confere
+-- so o primeiro valor.
+function checa_chamada(ctx: Contexto, l: ast.Loc, callee: ast.Exp, args: ast.Args): T
+    local argumentos: {ast.Exp} = exps_dos_args(args)
+    local nome: string = nome_do_callee(callee)
+
+    -- Chamada de membro de modulo (`texto.tamanho(s)`): os argumentos sao
+    -- tipados — um erro dentro deles continua sendo erro — mas a assinatura
+    -- nao e conhecida nesta fase, entao o retorno e `value`.
+    match callee with
+        ExpVar(lc, v) then
+            match v with
+                VarDot(lv, base, campo) then
+                    if eh_nome_de_modulo(ctx, base) then
+                        for a in argumentos do
+                            local ta: T = checa_exp(ctx, a)
+                        end
+                        return TValue
+                    end
+                _ then
+            end
+        _ then
+    end
+
+    -- Chamada de um nome que ninguem declarou. A mensagem e a de
+    -- `resolve_callee` (checker.rs:4543) — "funcao 'f' nao foi declarada", e
+    -- nao a generica de nome — e sai na posicao da **chamada**, nao na do
+    -- nome. E uma distincao que vale: quem escreve `nao_existe(3)` errou uma
+    -- funcao, e a mensagem que fala de funcao manda procurar no lugar certo.
+    if nome ~= "" and eh_callee_nu(callee) and not existe_simbolo(ctx, nome) then
+        for a in argumentos do
+            local ta: T = checa_exp(ctx, a)
+        end
+        registra(ctx.erros, l, "função '" .. nome .. "' não foi declarada.")
+        return TInvalido
+    end
+
+    local tf: T = checa_exp(ctx, callee)
+    match tf with
+        TFuncao(params, retornos) then
+            -- Os argumentos sao tipados **antes** da conferencia de aridade,
+            -- para que um erro dentro de um argumento saia mesmo quando a
+            -- contagem ja esta errada.
+            local tipos_dos_args: {T} = {}
+            local i: integer = 1
+            while i <= #argumentos do
+                local ta: T = checa_exp_com(ctx, argumentos[i], tipo_ou_invalido(params, i))
+                tipos_dos_args[i] = ta
+                i = i + 1
+            end
+            if #tipos_dos_args ~= #params then
+                registra(ctx.erros, l, "'" .. nome .. "' espera " .. #params .. " argumento(s), mas recebeu " .. #tipos_dos_args .. ".")
+                return TInvalido
+            end
+            local j: integer = 1
+            while j <= #params do
+                if not cabe_no_destino(params[j], tipos_dos_args[j]) then
+                    local esperado: string = tipo_para_texto(params[j])
+                    local achado: string = tipo_para_texto(tipos_dos_args[j])
+                    local l_arg: ast.Loc = ast.loc_da_exp(argumentos[j])
+                    registra(ctx.erros, l_arg, "argumento incompatível em chamada de '" .. nome .. "': esperado " .. esperado .. ", encontrado " .. achado .. ".")
+                    return TInvalido
+                end
+                j = j + 1
+            end
+            if #retornos == 0 then
+                return TNil
+            end
+            return retornos[1]
+        TValue then
+            for a in argumentos do
+                local ta: T = checa_exp(ctx, a)
+            end
+            return TValue
+        TInvalido then
+            for a in argumentos do
+                local ta: T = checa_exp(ctx, a)
+            end
+            return TInvalido
+        _ then
+            for a in argumentos do
+                local ta: T = checa_exp(ctx, a)
+            end
+            registra(ctx.erros, l, "'" .. nome .. "' não é uma função.")
+            return TInvalido
+    end
+end
+
+-- O `i`-esimo tipo de uma lista, ou `TInvalido` quando a lista e curta — o
+-- "sem contexto" que `checa_exp_com` entende. E o que deixa a aridade errada
+-- ser reportada pela conferencia de aridade, e nao por um estouro de indice.
+function tipo_ou_invalido(ts: {T}, i: integer): T
+    if i > #ts then
+        return TInvalido
+    end
+    return ts[i]
+end
+
+---------------------------------------------------------------------------
+-- O literal `{...}`
+--
+-- `check_init_list`: o mesmo no serve para array, map e record, e quem
+-- decide e o **tipo esperado** — a razao de `checa_exp_com` existir. Sem
+-- contexto, `{}` nao tem como ser tipado, e o erro diz isso.
+---------------------------------------------------------------------------
+
+-- O nome escrito num campo de literal, ou "" para o campo posicional.
+function nome_do_campo(c: ast.Campo): string
+    match c.nome with
+        NomeAusente then return ""
+        NomeChave(n) then return n
+        -- `{["parafuso"] = 0.5}`: a chave e uma expressao, que e a forma do
+        -- literal de **map**. O nome nao existe; quem trata e o braco de map
+        -- de `checa_initlist`, que olha `c.nome` de novo.
+        NomeExp(e) then return ""
+    end
+end
+
+function campo_tem_chave_exp(c: ast.Campo): boolean
+    match c.nome with
+        NomeExp(e) then return true
+        _ then return false
+    end
+end
+
+function chave_exp_do_campo(c: ast.Campo, padrao: ast.Exp): ast.Exp
+    match c.nome with
+        NomeExp(e) then return e
+        _ then return padrao
+    end
+end
+
+function checa_initlist(ctx: Contexto, l: ast.Loc, campos: {ast.Campo}, esperado: T): T
+    match esperado with
+        -- `{1, 2, 3}`: todo campo e posicional e do tipo do elemento.
+        TArray(elem) then
+            for c in campos do
+                if nome_do_campo(c) ~= "" or campo_tem_chave_exp(c) then
+                    registra(ctx.erros, c.loc, "um literal de array não leva campo nomeado.")
+                else
+                    local t: T = checa_exp_com(ctx, c.exp, elem)
+                    if not compativel(elem, t) then
+                        local esp: string = tipo_para_texto(elem)
+                        local achado: string = tipo_para_texto(t)
+                        registra(ctx.erros, c.loc, "elemento do array incompatível: esperado " .. esp .. ", encontrado " .. achado .. ".")
+                    end
+                end
+            end
+            return esperado
+        -- `{["a"] = 1}`: todo campo tem chave entre colchetes.
+        TMap(chave, valor) then
+            for c in campos do
+                if not campo_tem_chave_exp(c) then
+                    registra(ctx.erros, c.loc, "um literal de map precisa de chave entre colchetes (`{[k] = v}`).")
+                else
+                    local padrao: ast.Exp = c.exp
+                    local k: ast.Exp = chave_exp_do_campo(c, padrao)
+                    local tk: T = checa_exp_com(ctx, k, chave)
+                    if not compativel(chave, tk) then
+                        local esp: string = tipo_para_texto(chave)
+                        local achado: string = tipo_para_texto(tk)
+                        registra(ctx.erros, c.loc, "chave de map incompatível: esperado " .. esp .. ", encontrado " .. achado .. ".")
+                    end
+                    local tv: T = checa_exp_com(ctx, c.exp, valor)
+                    if not compativel(valor, tv) then
+                        local esp: string = tipo_para_texto(valor)
+                        local achado: string = tipo_para_texto(tv)
+                        registra(ctx.erros, c.loc, "valor de map incompatível: esperado " .. esp .. ", encontrado " .. achado .. ".")
+                    end
+                end
+            end
+            return esperado
+        -- `{x = 1, y = 2}`: todo campo e nomeado e o nome tem de existir no
+        -- record. A conferencia e nos dois sentidos — campo que nao existe e
+        -- campo do record que o literal nao preencheu.
+        TRecord(dono) then
+            local escritos: {string} = {}
+            for c in campos do
+                local n: string = nome_do_campo(c)
+                if n == "" then
+                    registra(ctx.erros, c.loc, "um literal de record precisa de campos nomeados (`{nome = valor}`).")
+                else
+                    local i: integer = indice_do_campo(ctx, dono, n)
+                    if i == 0 then
+                        registra(ctx.erros, c.loc, "campo '" .. n .. "' não existe no record '" .. dono .. "'.")
+                    else
+                        local tc: T = ctx.campo_tipos[i]
+                        local t: T = checa_exp_com(ctx, c.exp, tc)
+                        if not compativel(tc, t) then
+                            local esp: string = tipo_para_texto(tc)
+                            local achado: string = tipo_para_texto(t)
+                            registra(ctx.erros, c.loc, "campo '" .. n .. "' incompatível: esperado " .. esp .. ", encontrado " .. achado .. ".")
+                        end
+                        escritos[#escritos + 1] = n
+                    end
+                end
+            end
+            local j: integer = 1
+            while j <= #ctx.campo_donos do
+                if ctx.campo_donos[j] == dono then
+                    local nome_esperado: string = ctx.campo_nomes[j]
+                    local achou: boolean = false
+                    for w in escritos do
+                        if w == nome_esperado then
+                            achou = true
+                        end
+                    end
+                    if not achou then
+                        registra(ctx.erros, l, "falta o campo '" .. nome_esperado .. "' no construtor de '" .. dono .. "'.")
+                    end
+                end
+                j = j + 1
+            end
+            return esperado
+        -- `value` aceita o literal como esta: os campos sao tipados para que
+        -- um erro dentro deles ainda saia, e o resultado sobe ao topo do
+        -- gradual typing.
+        TValue then
+            for c in campos do
+                local t: T = checa_exp(ctx, c.exp)
+            end
+            return TValue
+        _ then
+            for c in campos do
+                local t: T = checa_exp(ctx, c.exp)
+            end
+            registra(ctx.erros, l, "não é possível saber o tipo deste `{...}`: escreva a anotação no destino.")
+            return TInvalido
+    end
+end
+
+---------------------------------------------------------------------------
+-- `as`
+--
+-- `check_cast` (checker.rs): tres familias passam — `integer` <-> `float`,
+-- qualquer tipo -> `value`, e `value` -> qualquer tipo. O resto e erro com a
+-- mensagem que diz o que o `as` **nao** faz: `"a" as integer` nao parseia a
+-- string.
+---------------------------------------------------------------------------
+
+function checa_cast(ctx: Contexto, l: ast.Loc, sub: ast.Exp, alvo: ast.Tipo): T
+    local destino: T = resolve_tipo(ctx, alvo)
+    local origem: T = checa_exp_com(ctx, sub, destino)
+    if eh_invalido(origem) or eh_invalido(destino) then
+        return destino
+    end
+    if tipos_iguais(origem, destino) then
+        return destino
+    end
+    if eh_value(origem) or eh_value(destino) then
+        return destino
+    end
+    if eh_numerico(origem) and eh_numerico(destino) then
+        return destino
+    end
+    local a: string = tipo_para_texto(origem)
+    local b: string = tipo_para_texto(destino)
+    registra(ctx.erros, l, "não existe cast de " .. a .. " para " .. b .. ": `as` converte entre números (`integer`/`float`) e de/para `value`, não interpreta texto nem reinterpreta compostos.")
+    return TInvalido
+end
+
+---------------------------------------------------------------------------
+-- `check_exp`: a expressao inteira
+---------------------------------------------------------------------------
+
+function checa_exp_com(ctx: Contexto, e: ast.Exp, esperado: T): T
+    match e with
+        ExpNil(l) then return TNil
+        ExpBool(l, v) then return TBoolean
+        ExpInteger(l, v) then return TInteger
+        ExpFloat(l, v) then return TFloat
+        ExpString(l, v) then return TString
+        ExpInitList(l, campos) then
+            local t: T = checa_initlist(ctx, l, campos, esperado)
+            return t
+        ExpCall(l, f, args) then
+            local t: T = checa_chamada(ctx, l, f, args)
+            return t
+        ExpVar(l, v) then
+            local t: T = checa_var(ctx, v)
+            return t
+        ExpUnop(l, op, sub) then
+            local t: T = checa_unop(ctx, l, op, sub)
+            return t
+        ExpConcat(l, partes) then
+            local t: T = checa_concat(ctx, partes)
+            return t
+        ExpBinop(l, op, esq, dir) then
+            local t: T = checa_binop(ctx, l, op, esq, dir)
+            return t
+        ExpCast(l, sub, alvo) then
+            local t: T = checa_cast(ctx, l, sub, alvo)
+            return t
+        -- `(f())` ajusta uma chamada de varios retornos para o primeiro
+        -- valor (T65). O tipo e o de dentro; o ajuste e assunto do codegen.
+        ExpAdjust(l, sub) then
+            local t: T = checa_exp_com(ctx, sub, esperado)
+            return t
+        -- Os dois nos que o parser da T86 nao produz. Os bracos existem
+        -- porque o `match` e exaustivo — e essa e a garantia que a T76
+        -- entregou: quando o subconjunto crescer, esquecer um deles vira
+        -- erro de compilacao aqui, em portugues, e nao um caso que cai no
+        -- `else`.
+        ExpExtra(l, sub, indice, anotado) then
+            local t: T = checa_exp(ctx, sub)
+            return TValue
+        ExpMatch(l, escrutinado, bracos) then
+            local t: T = checa_exp(ctx, escrutinado)
+            registra(ctx.erros, l, "`match` em posição de expressão está fora do subconjunto desta fase.")
+            return TInvalido
+    end
+end
+
+---------------------------------------------------------------------------
+-- Comandos
+--
+-- `check_stat` (checker.rs:2130). Dois valores descem por toda a arvore de
+-- comandos, e sao parametros em vez de campos do `Contexto` porque sao do
+-- **corpo corrente**, e nao do programa: os tipos de retorno da funcao que
+-- esta sendo checada, e a profundidade de laco que decide se um `break` e
+-- legitimo.
+---------------------------------------------------------------------------
+
+-- O alvo de uma atribuicao: que tipo ele tem e se pode receber.
+--
+-- `check_assign_target` (checker.rs:3054). Devolve `TInvalido` quando o
+-- alvo nao e atribuivel, depois de registrar o erro — a atribuicao segue
+-- tipando o valor, para que `f = g(1 + "a")` reclame das duas coisas.
+function checa_alvo(ctx: Contexto, v: ast.Var): T
+    match v with
+        VarName(l, n) then
+            if not existe_simbolo(ctx, n) then
+                registra(ctx.erros, l, "'" .. n .. "' não foi declarado.")
+                return TInvalido
+            end
+            match especie_do_simbolo(ctx, n) with
+                EspGlobal then
+                    registra(ctx.erros, l, "não é possível atribuir a uma função.")
+                    return TInvalido
+                EspModulo then
+                    registra(ctx.erros, l, "não é possível atribuir ao módulo '" .. n .. "'.")
+                    return TInvalido
+                -- Parametro: o compilador em Rust recusa nesta fase porque
+                -- nao rastreia mutabilidade de parametro, e o Rust gerado
+                -- nao compilaria. A mesma recusa, com a mesma mensagem.
+                EspParam then
+                    registra(ctx.erros, l, "não é possível atribuir ao parâmetro '" .. n .. "' nesta fase.")
+                    return TInvalido
+                _ then return tipo_do_simbolo(ctx, n)
+            end
+        -- `v[i] = e` e `r.c = e`: o alvo e o mesmo lugar que a leitura, e a
+        -- checagem e a mesma — inclusive a de que a base existe.
+        _ then
+            local t: T = checa_var(ctx, v)
+            return t
+    end
+end
+
+-- O nome escrito num alvo de atribuicao, para a mensagem de erro; "" quando
+-- o alvo e um indice ou um campo.
+function nome_do_alvo(v: ast.Var): string
+    match v with
+        VarName(l, n) then return n
+        _ then return ""
+    end
+end
+
+-- A mensagem de atribuicao incompativel, com ou sem o nome do destino
+-- (`coerce_assign_value`, checker.rs:3186).
+function erro_de_atribuicao(ctx: Contexto, l: ast.Loc, nome: string, esperado: T, achado: T): nil
+    local esp: string = tipo_para_texto(esperado)
+    local ach: string = tipo_para_texto(achado)
+    if nome == "" then
+        registra(ctx.erros, l, "atribuição incompatível: esperado " .. esp .. ", encontrado " .. ach .. ".")
+    else
+        registra(ctx.erros, l, "atribuição incompatível para '" .. nome .. "': esperado " .. esp .. ", encontrado " .. ach .. ".")
+    end
+end
+
+-- `local x: T = e` e `local x, y = a, b` (`check_decl_multi`,
+-- checker.rs:3321).
+--
+-- A anotacao decide o tipo quando ha uma; sem ela, o tipo e o do valor —
+-- e `local x` sem valor nenhum nao tem de onde inferir, o que e o erro que
+-- o parser (T86) deixou de proposito para este ponto.
+--
+-- **Divergencia deliberada do compilador em Rust, e a T88 precisa sabe-la:**
+-- uma declaracao que erra o tipo **entra no escopo assim mesmo**, com o tipo
+-- anotado. No `titanc`, `check_stat` devolve `None` e o simbolo nao entra, o
+-- que faz cada uso posterior do nome dar um segundo erro — num fonte com
+-- `local x: integer = "a"` seguido de tres usos de `x`, ele reporta quatro
+-- coisas para um engano so. Aqui o nome existe com o tipo que o autor
+-- escreveu, que e a hipotese mais util: o erro sai uma vez, e os usos
+-- seguintes sao conferidos contra o tipo pretendido. O conjunto de erros e
+-- um **subconjunto** do de la, nunca um erro que la nao exista.
+function checa_decl(ctx: Contexto, l: ast.Loc, decls: {ast.Decl}, exps: {ast.Exp}): nil
+    -- Os tipos sao decididos primeiro e os nomes entram no escopo depois,
+    -- e nao um par de cada vez: em Titan, como em Lua, o lado direito de um
+    -- `local` enxerga o escopo de **fora** da declaracao. `local x = x` le o
+    -- `x` externo, e `local a, b = b, a` troca os dois.
+    local tipos: {T} = {}
+    -- `#decls` num `local` antes do laco: passa-lo junto com `decls[i]` na
+    -- mesma chamada faz o codegen emitir um `&mut decls` para o elemento e
+    -- um `&decls` para o `array_len`, e o rustc recusa em ingles. E o mesmo
+    -- ADR 0007 que o parser (T86) contorna com `local` nos sufixos.
+    local quantos: integer = #decls
+    local i: integer = 1
+    while i <= quantos do
+        local d: ast.Decl = decls[i]
+        tipos[i] = tipo_de_um_decl(ctx, d, exps, i, quantos)
+        i = i + 1
+    end
+
+    -- A contagem, com a mensagem que o compilador em Rust da para a forma
+    -- multipla (`check_multi_values`, checker.rs:3499). Para a declaracao de
+    -- um nome so a contagem ja foi tratada em `tipo_de_um_decl`, que sabe
+    -- dizer qual nome ficou sem valor.
+    if #decls > 1 and #exps ~= #decls then
+        registra(ctx.erros, l, "declaração múltipla com " .. #decls .. " alvo(s), mas " .. #exps .. " valor(es) à direita.")
+    end
+    local extras: integer = #decls + 1
+    while extras <= #exps do
+        local sobra: T = checa_exp(ctx, exps[extras])
+        extras = extras + 1
+    end
+
+    local j: integer = 1
+    while j <= #decls do
+        local d: ast.Decl = decls[j]
+        local nome: string = "" .. d.nome
+        declara(ctx, nome, tipos[j], EspLocal)
+        j = j + 1
+    end
+end
+
+-- O tipo de um nome declarado: o anotado quando ha anotacao, o do valor
+-- quando nao ha. Registra o erro de incompatibilidade e o de valor faltando.
+function tipo_de_um_decl(ctx: Contexto, d: ast.Decl, exps: {ast.Exp}, i: integer, quantos: integer): T
+    -- O `"" ..` copia a string em vez de move-la. Ler um campo `string` de
+    -- um record que veio por parametro e um *move* no Rust emitido, e ler o
+    -- mesmo campo duas vezes faz o rustc recusar em ingles ("borrow of moved
+    -- value"). E o mesmo contorno de `lexeme` no parser (T86) — limite do
+    -- codegen, nao da gramatica.
+    local nome: string = "" .. d.nome
+    local escrito: boolean = tipo_foi_escrito(d.tipo)
+    local anotado: T = resolve_tipo(ctx, d.tipo)
+
+    if i > #exps then
+        -- `local x: integer` **sem inicializador**, que o parser da T86
+        -- aceita de proposito ("o checker decide se aceita") e que o checker
+        -- recusa: no Titan toda declaracao inicializa. O compilador em Rust
+        -- recusa isto na sintaxe, com "Esperava '=' apos a declaracao da
+        -- variavel" (parser.rs) — as duas implementacoes concordam no
+        -- veredito e divergem em **qual fase** o da, o que e natural: o
+        -- parser da T86 e mais permissivo por desenho, e cada coisa que ele
+        -- deixa passar tem de ser recusada aqui, ou o pipeline aceitaria o
+        -- que o `titanc` recusa. A T88 compara o desfecho, nao a fase.
+        --
+        -- Na forma multipla a contagem ja e reportada por quem chamou, com
+        -- a mensagem propria dela; aqui so o tipo importa.
+        if quantos == 1 then
+            registra(ctx.erros, d.loc, "'" .. nome .. "' precisa de um valor inicial: toda declaração em Titan inicializa.")
+        end
+        return anotado
+    end
+
+    local valor: T = checa_exp_com(ctx, exps[i], anotado)
+    if not escrito then
+        return valor
+    end
+    if not cabe_no_destino(anotado, valor) then
+        local esp: string = tipo_para_texto(anotado)
+        local ach: string = tipo_para_texto(valor)
+        if quantos == 1 then
+            registra(ctx.erros, d.loc, "tipos incompatíveis na declaração de '" .. nome .. "': esperado " .. esp .. ", encontrado " .. ach .. ".")
+        else
+            -- A forma multipla nomeia o **alvo**, e nao o nome, e aponta a
+            -- posicao do **valor**, e nao a da declaracao: e a mensagem de
+            -- `check_multi_values` (checker.rs:3482), onde o lado direito
+            -- pode ser uma chamada de varios retornos — falar do nome, ou
+            -- apontar o `local`, esconderia de qual valor se trata.
+            local l_valor: ast.Loc = ast.loc_da_exp(exps[i])
+            registra(ctx.erros, l_valor, "tipos incompatíveis no " .. i .. "º alvo da declaração múltipla: esperado " .. esp .. ", encontrado " .. ach .. ".")
+        end
+    end
+    return anotado
+end
+
+-- `a = e` e `a, b = x, y` (`check_assign`/`check_assign_multi`).
+function checa_assign(ctx: Contexto, l: ast.Loc, vars: {ast.Var}, exps: {ast.Exp}): nil
+    local i: integer = 1
+    while i <= #vars do
+        local alvo: T = checa_alvo(ctx, vars[i])
+        if i <= #exps then
+            local valor: T = checa_exp_com(ctx, exps[i], alvo)
+            if not cabe_no_destino(alvo, valor) then
+                local nome: string = nome_do_alvo(vars[i])
+                local l_valor: ast.Loc = ast.loc_da_exp(exps[i])
+                erro_de_atribuicao(ctx, l_valor, nome, alvo, valor)
+            end
+        end
+        i = i + 1
+    end
+    if #vars ~= #exps then
+        registra(ctx.erros, l, "atribuição múltipla com " .. #vars .. " alvo(s), mas " .. #exps .. " valor(es) à direita.")
+        local j: integer = #vars + 1
+        while j <= #exps do
+            local extra: T = checa_exp(ctx, exps[j])
+            j = j + 1
+        end
+    end
+end
+
+-- A condicao de um `if`/`while` (`check_condition`, checker.rs:2498).
+--
+-- Titan nao tem truthy/falsy (decisao 7 da Fase 1): a condicao e boolean, e
+-- so.
+function checa_condicao(ctx: Contexto, e: ast.Exp, contexto: string): nil
+    local t: T = checa_exp_com(ctx, e, TBoolean)
+    if eh_value(t) or eh_invalido(t) or tipos_iguais(t, TBoolean) then
+        return nil
+    end
+    local achado: string = tipo_para_texto(t)
+    local l: ast.Loc = ast.loc_da_exp(e)
+    registra(ctx.erros, l, "a condição do `" .. contexto .. "` precisa ser boolean, encontrado " .. achado .. ".")
+end
+
+-- `return` (checker.rs:2272): a contagem primeiro, o tipo de cada valor
+-- depois.
+function checa_return(ctx: Contexto, l: ast.Loc, exps: {ast.Exp}, retornos: {T}): nil
+    local tipos: {T} = {}
+    local i: integer = 1
+    while i <= #exps do
+        tipos[i] = checa_exp_com(ctx, exps[i], tipo_ou_invalido(retornos, i))
+        i = i + 1
+    end
+    if #tipos ~= #retornos then
+        registra(ctx.erros, l, "retornou " .. #tipos .. " valor(es), mas a função espera " .. #retornos .. ".")
+        return nil
+    end
+    local j: integer = 1
+    while j <= #retornos do
+        if not cabe_no_destino(retornos[j], tipos[j]) then
+            local esp: string = tipo_para_texto(retornos[j])
+            local ach: string = tipo_para_texto(tipos[j])
+            local l_valor: ast.Loc = ast.loc_da_exp(exps[j])
+            registra(ctx.erros, l_valor, "retorno incompatível: esperado " .. esp .. ", encontrado " .. ach .. ".")
+            return nil
+        end
+        j = j + 1
+    end
+end
+
+-- O `for` numerico (checker.rs:2700): a variavel de controle e integer ou
+-- float, e inicio, limite e passo tem de ter **o mesmo** tipo que ela — sem
+-- promocao, porque um `for i = 1, 10, 0.5` com `i: integer` seria um laco
+-- que nao anda como o autor pensa.
+function checa_for_numerico(ctx: Contexto, l: ast.Loc, d: ast.Decl, inicio: ast.Exp, limite: ast.Exp, passo: ast.Exp, tem_passo: boolean, corpo: ast.Stat, retornos: {T}, lacos: integer): nil
+    local anotado: T = resolve_tipo(ctx, d.tipo)
+    local t_inicio: T = checa_exp_com(ctx, inicio, anotado)
+    -- Sem anotacao, o tipo da variavel de controle e o do valor inicial —
+    -- que e como `for j = 2, n` ganha `integer` sem ninguem escrever.
+    local tvar: T = anotado
+    if not tipo_foi_escrito(d.tipo) then
+        tvar = t_inicio
+    end
+    if not eh_numerico(tvar) and not eh_value(tvar) and not eh_invalido(tvar) then
+        local achado: string = tipo_para_texto(tvar)
+        registra(ctx.erros, d.loc, "a variável de controle do `for` precisa ser integer ou float, encontrado " .. achado .. ".")
+        tvar = TInvalido
+    end
+    confere_parte_do_for(ctx, inicio, t_inicio, tvar, "valor inicial")
+    local t_limite: T = checa_exp_com(ctx, limite, tvar)
+    confere_parte_do_for(ctx, limite, t_limite, tvar, "limite")
+    if tem_passo then
+        local t_passo: T = checa_exp_com(ctx, passo, tvar)
+        confere_parte_do_for(ctx, passo, t_passo, tvar, "passo")
+    end
+    -- A variavel de controle vive no bloco do corpo, e nao no de fora: e o
+    -- escopo que o `for` do Titan tem, e o que faz `for i = 1, 3 do end`
+    -- seguido de `print(i)` ser "'i' nao foi declarado".
+    local marca: integer = abre_bloco(ctx)
+    local nome: string = "" .. d.nome
+    declara(ctx, nome, tvar, EspControle)
+    checa_stat(ctx, corpo, retornos, lacos + 1)
+    fecha_bloco(ctx, marca)
+end
+
+function confere_parte_do_for(ctx: Contexto, e: ast.Exp, achado: T, tvar: T, papel: string): nil
+    if compativel(tvar, achado) then
+        return nil
+    end
+    local esp: string = tipo_para_texto(tvar)
+    local ach: string = tipo_para_texto(achado)
+    local l: ast.Loc = ast.loc_da_exp(e)
+    registra(ctx.erros, l, "o " .. papel .. " do `for` precisa ter o mesmo tipo da variável de controle (" .. esp .. "), encontrado " .. ach .. ".")
+end
+
+-- `for x in v do` e `for k, v in m do` (T71): um nome sobre array, dois
+-- sobre map.
+function checa_for_in(ctx: Contexto, l: ast.Loc, decls: {ast.Decl}, container: ast.Exp, corpo: ast.Stat, retornos: {T}, lacos: integer): nil
+    local tc: T = checa_exp(ctx, container)
+    local marca: integer = abre_bloco(ctx)
+    match tc with
+        TArray(elem) then
+            if #decls ~= 1 then
+                local nome_do_tipo: string = tipo_para_texto(tc)
+                registra(ctx.erros, l, "iterar sobre " .. nome_do_tipo .. " liga um nome (o elemento); encontrei " .. #decls .. ". Escreva `for x in ... do`.")
+            end
+            liga_nomes_do_for_in(ctx, decls, elem, elem, "o elemento", "o elemento")
+        TMap(chave, valor) then
+            if #decls ~= 2 then
+                local nome_do_tipo: string = tipo_para_texto(tc)
+                registra(ctx.erros, l, "iterar sobre " .. nome_do_tipo .. " liga dois nomes (chave e valor); encontrei " .. #decls .. ". Escreva `for k, v in ... do`.")
+            end
+            liga_nomes_do_for_in(ctx, decls, chave, valor, "a chave", "o valor")
+        TValue then
+            liga_nomes_do_for_in(ctx, decls, TValue, TValue, "o elemento", "o elemento")
+        TInvalido then
+            liga_nomes_do_for_in(ctx, decls, TInvalido, TInvalido, "o elemento", "o elemento")
+        _ then
+            local achado: string = tipo_para_texto(tc)
+            local l_container: ast.Loc = ast.loc_da_exp(container)
+            registra(ctx.erros, l_container, "o `for`-in itera sobre array (`{T}`) ou map (`{K: V}`), encontrado " .. achado .. ".")
+            liga_nomes_do_for_in(ctx, decls, TInvalido, TInvalido, "o elemento", "o elemento")
+    end
+    checa_stat(ctx, corpo, retornos, lacos + 1)
+    fecha_bloco(ctx, marca)
+end
+
+-- Os nomes ligados pelo `for`-in: o primeiro recebe `primeiro`, os demais
+-- recebem `resto`. Sobre array os dois sao o elemento (e so ha um nome);
+-- sobre map o primeiro e a chave e o segundo o valor.
+--
+-- `papel_primeiro` e `papel_resto` sao como a mensagem de erro chama cada um
+-- ("o elemento", "a chave", "o valor") — o parametro `papel` de
+-- `for_in_var_type` (checker.rs:2977), que existe pela mesma razao la e
+-- aqui: a mensagem fica util ("a chave iterada tem tipo string") em vez de
+-- generica.
+--
+-- A anotacao escrita (`for x: integer in v do`) e conferida contra o tipo
+-- que a iteracao produz, em vez de substitui-lo: quem escreve o tipo errado
+-- tem um erro, nao uma ligacao silenciosamente diferente.
+function liga_nomes_do_for_in(ctx: Contexto, decls: {ast.Decl}, primeiro: T, resto: T, papel_primeiro: string, papel_resto: string): nil
+    local i: integer = 1
+    while i <= #decls do
+        local d: ast.Decl = decls[i]
+        local nome: string = "" .. d.nome
+        local esperado: T = resto
+        local papel: string = "" .. papel_resto
+        if i == 1 then
+            esperado = primeiro
+            papel = "" .. papel_primeiro
+        end
+        if tipo_foi_escrito(d.tipo) then
+            local anotado: T = resolve_tipo(ctx, d.tipo)
+            if not compativel(anotado, esperado) then
+                local ofe: string = tipo_para_texto(esperado)
+                local ano: string = tipo_para_texto(anotado)
+                registra(ctx.erros, d.loc, papel .. " iterado tem tipo " .. ofe .. ", mas '" .. nome .. "' foi declarado como " .. ano .. ".")
+            end
+        end
+        declara(ctx, nome, esperado, EspControle)
+        i = i + 1
+    end
+end
+
+function checa_stat(ctx: Contexto, s: ast.Stat, retornos: {T}, lacos: integer): nil
+    match s with
+        StatBlock(l, corpo) then
+            -- Um bloco abre um escopo proprio: o que os `local` de dentro
+            -- declaram morre quando ele fecha, e o nome de fora volta a
+            -- valer.
+            local minha: integer = abre_bloco(ctx)
+            for c in corpo do
+                checa_stat(ctx, c, retornos, lacos)
+            end
+            fecha_bloco(ctx, minha)
+        StatWhile(l, cond, corpo) then
+            checa_condicao(ctx, cond, "while")
+            checa_stat(ctx, corpo, retornos, lacos + 1)
+        StatIf(l, ramos) then
+            for r in ramos do
+                checa_condicao(ctx, r.condicao, "if")
+                checa_stat(ctx, r.bloco, retornos, lacos)
+            end
+        StatIfElse(l, ramos, senao) then
+            for r in ramos do
+                checa_condicao(ctx, r.condicao, "if")
+                checa_stat(ctx, r.bloco, retornos, lacos)
+            end
+            checa_stat(ctx, senao, retornos, lacos)
+        StatFor(l, d, inicio, limite, passo, corpo) then
+            checa_for_numerico(ctx, l, d, inicio, limite, passo, true, corpo, retornos, lacos)
+        StatForSemPasso(l, d, inicio, limite, corpo) then
+            -- O passo ausente e 1, do tipo da variavel de controle. Passar
+            -- `inicio` como o no de passo e inerte: `tem_passo` e false, e
+            -- ele nao e olhado. E o que o Titan **nao** tem — `Exp?` dentro
+            -- de parametro — pago com um booleano, como a ast (T84) pagou a
+            -- mesma ausencia com uma variante.
+            checa_for_numerico(ctx, l, d, inicio, limite, inicio, false, corpo, retornos, lacos)
+        StatForIn(l, decls, container, corpo) then
+            checa_for_in(ctx, l, decls, container, corpo, retornos, lacos)
+        StatAssign(l, vars, exps) then
+            checa_assign(ctx, l, vars, exps)
+        StatDecl(l, decls, exps) then
+            checa_decl(ctx, l, decls, exps)
+        StatCall(l, chamada) then
+            local t: T = checa_exp(ctx, chamada)
+        StatReturn(l, exps) then
+            checa_return(ctx, l, exps, retornos)
+        StatBreak(l) then
+            if lacos == 0 then
+                registra(ctx.erros, l, "`break` fora de um laço (`while`/`for`).")
+            end
+        -- Os tres comandos que o parser da T86 nao produz. Como em
+        -- `checa_exp_com`, os bracos existem porque o `match` e exaustivo, e
+        -- e isso que fara o dia de amplia-los ser um erro de compilacao aqui
+        -- em vez de um silencio.
+        StatRepeat(l, corpo, cond) then
+            registra(ctx.erros, l, "`repeat`/`until` está fora do subconjunto desta fase.")
+        StatContinue(l) then
+            registra(ctx.erros, l, "`continue` está fora do subconjunto desta fase.")
+        StatMatch(l, escrutinado, bracos) then
+            local t: T = checa_exp(ctx, escrutinado)
+            registra(ctx.erros, l, "`match` está fora do subconjunto desta fase.")
+    end
+end
+
+---------------------------------------------------------------------------
+-- As duas passadas
+--
+-- `run` (checker.rs:5806): records primeiro, assinaturas depois, corpos por
+-- ultimo. A ordem nao e arbitraria — e o que permite a uma funcao chamar
+-- outra declarada mais abaixo no arquivo, e a um parametro ter o tipo de um
+-- record declarado depois dele. Um compilador de uma passada so exigiria
+-- declaracao antes do uso, e nenhum dos `examples/*.titan` esta escrito
+-- assim.
+---------------------------------------------------------------------------
+
+-- Passada 1a: os nomes dos records.
+--
+-- Separada de 1b porque um campo pode ter o tipo de outro record — inclusive
+-- de um declarado mais abaixo, e inclusive do proprio record. Registrar
+-- todos os nomes antes de resolver qualquer campo e o que faz
+-- `resolve_tipo` nunca ver um nome que existe mas ainda nao entrou.
+function coleta_nomes_de_records(ctx: Contexto, topos: {ast.TopLevel}): nil
+    for t in topos do
+        match t with
+            TopLevelRecord(l, n, campos) then
+                if existe_record(ctx, n) then
+                    registra(ctx.erros, l, "'" .. n .. "' já foi declarado antes.")
+                else
+                    ctx.records[#ctx.records + 1] = n
+                end
+            _ then
+        end
+    end
+end
+
+-- Passada 1b: os campos de cada record.
+function coleta_campos_de_records(ctx: Contexto, topos: {ast.TopLevel}): nil
+    for t in topos do
+        match t with
+            TopLevelRecord(l, n, campos) then
+                for c in campos do
+                    local campo: string = "" .. c.nome
+                    if indice_do_campo(ctx, n, campo) > 0 then
+                        registra(ctx.erros, c.loc, "campo '" .. campo .. "' duplicado no record '" .. n .. "'.")
+                    else
+                        local tc: T = resolve_tipo(ctx, c.tipo)
+                        declara_campo(ctx, n, campo, tc)
+                    end
+                end
+            _ then
+        end
+    end
+end
+
+-- Passada 1b-bis: o record que se contem, direta ou indiretamente.
+--
+-- `record P p: P end` compila em Rust como um struct de tamanho infinito, e
+-- o rustc o recusa em ingles ("recursive type has infinite size"). O
+-- compilador em Rust o recusa antes disso, em portugues
+-- (`find_recursive_record`, checker.rs:1255), e este checker tem de recusar
+-- tambem — um programa que o `titanc` rejeita e o pipeline auto-hospedado
+-- aceita e uma divergencia de oraculo na T88.
+--
+-- **So a referencia direta conta**, como la: um campo `{P}` ou `{string: P}`
+-- dentro de `P` nao e ciclo, porque array e map ja sao indirecao (um `Vec`
+-- tem tamanho fixo qualquer que seja o elemento). E por isso que
+-- `depende_de` olha `TRecord` no topo do tipo do campo, e nao dentro dele.
+--
+-- A busca e a mesma em profundidade com tres cores, com o `{integer}` de
+-- cores indexado pelo indice do record em `ctx.records` — a pilha explicita
+-- que `visita` faz recursivamente. Branco = 0, cinza = 1, preto = 2.
+function indice_do_record(ctx: Contexto, nome: string): integer
+    local i: integer = 1
+    while i <= #ctx.records do
+        if ctx.records[i] == nome then
+            return i
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+-- `true` se a busca a partir de `nome` encontra um ciclo.
+function visita_record(ctx: Contexto, nome: string, cores: {integer}): boolean
+    local idx: integer = indice_do_record(ctx, nome)
+    if idx == 0 then
+        return false
+    end
+    if cores[idx] == 2 then
+        return false
+    end
+    if cores[idx] == 1 then
+        return true
+    end
+    cores[idx] = 1
+    local i: integer = 1
+    while i <= #ctx.campo_donos do
+        if ctx.campo_donos[i] == nome then
+            local tc: T = ctx.campo_tipos[i]
+            match tc with
+                TRecord(dep) then
+                    if visita_record(ctx, dep, cores) then
+                        return true
+                    end
+                _ then
+            end
+        end
+        i = i + 1
+    end
+    cores[idx] = 2
+    return false
+end
+
+function confere_records_recursivos(ctx: Contexto, topos: {ast.TopLevel}): nil
+    local cores: {integer} = {}
+    local i: integer = 1
+    while i <= #ctx.records do
+        cores[i] = 0
+        i = i + 1
+    end
+    -- A varredura e pela ordem de declaracao, e nao pela ordem da tabela de
+    -- records (que e a mesma): o erro sai na posicao do `record` que abre o
+    -- ciclo, que e o que `collect_records` (checker.rs:1315) reporta.
+    for t in topos do
+        match t with
+            TopLevelRecord(l, n, campos) then
+                if visita_record(ctx, n, cores) then
+                    registra(ctx.erros, l, "o record '" .. n .. "' é recursivo (direta ou indiretamente); esta fase não suporta indireção para quebrar o ciclo.")
+                    return nil
+                end
+            _ then
+        end
+    end
+end
+
+-- As capabilities do compilador (`capabilities.rs`), na ordem em que
+-- `available_module_names` as devolve — que e a ordem em que a mensagem de
+-- erro as lista.
+--
+-- **Sao as unicas fontes de modulo que este checker conhece**, e e um limite
+-- real: o `titanc` resolve `import` contra duas fontes, as capabilities e os
+-- modulos declarados no `[modulos]` de um `titan.toml`, e a segunda exige ler
+-- o manifesto — coisa que este checker nao faz, porque `--checar` recebe um
+-- arquivo, nao um projeto. A consequencia esta escrita para nao surpreender:
+-- `import lexer` num fonte solto e recusado aqui, e o `titanc` sem
+-- `--manifesto` o recusa igual, com a mesma mensagem. Com `--manifesto` ele
+-- aceita e este checker nao — e o dia de checar um projeto inteiro (que e
+-- para onde a T88 aponta) e o dia de passar os nomes declarados para ca.
+function capabilities_disponiveis(): string
+    return "data, texto, io"
+end
+
+function eh_capability(nome: string): boolean
+    return nome == "data" or nome == "texto" or nome == "io"
+end
+
+-- Passada 1c: as assinaturas de topo — funcoes, variaveis de topo e os
+-- nomes de modulo importados.
+function coleta_assinaturas(ctx: Contexto, topos: {ast.TopLevel}): nil
+    for t in topos do
+        match t with
+            TopLevelFunc(l, islocal, n, params, retornos, bloco) then
+                if existe_simbolo(ctx, n) then
+                    registra(ctx.erros, l, "'" .. n .. "' já foi declarado antes.")
+                end
+                local tipos_de_params: {T} = {}
+                local i: integer = 1
+                while i <= #params do
+                    tipos_de_params[i] = resolve_tipo(ctx, params[i].tipo)
+                    i = i + 1
+                end
+                local tipos_de_retorno: {T} = {}
+                local j: integer = 1
+                while j <= #retornos do
+                    tipos_de_retorno[j] = resolve_tipo(ctx, retornos[j])
+                    j = j + 1
+                end
+                -- Sem `:` na assinatura a funcao nao devolve nada, o que e
+                -- um retorno de tipo `nil` — e nao "zero retornos". E o que
+                -- faz `checa_return` de uma funcao sem retorno exigir
+                -- `return nil` (ou nenhum `return`), como no compilador em
+                -- Rust.
+                if #tipos_de_retorno == 0 then
+                    tipos_de_retorno[1] = TNil
+                end
+                local assinatura: T = TFuncao(tipos_de_params, tipos_de_retorno)
+                declara(ctx, n, assinatura, EspGlobal)
+            -- Variavel de topo: **recusada**, e nao registrada.
+            --
+            -- O parser da T86 a produz (`parse_var_de_topo`), e o
+            -- compilador em Rust a recusa com esta mensagem
+            -- (`collect_signature`, checker.rs:1613) — nao ha codegen para
+            -- ela nesta fase. Recusar aqui e o que mantem os dois pipelines
+            -- com o mesmo veredito; registrar o nome e seguir daria um
+            -- programa que o auto-hospedado aceita e o `titanc` rejeita.
+            --
+            -- O nome **nao** entra no escopo, de proposito: e a unica forma
+            -- de o uso posterior (`return g`) reportar "'g' nao foi
+            -- declarado", como la. E a excecao a divergencia que
+            -- `checa_decl` documenta, e ela existe porque aqui os dois
+            -- erros sao a mesma noticia — a variavel de topo nao existe —,
+            -- e nao um engano de tipo e suas consequencias.
+            TopLevelVar(l, islocal, d, valor) then
+                registra(ctx.erros, l, "declaração de variável no nível de topo não é suportada nesta fase.")
+            TopLevelImport(l, nomelocal, nomemodulo) then
+                if existe_simbolo(ctx, nomelocal) then
+                    registra(ctx.erros, l, "'" .. nomelocal .. "' já foi declarado antes.")
+                end
+                if not eh_capability(nomemodulo) then
+                    registra(ctx.erros, l, "capability '" .. nomemodulo .. "' não existe; disponíveis: " .. capabilities_disponiveis() .. ".")
+                end
+                declara(ctx, nomelocal, TModulo(nomemodulo), EspModulo)
+            -- As tres formas de topo que o parser da T86 nao produz.
+            TopLevelMethod(l, dono, n, params, retornos, bloco) then
+                registra(ctx.erros, l, "método de topo está fora do subconjunto desta fase.")
+            TopLevelStatic(l, dono, n, params, retornos, bloco) then
+                registra(ctx.erros, l, "função estática de record está fora do subconjunto desta fase.")
+            TopLevelRecord(l, n, campos) then
+            TopLevelEnum(l, n, variantes) then
+                registra(ctx.erros, l, "`enum` está fora do subconjunto desta fase.")
+            TopLevelForeignFunc(l, n, params, retornos) then
+                registra(ctx.erros, l, "`foreign function` está fora do subconjunto desta fase.")
+        end
+    end
+end
+
+-- Os tipos de retorno de uma funcao ja coletada, para a passada 2.
+function retornos_da_funcao(ctx: Contexto, nome: string): {T}
+    local t: T = tipo_do_simbolo(ctx, nome)
+    match t with
+        TFuncao(params, retornos) then return retornos
+        _ then
+            local vazio: {T} = {}
+            return vazio
+    end
+end
+
+-- Passada 2: o corpo de cada funcao, com os parametros em escopo.
+function checa_corpos(ctx: Contexto, topos: {ast.TopLevel}): nil
+    for t in topos do
+        match t with
+            TopLevelFunc(l, islocal, n, params, retornos, bloco) then
+                local tipos_de_retorno: {T} = retornos_da_funcao(ctx, n)
+                local marca: integer = abre_bloco(ctx)
+                for p in params do
+                    local nome_do_param: string = "" .. p.nome
+                    local tp: T = resolve_tipo(ctx, p.tipo)
+                    declara(ctx, nome_do_param, tp, EspParam)
+                end
+                checa_stat(ctx, bloco, tipos_de_retorno, 0)
+                fecha_bloco(ctx, marca)
+            -- `TopLevelVar` nao aparece aqui: `coleta_assinaturas` ja a
+            -- recusou, e tipar o valor de uma declaracao que nao existe so
+            -- acrescentaria erros sobre um programa que ja nao compila.
+            _ then
+        end
+    end
+end
+
+-- A assinatura que o programa principal precisa ter
+-- (`check_has_main`, checker.rs:1966).
+function confere_main(ctx: Contexto, topos: {ast.TopLevel}): nil
+    local args: {T} = {}
+    args[1] = TArray(TString)
+    local rets: {T} = {}
+    rets[1] = TInteger
+    local esperada: T = TFuncao(args, rets)
+    local l_main: ast.Loc = ast.loc(1, 1)
+    local achou: boolean = false
+    for t in topos do
+        match t with
+            TopLevelFunc(l, islocal, n, params, retornos, bloco) then
+                if n == "main" then
+                    l_main = l
+                    local assinatura: T = tipo_do_simbolo(ctx, "main")
+                    if tipos_iguais(assinatura, esperada) then
+                        achou = true
+                    end
+                end
+            _ then
+        end
+    end
+    if not achou then
+        registra(ctx.erros, l_main, "função 'main' precisa ter a assinatura main(args: {string}): integer.")
+    end
+end
+
+---------------------------------------------------------------------------
+-- A API do modulo
+---------------------------------------------------------------------------
+
+-- Os simbolos que existem antes de o programa declarar qualquer coisa: a
+-- stdlib (`BUILTINS`, builtins.rs). Hoje so `print`, como la.
+function declara_builtins(ctx: Contexto): nil
+    local params: {T} = {}
+    params[1] = TString
+    local retornos: {T} = {}
+    retornos[1] = TNil
+    local t: T = TFuncao(params, retornos)
+    declara(ctx, "print", t, EspGlobal)
+end
+
+-- Checa um programa ja parseado, acrescentando ao `{ErroDeTipo}` que o
+-- chamador passa.
+--
+-- Mesmo contrato do parser (T86): quem quer saber se o programa e valido
+-- olha `#erros`, e nao o valor de retorno — a funcao sempre termina, ainda
+-- que o programa esteja cheio de erros. E o que faz um fonte com tres
+-- enganos mostrar os tres.
+--
+-- `principal` diz se este e o programa de entrada (que precisa de `main`) ou
+-- um modulo importado (que nao precisa), como o campo de mesmo nome do
+-- `Contexto` do compilador em Rust.
+function checa_programa(topos: {ast.TopLevel}, erros: {ErroDeTipo}, principal: boolean): nil
+    local anotacoes: {string} = {}
+    checa_e_anota(topos, erros, anotacoes, principal)
+end
+
+-- A assinatura de uma funcao como a linha de anotacao a escreve:
+-- `(integer, {string}) -> integer`.
+--
+-- Nao e `tipo_para_texto`, que escreve toda funcao como `function` porque e o
+-- que `type_name` (checker.rs:5790) escreve **nas mensagens de erro**; nem e
+-- `assinatura_do_tipo`, cujo texto e chave de identidade e nao foi feito para
+-- ser lido. Esta terceira forma existe porque a anotacao tem um leitor humano
+-- e nenhuma das outras duas o serve: uma esconde a assinatura, a outra a
+-- escreve com virgula sobrando e dois-pontos no meio.
+function assinatura_legivel(t: T): string
+    match t with
+        TFuncao(params, retornos) then
+            local ps: string = ""
+            local primeiro: boolean = true
+            for p in params do
+                local pt: string = tipo_para_texto(p)
+                if primeiro then
+                    ps = ps .. pt
+                    primeiro = false
+                else
+                    ps = ps .. ", " .. pt
+                end
+            end
+            local rs: string = ""
+            local primeiro_r: boolean = true
+            for r in retornos do
+                local rt: string = tipo_para_texto(r)
+                if primeiro_r then
+                    rs = rs .. rt
+                    primeiro_r = false
+                else
+                    rs = rs .. ", " .. rt
+                end
+            end
+            return "(" .. ps .. ") -> " .. rs
+        _ then
+            return tipo_para_texto(t)
+    end
+end
+
+-- Checa o programa **e** devolve, em `anotacoes`, uma linha por declaracao de
+-- topo com o tipo que a analise resolveu para ela — o que a T88 imprime como
+-- "a AST tipada".
+--
+-- E a assinatura de cada funcao e o tipo de cada campo de record, e nao o tipo
+-- de cada expressao: o checker da T87 confere os tipos dos nos internos mas
+-- nao os guarda (`checa_exp` devolve um `T` que quem o chamou consome e
+-- descarta), e faze-lo guardar exigiria uma arvore paralela que so este
+-- ponto leria. As assinaturas sao o que o `titanc` tambem expoe sem
+-- reescrita (`CheckedProgram`), e portanto o que o oraculo pode comparar.
+--
+-- Uma declaracao que nao chegou a ser tipada — porque o nome colidiu, ou
+-- porque a forma de topo esta fora do subconjunto — sai como `<invalido>`,
+-- que e o que `tipo_do_simbolo` devolve para um nome ausente. Nao ha braco
+-- especial para isso: um programa com erro ja imprime os erros e sai com 1,
+-- e a anotacao so e impressa quando nao ha nenhum.
+function checa_e_anota(topos: {ast.TopLevel}, erros: {ErroDeTipo}, anotacoes: {string}, principal: boolean): nil
+    local ctx: Contexto = contexto_novo()
+    declara_builtins(ctx)
+    coleta_nomes_de_records(ctx, topos)
+    coleta_campos_de_records(ctx, topos)
+    confere_records_recursivos(ctx, topos)
+    coleta_assinaturas(ctx, topos)
+    if principal then
+        confere_main(ctx, topos)
+    end
+    checa_corpos(ctx, topos)
+    anota_topos(ctx, topos, anotacoes)
+    for e in ctx.erros do
+        erros[#erros + 1] = e
+    end
+end
+
+-- Uma linha por declaracao de topo, na ordem do fonte.
+--
+-- A ordem e a do fonte, e nao a da symtab, porque e a ordem que o `titanc`
+-- tambem percorre ao montar o `CheckedProgram` — e o oraculo compara as duas
+-- listas linha a linha.
+function anota_topos(ctx: Contexto, topos: {ast.TopLevel}, anotacoes: {string}): nil
+    for t in topos do
+        match t with
+            TopLevelFunc(l, islocal, n, params, retornos, bloco) then
+                local assinatura: T = tipo_do_simbolo(ctx, n)
+                local txt: string = assinatura_legivel(assinatura)
+                anotacoes[#anotacoes + 1] = n .. ": " .. txt
+            TopLevelRecord(l, n, campos) then
+                anotacoes[#anotacoes + 1] = "record " .. n
+                for c in campos do
+                    local nome_do_campo: string = "" .. c.nome
+                    local i: integer = indice_do_campo(ctx, n, nome_do_campo)
+                    local tct: string = "<invalido>"
+                    if i > 0 then
+                        local tc: T = ctx.campo_tipos[i]
+                        tct = tipo_para_texto(tc)
+                    end
+                    anotacoes[#anotacoes + 1] = "  " .. nome_do_campo .. ": " .. tct
+                end
+            TopLevelImport(l, nomelocal, nomemodulo) then
+                anotacoes[#anotacoes + 1] = "import " .. nomelocal .. ": module " .. nomemodulo
+            -- As formas que `coleta_assinaturas` recusa nao ganham linha: elas
+            -- ja produziram um erro, e o programa nao chega a ser impresso.
+            _ then
+        end
+    end
+end

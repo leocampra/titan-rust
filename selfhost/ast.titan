@@ -28,8 +28,8 @@
 --
 -- ESCOPO: espelha crates/titanc/src/ast.rs, que e a fonte de verdade. Os nomes
 -- de variante sao os mesmos (ExpBinop, StatWhile, TypeArray...) para que a
--- comparacao entre os dois arquivos seja literal. Duas divergencias
--- deliberadas, ambas por limite da linguagem hoje:
+-- comparacao entre os dois arquivos seja literal. Tres divergencias
+-- deliberadas, todas por limite da linguagem hoje:
 --
 --   1. As variantes do Titan sao POSICIONAIS (ExpBinop(Loc, string, Exp, Exp)),
 --      enquanto o ast.rs usa campos nomeados. A ordem dos campos aqui segue a
@@ -40,7 +40,12 @@
 --      vira, aqui, a variante `TipoAusente` do proprio `enum Tipo` — o que e
 --      mais fiel ao espirito da fase: um caso a mais do tipo soma, exaustivo
 --      como os outros, em vez de um `nil` que o checker precisa lembrar de
---      testar.
+--      testar. A mesma razao desdobra `StatIf`/`StatIfElse` e
+--      `StatFor`/`StatForSemPasso` em duas variantes cada.
+--   3. `MatchArm<T>` (ast.rs) e generico no que o braco produz; Titan nao tem
+--      genericos de usuario, entao ele vira dois records — `BracoExp` e
+--      `BracoStat`. E a unica das tres com custo visivel, e o item que a Fase 6
+--      tem motivo para olhar (ver o comentario de `BracoExp`).
 
 -- Posicao de um no no codigo-fonte (ast.rs: `Loc`).
 --
@@ -167,9 +172,9 @@ end
 -- Um braco de `match` em posicao de expressao (ast.rs: `MatchArm<Exp>`).
 --
 -- O `MatchArm<T>` do Rust e generico no que o braco produz; Titan nao tem
--- genericos de usuario, entao a generalizacao vira dois records — a terceira
--- divergencia, esta sim de custo visivel, e o item que a Fase 6 tem motivo para
--- olhar.
+-- genericos de usuario, entao a generalizacao vira dois records — a divergencia
+-- 3 do cabecalho, esta sim de custo visivel, e o item que a Fase 6 tem motivo
+-- para olhar.
 record BracoExp
     loc: Loc
     padrao: Padrao
@@ -202,10 +207,12 @@ enum Stat
     StatRepeat(Loc, Stat, Exp)
     StatIf(Loc, {Ramo})
     StatIfElse(Loc, {Ramo}, Stat)
-    -- `for` numerico: variavel de controle, inicio, limite e passo.
-    StatFor(Loc, Decl, Exp, Exp, Exp)
-    -- `for` sem passo escrito — o passo implicito e 1.
-    StatForSemPasso(Loc, Decl, Exp, Exp)
+    -- `for` numerico: variavel de controle, inicio, limite, passo e corpo.
+    StatFor(Loc, Decl, Exp, Exp, Exp, Stat)
+    -- `for` sem passo escrito — o passo implicito e 1. O ast.rs guarda isso
+    -- num `inc: Option<Box<Exp>>`; aqui a ausencia e uma variante, pela mesma
+    -- razao da divergencia 2 do cabecalho.
+    StatForSemPasso(Loc, Decl, Exp, Exp, Stat)
     -- `for x in v do` / `for k, v in m do` (T71): `decls` tem 1 elemento sobre
     -- `{T}` e 2 sobre `{K: V}`.
     StatForIn(Loc, {Decl}, Exp, Stat)
@@ -269,6 +276,216 @@ end
 
 function nome(l: Loc, n: string): Exp
     return ExpVar(l, VarName(l, n))
+end
+
+-- Os construtores acrescentados pela T86.
+--
+-- Nao sao acucar: variante de `enum` **nao atravessa modulo**. Escrever
+-- `ast.ExpString(l, s)` em selfhost/parser.titan e erro de tipo ("o modulo
+-- 'ast' nao tem 'ExpString'; exporta: ..."), porque o `import` exporta tipos e
+-- funcoes, nao os construtores de variante. O `match` do lado de la nao tem
+-- esse limite: casar `ExpBinop(l, op, esq, dir)` sobre um `ast.Exp` funciona
+-- sem qualificacao, o que e por que a travessia acima nunca precisou disto.
+--
+-- Entao cada variante que o parser constroi ganha aqui uma funcao de um
+-- `return` so. Quem acrescentar variante a `Exp`/`Stat`/`Tipo` e quiser
+-- constru-la do parser tem de acrescentar o construtor junto — e o `match`
+-- exaustivo da travessia ja avisa de qualquer forma.
+
+function nil_exp(l: Loc): Exp
+    return ExpNil(l)
+end
+
+function booleano(l: Loc, valor: boolean): Exp
+    return ExpBool(l, valor)
+end
+
+function flutuante(l: Loc, valor: float): Exp
+    return ExpFloat(l, valor)
+end
+
+function cadeia(l: Loc, valor: string): Exp
+    return ExpString(l, valor)
+end
+
+function unop(l: Loc, op: string, sub: Exp): Exp
+    return ExpUnop(l, op, sub)
+end
+
+function concat(l: Loc, partes: {Exp}): Exp
+    return ExpConcat(l, partes)
+end
+
+function chamada(l: Loc, f: Exp, args: Args): Exp
+    return ExpCall(l, f, args)
+end
+
+function args_func(l: Loc, exps: {Exp}): Args
+    return ArgsFunc(l, exps)
+end
+
+function exp_de_var(l: Loc, v: Var): Exp
+    return ExpVar(l, v)
+end
+
+function var_nome(l: Loc, n: string): Var
+    return VarName(l, n)
+end
+
+function var_colchete(l: Loc, base: Exp, indice: Exp): Var
+    return VarBracket(l, base, indice)
+end
+
+function var_ponto(l: Loc, base: Exp, campo: string): Var
+    return VarDot(l, base, campo)
+end
+
+function cast(l: Loc, sub: Exp, t: Tipo): Exp
+    return ExpCast(l, sub, t)
+end
+
+function initlist(l: Loc, campos: {Campo}): Exp
+    return ExpInitList(l, campos)
+end
+
+-- `(f())` ajusta uma chamada de varios retornos para o primeiro valor (T65).
+function ajuste(l: Loc, sub: Exp): Exp
+    return ExpAdjust(l, sub)
+end
+
+function campo_nomeado(l: Loc, chave: string, valor: Exp): Campo
+    return {loc = l, nome = NomeChave(chave), exp = valor}
+end
+
+function campo_posicional(l: Loc, valor: Exp): Campo
+    return {loc = l, nome = NomeAusente, exp = valor}
+end
+
+-- Tipos escritos no fonte.
+
+function tipo_ausente(): Tipo
+    return TipoAusente
+end
+
+function tipo_nil(l: Loc): Tipo
+    return TipoNil(l)
+end
+
+function tipo_boolean(l: Loc): Tipo
+    return TipoBoolean(l)
+end
+
+function tipo_integer(l: Loc): Tipo
+    return TipoInteger(l)
+end
+
+function tipo_float(l: Loc): Tipo
+    return TipoFloat(l)
+end
+
+function tipo_string(l: Loc): Tipo
+    return TipoString(l)
+end
+
+function tipo_value(l: Loc): Tipo
+    return TipoValue(l)
+end
+
+function tipo_nome(l: Loc, n: string): Tipo
+    return TipoName(l, n)
+end
+
+function tipo_qual(l: Loc, modulo: string, n: string): Tipo
+    return TipoQualName(l, modulo, n)
+end
+
+function tipo_array(l: Loc, elem: Tipo): Tipo
+    return TipoArray(l, elem)
+end
+
+function tipo_map(l: Loc, chave: Tipo, valor: Tipo): Tipo
+    return TipoMap(l, chave, valor)
+end
+
+function tipo_opcional(l: Loc, base: Tipo): Tipo
+    return TipoOption(l, base)
+end
+
+-- Comandos.
+
+function stat_bloco(l: Loc, corpo: {Stat}): Stat
+    return StatBlock(l, corpo)
+end
+
+function stat_while(l: Loc, cond: Exp, corpo: Stat): Stat
+    return StatWhile(l, cond, corpo)
+end
+
+function stat_if(l: Loc, ramos: {Ramo}): Stat
+    return StatIf(l, ramos)
+end
+
+function stat_if_else(l: Loc, ramos: {Ramo}, senao: Stat): Stat
+    return StatIfElse(l, ramos, senao)
+end
+
+function ramo(l: Loc, cond: Exp, bloco: Stat): Ramo
+    return {loc = l, condicao = cond, bloco = bloco}
+end
+
+function stat_for(l: Loc, d: Decl, inicio: Exp, limite: Exp, passo: Exp, corpo: Stat): Stat
+    return StatFor(l, d, inicio, limite, passo, corpo)
+end
+
+function stat_for_sem_passo(l: Loc, d: Decl, inicio: Exp, limite: Exp, corpo: Stat): Stat
+    return StatForSemPasso(l, d, inicio, limite, corpo)
+end
+
+function stat_for_in(l: Loc, decls: {Decl}, container: Exp, corpo: Stat): Stat
+    return StatForIn(l, decls, container, corpo)
+end
+
+function stat_assign(l: Loc, vars: {Var}, exps: {Exp}): Stat
+    return StatAssign(l, vars, exps)
+end
+
+function stat_decl(l: Loc, decls: {Decl}, exps: {Exp}): Stat
+    return StatDecl(l, decls, exps)
+end
+
+function stat_call(l: Loc, c: Exp): Stat
+    return StatCall(l, c)
+end
+
+function stat_return(l: Loc, exps: {Exp}): Stat
+    return StatReturn(l, exps)
+end
+
+function stat_break(l: Loc): Stat
+    return StatBreak(l)
+end
+
+-- Declaracoes de topo.
+
+function toplevel_func(l: Loc, islocal: boolean, n: string, params: {Decl}, retornos: {Tipo}, bloco: Stat): TopLevel
+    return TopLevelFunc(l, islocal, n, params, retornos, bloco)
+end
+
+function toplevel_record(l: Loc, n: string, campos: {Decl}): TopLevel
+    return TopLevelRecord(l, n, campos)
+end
+
+function toplevel_import(l: Loc, nomelocal: string, nomemodulo: string): TopLevel
+    return TopLevelImport(l, nomelocal, nomemodulo)
+end
+
+function toplevel_var(l: Loc, islocal: boolean, d: Decl, valor: Exp): TopLevel
+    return TopLevelVar(l, islocal, d, valor)
+end
+
+-- `Decl` com a marca `opcional` (a forma `local x?`), que `decl` nao cobre.
+function decl_opcional(l: Loc, nome: string, tipo: Tipo): Decl
+    return {loc = l, nome = nome, tipo = tipo, opcional = true}
 end
 
 ---------------------------------------------------------------------------
@@ -348,7 +565,14 @@ function exp_para_texto(e: Exp): string
         ExpVar(l, v) then
             return var_para_texto(v)
         ExpUnop(l, op, sub) then
-            return "(" .. op .. exp_para_texto(sub) .. ")"
+            -- `not` precisa do espaco (`(not a)`); `-`, `#` e `~` colam no
+            -- operando (`(-a)`), que e como se escreve. Sem isto `not a` sai
+            -- "(nota)", que se le como um nome.
+            local sub_texto: string = exp_para_texto(sub)
+            if op == "not" then
+                return "(" .. op .. " " .. sub_texto .. ")"
+            end
+            return "(" .. op .. sub_texto .. ")"
         ExpBinop(l, op, esq, dir) then
             return "(" .. exp_para_texto(esq) .. " " .. op .. " " .. exp_para_texto(dir) .. ")"
         ExpConcat(l, partes) then
@@ -430,8 +654,8 @@ function loc_do_stat(s: Stat): Loc
         StatRepeat(l, corpo, cond) then return l
         StatIf(l, ramos) then return l
         StatIfElse(l, ramos, senao) then return l
-        StatFor(l, d, inicio, limite, passo) then return l
-        StatForSemPasso(l, d, inicio, limite) then return l
+        StatFor(l, d, inicio, limite, passo, corpo) then return l
+        StatForSemPasso(l, d, inicio, limite, corpo) then return l
         StatForIn(l, decls, container, corpo) then return l
         StatAssign(l, vars, exps) then return l
         StatDecl(l, decls, exps) then return l
@@ -465,4 +689,238 @@ function nome_do_toplevel(t: TopLevel): string
         TopLevelForeignFunc(l, n, params, retornos) then
             return n
     end
+end
+
+---------------------------------------------------------------------------
+-- Impressao da arvore
+--
+-- O que o driver (T88) imprime e o que o parser (T86) usa para mostrar o que
+-- leu. Uma linha por no, indentada pela profundidade — formato de arvore, e
+-- nao de expressao reparentizada como `exp_para_texto`, porque um programa
+-- inteiro numa linha so nao se le.
+--
+-- Como `exp_para_texto`, sao `match` exaustivos: variante nova em `Stat` ou
+-- `TopLevel` quebra a compilacao aqui, em portugues.
+---------------------------------------------------------------------------
+
+function recuo(n: integer): string
+    local s: string = ""
+    local i: integer = 1
+    while i <= n do
+        s = s .. "  "
+        i = i + 1
+    end
+    return s
+end
+
+-- Os nomes dos campos de uma `Decl`, como `x: integer` — o que a linha de um
+-- `local` ou de um parametro mostra.
+function decl_para_texto(d: Decl): string
+    local t: string = tipo_para_texto(d.tipo)
+    return d.nome .. ": " .. t
+end
+
+function decls_para_texto(ds: {Decl}): string
+    local s: string = ""
+    local primeiro: boolean = true
+    for d in ds do
+        local txt: string = decl_para_texto(d)
+        if primeiro then
+            s = s .. txt
+            primeiro = false
+        else
+            s = s .. ", " .. txt
+        end
+    end
+    return s
+end
+
+function exps_para_texto(es: {Exp}): string
+    local s: string = ""
+    local primeiro: boolean = true
+    for e in es do
+        local txt: string = exp_para_texto(e)
+        if primeiro then
+            s = s .. txt
+            primeiro = false
+        else
+            s = s .. ", " .. txt
+        end
+    end
+    return s
+end
+
+function vars_para_texto(vs: {Var}): string
+    local s: string = ""
+    local primeiro: boolean = true
+    for v in vs do
+        local txt: string = var_para_texto(v)
+        if primeiro then
+            s = s .. txt
+            primeiro = false
+        else
+            s = s .. ", " .. txt
+        end
+    end
+    return s
+end
+
+function tipos_para_texto(ts: {Tipo}): string
+    local s: string = ""
+    local primeiro: boolean = true
+    for t in ts do
+        local txt: string = tipo_para_texto(t)
+        if primeiro then
+            s = s .. txt
+            primeiro = false
+        else
+            s = s .. ", " .. txt
+        end
+    end
+    return s
+end
+
+function stat_para_texto(s: Stat, nivel: integer): string
+    local pad: string = recuo(nivel)
+    match s with
+        StatBlock(l, corpo) then
+            local texto_do_bloco: string = ""
+            for sub in corpo do
+                texto_do_bloco = texto_do_bloco .. stat_para_texto(sub, nivel)
+            end
+            return texto_do_bloco
+        StatWhile(l, cond, corpo) then
+            local c: string = exp_para_texto(cond)
+            local dentro: string = stat_para_texto(corpo, nivel + 1)
+            return pad .. "while " .. c .. "\n" .. dentro
+        StatRepeat(l, corpo, cond) then
+            local dentro: string = stat_para_texto(corpo, nivel + 1)
+            local c: string = exp_para_texto(cond)
+            return pad .. "repeat\n" .. dentro .. pad .. "until " .. c .. "\n"
+        StatIf(l, ramos) then
+            return ramos_para_texto(ramos, nivel)
+        StatIfElse(l, ramos, senao) then
+            local cabeca: string = ramos_para_texto(ramos, nivel)
+            local dentro: string = stat_para_texto(senao, nivel + 1)
+            return cabeca .. pad .. "else\n" .. dentro
+        StatFor(l, d, inicio, limite, passo, corpo) then
+            local dt: string = decl_para_texto(d)
+            local a: string = exp_para_texto(inicio)
+            local b: string = exp_para_texto(limite)
+            local p: string = exp_para_texto(passo)
+            local dentro: string = stat_para_texto(corpo, nivel + 1)
+            return pad .. "for " .. dt .. " = " .. a .. ", " .. b .. ", " .. p .. "\n" .. dentro
+        StatForSemPasso(l, d, inicio, limite, corpo) then
+            local dt: string = decl_para_texto(d)
+            local a: string = exp_para_texto(inicio)
+            local b: string = exp_para_texto(limite)
+            local dentro: string = stat_para_texto(corpo, nivel + 1)
+            return pad .. "for " .. dt .. " = " .. a .. ", " .. b .. "\n" .. dentro
+        StatForIn(l, decls, container, corpo) then
+            local ds: string = decls_para_texto(decls)
+            local c: string = exp_para_texto(container)
+            local dentro: string = stat_para_texto(corpo, nivel + 1)
+            return pad .. "for " .. ds .. " in " .. c .. "\n" .. dentro
+        StatAssign(l, vars, exps) then
+            local vs: string = vars_para_texto(vars)
+            local es: string = exps_para_texto(exps)
+            return pad .. "assign " .. vs .. " = " .. es .. "\n"
+        StatDecl(l, decls, exps) then
+            local ds: string = decls_para_texto(decls)
+            local es: string = exps_para_texto(exps)
+            if #exps < 1 then
+                return pad .. "local " .. ds .. "\n"
+            end
+            return pad .. "local " .. ds .. " = " .. es .. "\n"
+        StatCall(l, c) then
+            local txt: string = exp_para_texto(c)
+            return pad .. "call " .. txt .. "\n"
+        StatReturn(l, exps) then
+            local es: string = exps_para_texto(exps)
+            return pad .. "return " .. es .. "\n"
+        StatBreak(l) then
+            return pad .. "break\n"
+        StatContinue(l) then
+            return pad .. "continue\n"
+        StatMatch(l, escrutinado, bracos) then
+            local e: string = exp_para_texto(escrutinado)
+            return pad .. "match " .. e .. "\n"
+    end
+end
+
+-- Os ramos `then` de um `if`, que `StatIf` e `StatIfElse` compartilham. O
+-- primeiro sai como `if`, os demais como `elseif` — a forma que o autor
+-- escreveu.
+function ramos_para_texto(ramos: {Ramo}, nivel: integer): string
+    local pad: string = recuo(nivel)
+    local s: string = ""
+    local primeiro: boolean = true
+    for r in ramos do
+        local c: string = exp_para_texto(r.condicao)
+        local dentro: string = stat_para_texto(r.bloco, nivel + 1)
+        if primeiro then
+            s = s .. pad .. "if " .. c .. "\n" .. dentro
+            primeiro = false
+        else
+            s = s .. pad .. "elseif " .. c .. "\n" .. dentro
+        end
+    end
+    return s
+end
+
+function toplevel_para_texto(t: TopLevel): string
+    match t with
+        TopLevelMethod(l, classe, n, params, retornos, bloco) then
+            local dentro: string = stat_para_texto(bloco, 1)
+            return "method " .. classe .. "." .. n .. "\n" .. dentro
+        TopLevelStatic(l, classe, n, params, retornos, bloco) then
+            local dentro: string = stat_para_texto(bloco, 1)
+            return "static " .. classe .. "." .. n .. "\n" .. dentro
+        TopLevelFunc(l, islocal, n, params, retornos, bloco) then
+            local ps: string = decls_para_texto(params)
+            local rs: string = tipos_para_texto(retornos)
+            local dentro: string = stat_para_texto(bloco, 1)
+            local cabeca: string = "function " .. n .. "(" .. ps .. ")"
+            if #retornos > 0 then
+                cabeca = cabeca .. ": " .. rs
+            end
+            if islocal then
+                cabeca = "local " .. cabeca
+            end
+            return cabeca .. "\n" .. dentro
+        TopLevelVar(l, islocal, d, valor) then
+            local dt: string = decl_para_texto(d)
+            local v: string = exp_para_texto(valor)
+            if islocal then
+                return "local " .. dt .. " = " .. v .. "\n"
+            end
+            return "var " .. dt .. " = " .. v .. "\n"
+        TopLevelRecord(l, n, campos) then
+            local s: string = "record " .. n .. "\n"
+            for c in campos do
+                local txt: string = decl_para_texto(c)
+                s = s .. "  " .. txt .. "\n"
+            end
+            return s
+        TopLevelImport(l, nomelocal, nomemodulo) then
+            return "import " .. nomemodulo .. "\n"
+        TopLevelEnum(l, n, variantes) then
+            local s: string = "enum " .. n .. "\n"
+            for v in variantes do
+                s = s .. "  " .. v.nome .. "\n"
+            end
+            return s
+        TopLevelForeignFunc(l, n, params, retornos) then
+            local ps: string = decls_para_texto(params)
+            return "foreign function " .. n .. "(" .. ps .. ")\n"
+    end
+end
+
+-- O programa inteiro: uma declaracao de topo por bloco.
+function programa_para_texto(topos: {TopLevel}): string
+    local s: string = ""
+    for t in topos do
+        s = s .. toplevel_para_texto(t)
+    end
+    return s
 end

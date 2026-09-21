@@ -280,8 +280,57 @@ function escape_de(fonte: string, p: Pos, prox: integer): string
     return texto.sub(fonte, p.pos + 1, p.pos + 1)
 end
 
+-- Quantos bytes ocupa o caractere UTF-8 que comeca no byte `b`.
+--
+-- O unico ponto em que este lexer **nao** e byte a byte, e a unica divergencia
+-- deliberada com examples/lexer.titan (T85). A razao e mecanica: o conteudo de
+-- uma string literal e copiado com `texto.sub`, e `texto.sub` **aborta** —
+-- mata o processo com mensagem do runtime — quando a fatia corta um caractere
+-- multi-byte ao meio. Copiando byte a byte, qualquer fonte com acento dentro
+-- de uma string derruba o compilador auto-hospedado; `examples/hello.titan`,
+-- que a T86 tem de parsear, e exatamente esse caso ("Ola, mundo!" com acento).
+--
+-- A largura sai do primeiro byte, como manda o UTF-8: 0xxxxxxx e 1 byte,
+-- 110xxxxx sao 2, 1110xxxx sao 3 e 11110xxx sao 4.
+--
+-- Isto **nao** muda a lista de tokens de nenhum fonte ASCII, que sao todos os
+-- que o teste de equivalencia da T85 compara: examples/nucleo.titan e
+-- examples/lexer.titan nao tem um byte acima de 127. Os acentos de
+-- selfhost/lexer.titan estao todos em comentario, que `pular_trivia` descarta
+-- sem chamar `texto.sub`. O que muda e so o desfecho de um fonte com acento
+-- **dentro de string**: antes os dois lexers abortavam juntos, agora este le
+-- e o da Fase 4 continua abortando. A equivalencia da T85 deixou de ser
+-- herdada e virou escolha, que e o que o teste dela previa.
+function bytes_do_caractere(b: integer): integer
+    if b >= 240 then
+        return 4
+    elseif b >= 224 then
+        return 3
+    elseif b >= 192 then
+        return 2
+    end
+    return 1
+end
+
+-- Avanca `n` bytes, contando **uma** coluna — o que mantem a posicao certa
+-- depois de um acento, em vez de contar os bytes dele como colunas.
+--
+-- O caso `n == 1` delega a `avancar`, e nao repete a conta: e ele que trata a
+-- quebra de linha (byte 10), que `lex_string` consome sem fechar a string
+-- quando o fonte tem uma aspa nao terminada. Duplicar a regra aqui seria
+-- deixar duas copias que podem divergir; um caractere multi-byte, por
+-- definicao, nunca e o byte 10.
+function avancar_caractere(fonte: string, p: Pos, n: integer): Pos
+    if n <= 1 then
+        return avancar(fonte, p)
+    end
+    return {pos = p.pos + n, linha = p.linha, coluna = p.coluna + 1}
+end
+
 -- Strings curtas entre aspas duplas, com os escapes `\n \" \\`. Subconjunto
--- deliberado, identico ao da Fase 4: sem aspa simples, sem long string.
+-- deliberado, identico ao da Fase 4 — salvo o caractere multi-byte, que aqui e
+-- copiado inteiro (ver `bytes_do_caractere`): sem aspa simples, sem long
+-- string.
 function lex_string(fonte: string, p: Pos): Pos, Token
     local cur: Pos = avancar(fonte, p) -- consome a aspa de abertura
     local conteudo: string = ""
@@ -298,8 +347,11 @@ function lex_string(fonte: string, p: Pos): Pos, Token
             conteudo = conteudo .. escape_de(fonte, cur, prox)
             cur = avancar_duas_vezes(fonte, cur)
         else
-            conteudo = conteudo .. texto.sub(fonte, cur.pos, cur.pos)
-            cur = avancar(fonte, cur)
+            -- O caractere inteiro, e nao um byte: `texto.sub` aborta se a
+            -- fatia cortar um multi-byte ao meio.
+            local largura: integer = bytes_do_caractere(atual(fonte, cur))
+            conteudo = conteudo .. texto.sub(fonte, cur.pos, cur.pos + largura - 1)
+            cur = avancar_caractere(fonte, cur, largura)
         end
     end
     if fim(fonte, cur) then

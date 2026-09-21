@@ -3179,6 +3179,26 @@ lista** que `examples/lexer.titan` produz; teste comparando as duas saídas.
 **Critério de aceite:** parseia `examples/hello.titan` e `examples/nucleo.titan`
 sem erro; erro claro (sem abortar) para `end` faltando.
 
+**Nota de execução (UTF-8):** `examples/hello.titan` tem `"Olá, mundo!"`, e o
+lexer da T85 varre bytes — `texto.sub` aborta ao cortar o `á` ao meio, o que a
+T85 fixou em teste como limitação herdada da Fase 4. Para cumprir este critério,
+a T86 fez `lex_string` (e **só** ele) copiar o caractere multi-byte inteiro, via
+`bytes_do_caractere`. A equivalência que a T85 mede não muda: `nucleo.titan` e
+`examples/lexer.titan` são ASCII puro, e os acentos de `selfhost/lexer.titan`
+estão todos em comentário, que `pular_trivia` descarta sem chamar `texto.sub` —
+os três seguem com listas de tokens idênticas byte a byte. O que mudou é o
+desfecho de um fonte com acento **dentro de string**: o lexer da Fase 4 continua
+abortando, o da Fase 5 lê. O teste `t85_os_dois_lexers_tropecam_igual_em_utf8_
+multibyte` virou `t86_so_o_lexer_da_fase_5_le_utf8_multibyte_dentro_de_string`,
+como o comentário dele previa. A T88 compara sobre fontes ASCII, então o oráculo
+não é afetado.
+
+**Nota de execução (`StatFor`):** a T84 escreveu `StatFor(Loc, Decl, Exp, Exp,
+Exp)` sem o corpo, mas `ast.rs:194-201` tem `block: Box<Stat>`. A T86 acrescentou
+o campo (`StatFor(..., Stat)` e `StatForSemPasso(..., Stat)`), porque a
+alternativa — embrulhar `for` e corpo num `StatBlock` de dois — criaria uma
+divergência estrutural artificial justamente no nó que a T88 vai comparar.
+
 **Depende de:** T85.
 
 **Skills:** `test-driven-development` · `clean-code` · `architecture`
@@ -3200,6 +3220,42 @@ sem erro; erro claro (sem abortar) para `end` faltando.
 
 **Critério de aceite:** aceita `examples/nucleo.titan`; rejeita um programa com
 erro de tipo, com mensagem e posição.
+
+**Nota de execução (a flag `--checar`):** o driver ganhou `--checar <arquivo>`
+em vez de o argumento nu passar a significar "checa". A T86 pôde trocar o
+significado do argumento nu porque o que ela substituiu (a lista de tokens da
+T85) virou `--tokens` no mesmo commit, com um teste só olhando; aqui meia dúzia
+de testes da T86 leem a árvore do argumento nu, e a amarração definitiva do
+pipeline é tarefa da T88 — trocar na T87 seria mexer duas vezes no mesmo lugar,
+a segunda para desfazer parte da primeira.
+
+**Nota de execução (três posições de nó corrigidas no parser da T86):** o
+`loc` de `TopLevelFunc`, de `VarDot` e de `TopLevelVar` não batia com o do
+`parser.rs` — o da função era o do `function` e não o do nome (`parser.rs:351`),
+o do campo era o do `.` e não o do nome (`:1473`, que o diz com todas as
+letras), e o da variável de topo era o do nome e não o do `local` (`:382`).
+Nenhuma aparecia na árvore impressa, que não mostra `Loc`; o que as revelou foi
+o erro de tipo saindo numa coluna diferente da do mesmo erro no `titanc`. Como
+a T88 compara a forma das duas árvores, a correção é na produção (o parser), e
+não em quem as consome; o teste `t87_as_posicoes_dos_nos_batem_com_as_do_parser_
+em_rust` as trava.
+
+**Nota de execução (a única divergência de conteúdo):** uma declaração que erra
+o tipo **entra no escopo assim mesmo** neste checker, com o tipo anotado,
+enquanto o `titanc` a descarta e reporta um segundo erro em cada uso posterior
+do nome. O conjunto de erros do checker em Titan é, por isso, um **subconjunto**
+do de lá — nunca um erro que lá não exista —, e a T88 precisa da distinção ao
+comparar. A exceção é a variável de topo, que é recusada e **não** entra no
+escopo, porque ali os dois erros são a mesma notícia.
+
+**Nota de execução (limites do codegen encontrados):** dois, os dois já
+conhecidos de outras tarefas e contornados do mesmo jeito. `c.itens[1].campo` —
+indexar um array que é campo de outro record e pegar um campo do elemento —
+perde os campos do tipo e o compilador recusa com "o record 'X' não tem campo
+'y'"; por isso a symtab é de arrays paralelos de primitivos, e não um
+`{Simbolo}`. E ler duas vezes um campo `string` de um record vindo por parâmetro
+é um *move* no Rust emitido (ADR 0007), contornado com o `"" ..` que
+`parser.titan` já documenta.
 
 **Depende de:** T86.
 
@@ -3224,6 +3280,57 @@ erro de tipo, com mensagem e posição.
 imprime a AST tipada e sai com 0; o teste de oráculo passa para `hello.titan` e
 `nucleo.titan`; os erros de tipo de um `.titan` inválido **batem** com os do
 `titanc`.
+
+**Nota de execução (o que "AST tipada" virou):** as **assinaturas** que a
+análise resolveu, e não o tipo de cada expressão. `checa_exp` devolve um `T`
+que quem a chamou consome e descarta, e fazê-la guardá-lo exigiria uma árvore
+paralela cujo único leitor seria o driver; as assinaturas, por outro lado, são
+o que o `titanc` também expõe sem reescrita (`CheckedProgram`), e portanto o
+que o oráculo pode comparar. A saída são duas seções — `-- tipos --` e
+`-- arvore --` —, e não os tipos intercalados na árvore, porque a árvore já é
+comparada byte a byte desde a T86: separadas, uma divergência de tipo e uma
+divergência de forma apontam para lugares diferentes do pipeline. O checker
+ganhou `checa_e_anota`; `checa_programa` continua existindo e a chama
+descartando as anotações, de modo que nenhum teste da T87 mudou.
+
+**Nota de execução (o argumento nu, pela última vez):** ele passa a ser o
+pipeline inteiro, e o que significava na T86 (parseia e imprime a árvore) virou
+`--arvore` — pela mesma porta que a T86 usou ao mover a lista de tokens da T85
+para `--tokens`. É a troca que a T87 deixou para cá de propósito, e as onze
+invocações dos testes da T86 ganharam a flag no mesmo commit.
+
+**Nota de execução (o oráculo é um formatador, não uma flag nova):** o teste
+chama `titanc::lexer::lex`, `parser::parse` e `checker::check` — as funções
+puras que o compilador de verdade usa — e traduz a AST em Rust para exatamente
+o texto que `selfhost/ast.titan` imprime. A alternativa, uma flag `--arvore` no
+próprio `titanc`, carregaria para sempre o formato de impressão de um módulo do
+`selfhost/` dentro do compilador. O formatador mora no teste, que é quem tem
+interesse nele, e a referência é o arquivo Titan: divergência entre os dois é
+bug do lado Rust até prova em contrário.
+
+**Nota de execução (a guarda do subconjunto):** o oráculo **recusa** um fonte
+que saia do subconjunto comum antes de comparar — `float`, `enum`/`match`,
+`continue`, `repeat`/`until`, `for`-in e os símbolos da T59, que o lexer em
+Titan herdou da Fase 4 sem conhecer (`eh_palavra_chave`,
+`selfhost/lexer.titan:207`). Sem ela, um fonte com `enum` produziria árvores
+diferentes por construção e o teste ou falharia sem informar nada ou seria
+afrouxado até passar. `t88_o_oraculo_recusa_fonte_fora_do_subconjunto` é o
+teste do teste: ele impede que a guarda passe a devolver "está dentro" para
+tudo.
+
+**Nota de execução (como os erros "batem"):** a asserção é de **subconjunto**,
+e não de igualdade, porque é o que o cabeçalho de `selfhost/checker.titan` já
+documentava: uma declaração que erra o tipo entra no escopo lá e é descartada
+no `titanc`, o que só pode produzir erros **a menos**. Cada erro do checker em
+Titan tem de existir, palavra por palavra e na mesma linha e coluna, na lista
+do `titanc`; um erro que lá não exista é falha de teste. Afirmar o subconjunto
+desde o início vale mais que exigir igualdade e afrouxar depois.
+
+**Nota de execução (o terceiro fonte do oráculo):** além de `hello.titan` e
+`nucleo.titan`, que o critério nomeia, o oráculo roda sobre
+`examples/lexer.titan` — 282 linhas com record, array, `while`, `if`
+encadeado, chamadas e concatenação. É o maior programa do repositório dentro do
+subconjunto, e o único dos três que de fato exercita o formatador inteiro.
 
 **Depende de:** T87.
 

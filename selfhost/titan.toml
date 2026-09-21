@@ -5,6 +5,12 @@
 # [modulos] e o grafo do driver (T80) resolve o resto — o nome do modulo e o
 # que o programa escreve em `import`, e nao precisa coincidir com o nome do
 # arquivo.
+#
+# A ordem das linhas nao importa: quem resolve a ordem de compilacao e o grafo
+# de dependencias do driver, a partir dos `import` de cada fonte (T80). Hoje
+# ela e ast -> lexer -> parser -> checker -> main. O `checker` depende so de
+# `ast`, e nao do `parser`: ele recebe a arvore ja pronta, o que e o que
+# permite a T88 amarrar as tres pecas sem que nenhuma conheca a seguinte.
 
 [pacote]
 nome = "titanself"
@@ -13,3 +19,5 @@ principal = "main.titan"
 [modulos]
 ast = "ast.titan"
 lexer = "lexer.titan"
+parser = "parser.titan"
+checker = "checker.titan"
