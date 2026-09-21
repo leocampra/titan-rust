@@ -116,25 +116,51 @@ deliberadamente deselegante (constantes como função no lugar de tipo soma,
 estado da varredura num `record` passado por parâmetro no lugar de retorno
 múltiplo) — evidência do que falta para a Fase 5, não defeito desta.
 
-## Como rodar o projeto da Fase 5 (self-hosting: AST em Titan)
+## Como rodar o projeto da Fase 5 (self-hosting: o pipeline em Titan)
 
 ```bash
 ./target/release/titanc --manifesto selfhost --out .
-./titanself
-# → arvore: (1 + (2 * 3))
-# → nos: 5
-# → linha: 1
+./titanself examples/nucleo.titan
+# → -- tipos --
+# → fatorial: (integer) -> integer
+# → fibonacci: (integer) -> integer
+# → main: ({string}) -> integer
+# → -- arvore --
+# → function fatorial(n: integer): integer
+# →   if (n <= 1)
+# →     return 1
+# →   ...
 echo $?
 # → 0
 ```
 
 `selfhost/` é um projeto multi-módulo declarado por
 [`titan.toml`](selfhost/titan.toml), e não um arquivo solto: é assim que um
-compilador escrito em Titan passa a caber em mais de um arquivo. Na Fase 5 ele
-traz `selfhost/ast.titan` — a AST do Titan escrita em Titan, com `enum Exp`
-**recursivo de verdade** (`ExpBinop(Loc, string, Exp, Exp)`), `enum Stat`,
-`enum TopLevel`, `enum Var`, `enum Tipo` e `record Loc`. O `main.titan` monta a
-expressão `1 + 2 * 3` com esses construtores e a percorre com `match`.
+compilador escrito em Titan passa a caber em mais de um arquivo. Ele traz o
+pipeline inteiro — `ast.titan` (a AST sobre tipos soma), `lexer.titan`,
+`parser.titan` e `checker.titan` —, e o `main.titan` os amarra: lê o fonte,
+tokeniza, parseia, checa, e imprime a **AST tipada** — as assinaturas que a
+análise resolveu e a forma da árvore que o parser produziu.
+
+A `ast.titan` é onde os tipos soma aparecem inteiros: `enum Exp` **recursivo de
+verdade** (`ExpBinop(Loc, string, Exp, Exp)`), `enum Stat`, `enum TopLevel`,
+`enum Var`, `enum Tipo` e `record Loc`.
+
+As outras saídas do driver, cada uma uma etapa do pipeline:
+
+```bash
+./titanself                                 # a Exp de 1 + 2 * 3, percorrida com match
+./titanself --tokens examples/nucleo.titan  # só o lexer: um token por linha
+./titanself --arvore examples/nucleo.titan  # lexer + parser: a árvore sintática
+./titanself --checar examples/nucleo.titan  # + o checker: "ok: <arquivo>" ou os erros
+```
+
+**Que o pipeline em Titan concorda com o `titanc` não é afirmação, é teste.**
+Um teste de integração roda os dois sobre os mesmos `examples/*.titan` — o
+`titanc` entra como lib ([ADR 0018](docs/adr/0018-titanc-lib-lsp-reusa-pipeline.md)),
+com as mesmas funções `lex`/`parse`/`check` que o compilador de verdade usa — e
+compara a lista de tokens, a forma da árvore e o conjunto de erros de tipo.
+Divergência é falha de teste.
 
 Vale ler `selfhost/ast.titan` lado a lado com `examples/lexer.titan`: o mesmo
 compilador, antes e depois dos tipos soma. Lá, `TokenKind` é `integer` e cada
@@ -313,6 +339,10 @@ compostos) + Fase 3 (capability runtimes) + Fase 4 (self-hosting / LSP):
 - `examples/lexer.titan`: lexer do Titan escrito em Titan, sobre `texto` e
   `io` — prova de self-hosting parcial
   ([ADR 0020](docs/adr/0020-self-hosting-por-etapas.md)).
+- `selfhost/`: o pipeline `lexer → parser → checker` escrito em Titan, sobre
+  tipos soma e módulos de usuário, validado contra o `titanc` por um teste de
+  oráculo que compara tokens, forma da árvore e erros de tipo — veja "Como
+  rodar o projeto da Fase 5" acima.
 - Tipos opcionais (`T?`), com estreitamento por `if x ~= nil then`.
 - Cast de tipo (`exp as T`) e o tipo `value` — veja a seção abaixo.
 - `foreign function` (Fase 5, T73): chamada a funções C, com assinatura
@@ -536,9 +566,15 @@ com `match` primeiro) e atravessar a fronteira de FFI.
 
 Ficam para fases futuras (veja o roadmap no [`PRD.md`](PRD.md)):
 
-- `local m = import "data"` (a forma do original), módulos definidos pelo
-  usuário (um `.titan` importando outro `.titan`).
-- Parser e checker auto-hospedados (self-hosting pleno, fase 5).
+- `local m = import "data"` (a forma do original).
+- **O pipeline auto-hospedado cobre um subconjunto, não a linguagem inteira.**
+  `selfhost/lexer.titan`, `parser.titan` e `checker.titan` leem e checam o que
+  os `examples/*.titan` usam — funções, `local`, `return`, `if`/`while`/`for`,
+  atribuição, chamadas, record, array e map —, e não as 4498 linhas de
+  `crates/titanc/src/checker.rs`. Ficam de fora, entre outros, `enum`/`match`,
+  `repeat`/`until`, `continue`, `foreign function` e float. O compilador que
+  compila é o `titanc`; o pipeline em Titan é a prova de que a linguagem já
+  comporta escrevê-lo.
 - `titan-crypto`, `titan-ai` (fases 3b/3c).
 
 Qualquer construção fora desse subconjunto é rejeitada pelo `checker` (ou
@@ -568,7 +604,10 @@ titan-rust/
 ├── selfhost/            # o titanc escrito em Titan: projeto multi-módulo
 │   ├── titan.toml       # manifesto: nome → caminho de cada módulo
 │   ├── ast.titan        # a AST do Titan em Titan, sobre tipos soma
-│   └── main.titan
+│   ├── lexer.titan      # o lexer, no idioma da Fase 5
+│   ├── parser.titan     # descida recursiva produzindo a AST acima
+│   ├── checker.titan    # a análise semântica: symtab em pilha, duas passadas
+│   └── main.titan       # amarra as três peças e imprime a AST tipada
 ├── docs/
 │   ├── arquitetura.md
 │   └── adr/

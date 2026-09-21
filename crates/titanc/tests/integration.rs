@@ -3387,6 +3387,7 @@ fn t86_selfhost_parser_titan_parseia_hello_e_nucleo_sem_erro() {
     // matava o lexer no `á` de "Olá, mundo!". A T86 fez `lex_string` copiar o
     // caractere multi-byte inteiro justamente porque este critério o nomeia.
     let hello = Command::new(&titanself)
+        .arg("--arvore")
         .arg(examples_dir().join("hello.titan"))
         .output()
         .expect("parseia examples/hello.titan");
@@ -3407,6 +3408,7 @@ fn t86_selfhost_parser_titan_parseia_hello_e_nucleo_sem_erro() {
     // `nucleo.titan`: três funções, `if`, `while`, `for` numérico, chamadas,
     // concatenação e aritmética — o subconjunto que a T86 declara, inteiro.
     let nucleo = Command::new(&titanself)
+        .arg("--arvore")
         .arg(examples_dir().join("nucleo.titan"))
         .output()
         .expect("parseia examples/nucleo.titan");
@@ -3484,6 +3486,7 @@ fn t86_selfhost_parser_titan_erra_claro_sem_abortar_com_end_faltando() {
          end\n",
     );
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(&sem_end)
         .output()
         .expect("parseia um fonte com 'end' faltando");
@@ -3514,6 +3517,7 @@ fn t86_selfhost_parser_titan_erra_claro_sem_abortar_com_end_faltando() {
          end\n",
     );
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(&varios)
         .output()
         .expect("parseia um fonte com vários erros");
@@ -3533,6 +3537,7 @@ fn t86_selfhost_parser_titan_erra_claro_sem_abortar_com_end_faltando() {
     // que falharia por timeout se a recuperação regredisse.
     let lixo = write_source(&fontes, "lixo.titan", "42 + 7\nend\n)\n");
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(&lixo)
         .output()
         .expect("parseia lixo sem travar");
@@ -3567,6 +3572,7 @@ end
 "#,
     );
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(&cascata)
         .output()
         .expect("parseia um record com campo sem tipo");
@@ -3585,6 +3591,7 @@ end
     // Arquivo vazio é um programa válido de zero declarações, e não um erro.
     let vazio = write_source(&fontes, "vazio.titan", "");
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(&vazio)
         .output()
         .expect("parseia um arquivo vazio");
@@ -3629,6 +3636,7 @@ fn t86_selfhost_parser_titan_resolve_a_precedencia_na_forma_da_arvore() {
          end\n",
     );
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(&fonte)
         .output()
         .expect("parseia o fonte de precedência");
@@ -3696,6 +3704,7 @@ fn t86_selfhost_parser_titan_le_o_lexer_da_fase_4_inteiro() {
 
     for exemplo in ["lexer.titan", "dados.titan"] {
         let saida = Command::new(&titanself)
+            .arg("--arvore")
             .arg(examples_dir().join(exemplo))
             .output()
             .unwrap_or_else(|e| panic!("parseia examples/{exemplo}: {e}"));
@@ -3751,6 +3760,7 @@ fn t86_o_que_esta_fora_do_subconjunto_da_t86_erra_em_vez_de_passar_batido() {
     // `selfhost/ast.titan` é quase todo `enum`, então é o fonte que prova o
     // limite sem precisar de um arquivo inventado.
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(selfhost_dir().join("ast.titan"))
         .output()
         .expect("parseia selfhost/ast.titan");
@@ -3788,6 +3798,7 @@ fn t86_o_que_esta_fora_do_subconjunto_da_t86_erra_em_vez_de_passar_batido() {
         "function f(): float\n\x20   return 0.0\nend\n",
     );
     let saida = Command::new(&titanself)
+        .arg("--arvore")
         .arg(&com_float)
         .output()
         .expect("parseia um fonte com float");
@@ -4404,4 +4415,819 @@ fn t87_as_posicoes_dos_nos_batem_com_as_do_parser_em_rust() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&fontes);
+}
+
+// =====================================================================
+// T88 — o oráculo
+//
+// O que segue é o formatador que traduz a AST do `titanc` (usado como
+// **lib**, ADR 0018) para exatamente o texto que `selfhost/ast.titan`
+// imprime. Ele existe por uma razão só: sem um texto comum, "as duas
+// árvores concordam" não é uma asserção, é uma opinião.
+//
+// Por que um formatador em Rust e não uma flag `--arvore` no `titanc`: a
+// flag seria superfície de CLI nova que nenhuma outra tarefa pediu, e
+// carregaria para sempre o formato de impressão de um módulo do
+// `selfhost/` dentro do compilador. Aqui ele mora no teste, que é quem
+// tem interesse nele.
+//
+// **A regra de ouro deste bloco**: ele espelha `selfhost/ast.titan`, e a
+// referência é aquele arquivo. Divergência entre os dois é um bug daqui
+// até prova em contrário — o formato é o que o Titan escreve, e este
+// código é quem o persegue.
+// =====================================================================
+
+use titanc::ast::{Decl, Exp, Program, Stat, TopLevel, Type as TipoAst, Var};
+use titanc::lexer::{Token, TokenKind};
+
+/// Uma linha de token no formato de `lexer.token_para_texto`:
+/// `CLASSE 'lexeme' linha:coluna`.
+///
+/// A classe é a do lexer da **Fase 4**, que o da Fase 5 herdou intacta
+/// (`selfhost/lexer.titan`, `nome_kind`): cinco classes grossas onde o
+/// `TokenKind` do Rust tem oitenta variantes. Não é perda de informação
+/// para o que se compara aqui — o lexeme distingue `+` de `-` dentro de
+/// `SIMBOLO`, e `function` de `local` dentro de `PALAVRA_CHAVE`.
+fn token_para_texto_do_rust(t: &Token) -> String {
+    let (classe, lexeme) = classe_e_lexeme(&t.kind);
+    format!("{classe} '{lexeme}' {}:{}", t.loc.line, t.loc.col)
+}
+
+/// A classe e o lexeme de um `TokenKind` do `titanc`, na convenção do
+/// lexer em Titan.
+///
+/// As palavras-chave que o lexer da Fase 5 **não** conhece (`enum`,
+/// `match`, `with`, `in`, `repeat`, `until`, `continue`, `foreign`) saem
+/// como `NOME`, que é o que o lexer em Titan produz para elas —
+/// `eh_palavra_chave` (`selfhost/lexer.titan:207`) copia a lista da Fase
+/// 4 de propósito, e o comentário de lá explica por quê. O mesmo vale
+/// para os símbolos da T59 (`? & | << >> //`), que o lexer em Titan não
+/// lexa: aqui eles saem como `SIMBOLO` com o texto que têm, e um fonte
+/// que os use simplesmente não é comparável — por isso o oráculo roda
+/// sobre o subconjunto, e `oraculo_recusa_fonte_fora_do_subconjunto` o
+/// diz em voz alta em vez de deixar passar uma comparação silenciosa.
+fn classe_e_lexeme(k: &TokenKind) -> (&'static str, String) {
+    match k {
+        TokenKind::Eof => ("EOF", String::new()),
+        TokenKind::Name(n) => ("NOME", n.clone()),
+        TokenKind::Integer(v) => ("INTEIRO", v.to_string()),
+        // O lexer em Titan não tem float: `1.5` sai como `INTEIRO '1'`,
+        // `SIMBOLO '.'`, `INTEIRO '5'`. Um fonte com float está fora do
+        // subconjunto comparável, e a guarda o recusa antes daqui.
+        TokenKind::Float(v) => ("INTEIRO", v.to_string()),
+        TokenKind::String(s) => ("STRING", s.clone()),
+
+        TokenKind::Function => ("PALAVRA_CHAVE", "function".into()),
+        TokenKind::Local => ("PALAVRA_CHAVE", "local".into()),
+        TokenKind::Return => ("PALAVRA_CHAVE", "return".into()),
+        TokenKind::End => ("PALAVRA_CHAVE", "end".into()),
+        TokenKind::True => ("PALAVRA_CHAVE", "true".into()),
+        TokenKind::False => ("PALAVRA_CHAVE", "false".into()),
+        TokenKind::Nil => ("PALAVRA_CHAVE", "nil".into()),
+        TokenKind::And => ("PALAVRA_CHAVE", "and".into()),
+        TokenKind::Or => ("PALAVRA_CHAVE", "or".into()),
+        TokenKind::Not => ("PALAVRA_CHAVE", "not".into()),
+        TokenKind::If => ("PALAVRA_CHAVE", "if".into()),
+        TokenKind::Then => ("PALAVRA_CHAVE", "then".into()),
+        TokenKind::Elseif => ("PALAVRA_CHAVE", "elseif".into()),
+        TokenKind::Else => ("PALAVRA_CHAVE", "else".into()),
+        TokenKind::While => ("PALAVRA_CHAVE", "while".into()),
+        TokenKind::Do => ("PALAVRA_CHAVE", "do".into()),
+        TokenKind::For => ("PALAVRA_CHAVE", "for".into()),
+        TokenKind::KwBoolean => ("PALAVRA_CHAVE", "boolean".into()),
+        TokenKind::KwInteger => ("PALAVRA_CHAVE", "integer".into()),
+        TokenKind::KwFloat => ("PALAVRA_CHAVE", "float".into()),
+        TokenKind::KwString => ("PALAVRA_CHAVE", "string".into()),
+        TokenKind::KwValue => ("PALAVRA_CHAVE", "value".into()),
+        TokenKind::KwRecord => ("PALAVRA_CHAVE", "record".into()),
+        TokenKind::KwAs => ("PALAVRA_CHAVE", "as".into()),
+        TokenKind::KwImport => ("PALAVRA_CHAVE", "import".into()),
+        TokenKind::KwBreak => ("PALAVRA_CHAVE", "break".into()),
+
+        // As palavras-chave que só a Fase 5 acrescentou ao `titanc`: para
+        // o lexer em Titan elas ainda são identificadores.
+        TokenKind::KwEnum => ("NOME", "enum".into()),
+        TokenKind::KwMatch => ("NOME", "match".into()),
+        TokenKind::KwWith => ("NOME", "with".into()),
+        TokenKind::KwContinue => ("NOME", "continue".into()),
+        TokenKind::KwRepeat => ("NOME", "repeat".into()),
+        TokenKind::KwUntil => ("NOME", "until".into()),
+        TokenKind::KwIn => ("NOME", "in".into()),
+        TokenKind::KwForeign => ("NOME", "foreign".into()),
+
+        TokenKind::LParen => ("SIMBOLO", "(".into()),
+        TokenKind::RParen => ("SIMBOLO", ")".into()),
+        TokenKind::LCurly => ("SIMBOLO", "{".into()),
+        TokenKind::RCurly => ("SIMBOLO", "}".into()),
+        TokenKind::LBracket => ("SIMBOLO", "[".into()),
+        TokenKind::RBracket => ("SIMBOLO", "]".into()),
+        TokenKind::Comma => ("SIMBOLO", ",".into()),
+        TokenKind::Colon => ("SIMBOLO", ":".into()),
+        TokenKind::Semicolon => ("SIMBOLO", ";".into()),
+        TokenKind::Dot => ("SIMBOLO", ".".into()),
+        TokenKind::Concat => ("SIMBOLO", "..".into()),
+        TokenKind::Assign => ("SIMBOLO", "=".into()),
+        TokenKind::Hash => ("SIMBOLO", "#".into()),
+        TokenKind::Plus => ("SIMBOLO", "+".into()),
+        TokenKind::Minus => ("SIMBOLO", "-".into()),
+        TokenKind::Star => ("SIMBOLO", "*".into()),
+        TokenKind::Slash => ("SIMBOLO", "/".into()),
+        TokenKind::Percent => ("SIMBOLO", "%".into()),
+        TokenKind::Caret => ("SIMBOLO", "^".into()),
+        TokenKind::Eq => ("SIMBOLO", "==".into()),
+        TokenKind::Ne => ("SIMBOLO", "~=".into()),
+        TokenKind::Lt => ("SIMBOLO", "<".into()),
+        TokenKind::Gt => ("SIMBOLO", ">".into()),
+        TokenKind::Le => ("SIMBOLO", "<=".into()),
+        TokenKind::Ge => ("SIMBOLO", ">=".into()),
+        TokenKind::Question => ("SIMBOLO", "?".into()),
+        TokenKind::Amp => ("SIMBOLO", "&".into()),
+        TokenKind::Pipe => ("SIMBOLO", "|".into()),
+        TokenKind::Tilde => ("SIMBOLO", "~".into()),
+        TokenKind::Shl => ("SIMBOLO", "<<".into()),
+        TokenKind::Shr => ("SIMBOLO", ">>".into()),
+        TokenKind::DoubleSlash => ("SIMBOLO", "//".into()),
+    }
+}
+
+/// Se o fonte está no subconjunto que os dois pipelines compartilham.
+///
+/// Devolve o motivo da recusa, ou `None` se ele é comparável. O ponto não
+/// é a lista: é que **o oráculo nunca compara duas saídas sem antes saber
+/// que a comparação faz sentido**. Sem esta guarda, um fonte com `enum`
+/// produziria árvores diferentes por construção, e o teste ou falharia
+/// sem informar nada ou (pior) seria afrouxado até passar.
+fn fora_do_subconjunto(tokens: &[Token]) -> Option<String> {
+    for t in tokens {
+        let motivo = match &t.kind {
+            TokenKind::Float(_) => "float (o lexer em Titan não lexa `1.5`)",
+            TokenKind::KwEnum | TokenKind::KwMatch | TokenKind::KwWith => {
+                "`enum`/`match` (fora do subconjunto do parser da T86)"
+            }
+            TokenKind::KwContinue => "`continue`",
+            TokenKind::KwRepeat | TokenKind::KwUntil => "`repeat`/`until`",
+            TokenKind::KwIn => "`for`-in (o lexer em Titan lê `in` como nome)",
+            TokenKind::KwForeign => "`foreign function`",
+            TokenKind::Question
+            | TokenKind::Amp
+            | TokenKind::Pipe
+            | TokenKind::Shl
+            | TokenKind::Shr
+            | TokenKind::DoubleSlash => "símbolo da T59 que o lexer em Titan não lexa",
+            _ => continue,
+        };
+        return Some(format!(
+            "{motivo}, na linha {} coluna {}",
+            t.loc.line, t.loc.col
+        ));
+    }
+    None
+}
+
+// ---- A árvore, no formato de `selfhost/ast.titan` ---------------------
+
+fn recuo(n: usize) -> String {
+    "  ".repeat(n)
+}
+
+/// `ast.tipo_para_texto`. `None` é `TipoAusente`, que sai como `?`.
+fn tipo_para_texto(t: Option<&TipoAst>) -> String {
+    let Some(t) = t else {
+        return "?".to_string();
+    };
+    match t {
+        TipoAst::TypeNil { .. } => "nil".into(),
+        TipoAst::TypeBoolean { .. } => "boolean".into(),
+        TipoAst::TypeInteger { .. } => "integer".into(),
+        TipoAst::TypeFloat { .. } => "float".into(),
+        TipoAst::TypeString { .. } => "string".into(),
+        TipoAst::TypeValue { .. } => "value".into(),
+        TipoAst::TypeQualName { module, name, .. } => format!("{module}.{name}"),
+        TipoAst::TypeName { name, .. } => name.clone(),
+        TipoAst::TypeArray { subtype, .. } => format!("{{{}}}", tipo_para_texto(Some(subtype))),
+        TipoAst::TypeMap {
+            keystype,
+            valuestype,
+            ..
+        } => format!(
+            "{{{}: {}}}",
+            tipo_para_texto(Some(keystype)),
+            tipo_para_texto(Some(valuestype))
+        ),
+        TipoAst::TypeFunction { .. } => "function(...)".into(),
+        TipoAst::TypeOption { basetype, .. } => {
+            format!("{}?", tipo_para_texto(Some(basetype)))
+        }
+    }
+}
+
+/// `ast.decl_para_texto`.
+fn decl_para_texto(d: &Decl) -> String {
+    format!("{}: {}", d.name, tipo_para_texto(d.r#type.as_ref()))
+}
+
+fn juntar<T>(itens: &[T], f: impl Fn(&T) -> String) -> String {
+    itens.iter().map(f).collect::<Vec<_>>().join(", ")
+}
+
+/// `ast.var_para_texto`.
+fn var_para_texto(v: &Var) -> String {
+    match v {
+        Var::VarName { name, .. } => name.clone(),
+        Var::VarBracket { exp1, exp2, .. } => {
+            format!("{}[{}]", exp_para_texto(exp1), exp_para_texto(exp2))
+        }
+        Var::VarDot { exp, name, .. } => format!("{}.{}", exp_para_texto(exp), name),
+    }
+}
+
+/// `ast.exp_para_texto` — a expressão totalmente parentizada.
+fn exp_para_texto(e: &Exp) -> String {
+    match e {
+        Exp::ExpNil { .. } => "nil".into(),
+        Exp::ExpBool { value, .. } => if *value { "true" } else { "false" }.into(),
+        Exp::ExpInteger { value, .. } => value.to_string(),
+        Exp::ExpFloat { value, .. } => value.to_string(),
+        Exp::ExpString { value, .. } => format!("\"{value}\""),
+        Exp::ExpVar { var, .. } => var_para_texto(var),
+        Exp::ExpUnop { op, exp, .. } => {
+            // `not` com espaço, `-`/`#`/`~` colados — a mesma distinção que
+            // `exp_para_texto` faz em `ast.titan`, pela mesma razão: sem ela
+            // `not a` sai "(nota)".
+            if op == "not" {
+                format!("({op} {})", exp_para_texto(exp))
+            } else {
+                format!("({op}{})", exp_para_texto(exp))
+            }
+        }
+        Exp::ExpBinop { lhs, op, rhs, .. } => {
+            format!("({} {op} {})", exp_para_texto(lhs), exp_para_texto(rhs))
+        }
+        Exp::ExpConcat { exps, .. } => format!(
+            "({})",
+            exps.iter()
+                .map(exp_para_texto)
+                .collect::<Vec<_>>()
+                .join(" .. ")
+        ),
+        Exp::ExpCast { exp, target, .. } => {
+            format!(
+                "({} as {})",
+                exp_para_texto(exp),
+                tipo_para_texto(Some(target))
+            )
+        }
+        Exp::ExpAdjust { exp, .. } => exp_para_texto(exp),
+        Exp::ExpExtra { exp, index, .. } => format!("{}#{index}", exp_para_texto(exp)),
+        // Os argumentos ficam de fora dos dois lados: `ast.titan` escreve
+        // `f(...)`. Não é economia — é que a árvore impressa mostra a
+        // **forma**, e a forma dos argumentos já aparece quando eles são
+        // expressões de um `local` ou de um `return`.
+        Exp::ExpCall { exp, .. } => format!("{}(...)", exp_para_texto(exp)),
+        Exp::ExpInitList { .. } => "{...}".into(),
+        Exp::ExpMatch { exp, .. } => {
+            format!("match {} with ... end", exp_para_texto(exp))
+        }
+    }
+}
+
+/// `ast.stat_para_texto`.
+///
+/// O `StatIf` do `titanc` carrega o `else` dentro de si (`elsestat:
+/// Option`), enquanto o `ast.titan` tem `StatIf` e `StatIfElse`
+/// separados. A diferença é de representação e some no texto: os dois
+/// imprimem os ramos e depois, se houver, `else` — e é o texto que o
+/// oráculo compara, porque é o que ambos os lados sabem produzir.
+fn stat_para_texto(s: &Stat, nivel: usize) -> String {
+    let pad = recuo(nivel);
+    match s {
+        Stat::StatBlock { stats, .. } => stats
+            .iter()
+            .map(|sub| stat_para_texto(sub, nivel))
+            .collect(),
+        Stat::StatWhile {
+            condition, block, ..
+        } => format!(
+            "{pad}while {}\n{}",
+            exp_para_texto(condition),
+            stat_para_texto(block, nivel + 1)
+        ),
+        Stat::StatRepeat {
+            block, condition, ..
+        } => format!(
+            "{pad}repeat\n{}{pad}until {}\n",
+            stat_para_texto(block, nivel + 1),
+            exp_para_texto(condition)
+        ),
+        Stat::StatIf { thens, elsestat, .. } => {
+            let mut s = String::new();
+            for (i, t) in thens.iter().enumerate() {
+                let palavra = if i == 0 { "if" } else { "elseif" };
+                s.push_str(&format!(
+                    "{pad}{palavra} {}\n{}",
+                    exp_para_texto(&t.condition),
+                    stat_para_texto(&t.block, nivel + 1)
+                ));
+            }
+            if let Some(senao) = elsestat {
+                s.push_str(&format!(
+                    "{pad}else\n{}",
+                    stat_para_texto(senao, nivel + 1)
+                ));
+            }
+            s
+        }
+        Stat::StatFor {
+            decl,
+            start,
+            finish,
+            inc,
+            block,
+            ..
+        } => {
+            // Com passo é `StatFor` no `ast.titan`; sem passo é
+            // `StatForSemPasso`, e a linha não traz a terceira expressão.
+            let cabeca = match inc {
+                Some(passo) => format!(
+                    "{pad}for {} = {}, {}, {}",
+                    decl_para_texto(decl),
+                    exp_para_texto(start),
+                    exp_para_texto(finish),
+                    exp_para_texto(passo)
+                ),
+                None => format!(
+                    "{pad}for {} = {}, {}",
+                    decl_para_texto(decl),
+                    exp_para_texto(start),
+                    exp_para_texto(finish)
+                ),
+            };
+            format!("{cabeca}\n{}", stat_para_texto(block, nivel + 1))
+        }
+        Stat::StatForIn {
+            decls, exp, block, ..
+        } => format!(
+            "{pad}for {} in {}\n{}",
+            juntar(decls, decl_para_texto),
+            exp_para_texto(exp),
+            stat_para_texto(block, nivel + 1)
+        ),
+        Stat::StatAssign { vars, exps, .. } => format!(
+            "{pad}assign {} = {}\n",
+            juntar(vars, var_para_texto),
+            juntar(exps, exp_para_texto)
+        ),
+        Stat::StatDecl { decls, exps, .. } => {
+            let ds = juntar(decls, decl_para_texto);
+            if exps.is_empty() {
+                format!("{pad}local {ds}\n")
+            } else {
+                format!("{pad}local {ds} = {}\n", juntar(exps, exp_para_texto))
+            }
+        }
+        Stat::StatCall { callexp, .. } => {
+            format!("{pad}call {}\n", exp_para_texto(callexp))
+        }
+        Stat::StatReturn { exps, .. } => {
+            format!("{pad}return {}\n", juntar(exps, exp_para_texto))
+        }
+        Stat::StatBreak { .. } => format!("{pad}break\n"),
+        Stat::StatContinue { .. } => format!("{pad}continue\n"),
+        Stat::StatMatch { exp, .. } => {
+            format!("{pad}match {}\n", exp_para_texto(exp))
+        }
+    }
+}
+
+/// `ast.toplevel_para_texto`.
+fn toplevel_para_texto(t: &TopLevel) -> String {
+    match t {
+        TopLevel::TopLevelMethod {
+            class, name, block, ..
+        } => format!("method {class}.{name}\n{}", stat_para_texto(block, 1)),
+        TopLevel::TopLevelStatic {
+            class, name, block, ..
+        } => format!("static {class}.{name}\n{}", stat_para_texto(block, 1)),
+        TopLevel::TopLevelFunc {
+            islocal,
+            name,
+            params,
+            rettypes,
+            block,
+            ..
+        } => {
+            let mut cabeca = format!("function {name}({})", juntar(params, decl_para_texto));
+            if !rettypes.is_empty() {
+                cabeca.push_str(&format!(
+                    ": {}",
+                    juntar(rettypes, |t| tipo_para_texto(Some(t)))
+                ));
+            }
+            if *islocal {
+                cabeca = format!("local {cabeca}");
+            }
+            format!("{cabeca}\n{}", stat_para_texto(block, 1))
+        }
+        TopLevel::TopLevelVar {
+            islocal,
+            decl,
+            value,
+            ..
+        } => {
+            let corpo = format!("{} = {}\n", decl_para_texto(decl), exp_para_texto(value));
+            if *islocal {
+                format!("local {corpo}")
+            } else {
+                format!("var {corpo}")
+            }
+        }
+        TopLevel::TopLevelRecord { name, fields, .. } => {
+            let mut s = format!("record {name}\n");
+            for c in fields {
+                s.push_str(&format!("  {}\n", decl_para_texto(c)));
+            }
+            s
+        }
+        TopLevel::TopLevelImport { modname, .. } => format!("import {modname}\n"),
+        TopLevel::TopLevelEnum { name, variants, .. } => {
+            let mut s = format!("enum {name}\n");
+            for v in variants {
+                s.push_str(&format!("  {}\n", v.name));
+            }
+            s
+        }
+        TopLevel::TopLevelForeignFunc { name, params, .. } => {
+            format!(
+                "foreign function {name}({})\n",
+                juntar(params, decl_para_texto)
+            )
+        }
+    }
+}
+
+/// O que `main.titan` imprime sob `-- arvore --`: uma declaração de topo
+/// por bloco, sem a quebra de linha dobrada que o `print` do Titan evita
+/// com `texto_sem_quebra_final`.
+fn arvore_do_titanc(programa: &Program) -> String {
+    programa.iter().map(toplevel_para_texto).collect()
+}
+
+// ---- Os tipos, no formato de `checker.assinatura_legivel` -------------
+
+/// `checker.tipo_para_texto` do lado Titan, que é `checker::type_name` do
+/// lado Rust — com uma diferença de um caractere: `Type::Invalid` sai
+/// como `<inválido>` lá e `<invalido>` aqui. Ela nunca aparece numa
+/// comparação, porque um programa com tipo inválido tem erro e não chega
+/// a ser impresso; o `unreachable` a trava em vez de escondê-la.
+fn tipo_semantico_para_texto(t: &titanc::types::Type) -> String {
+    match t {
+        titanc::types::Type::Invalid => {
+            unreachable!("um programa que tipa não tem `Type::Invalid` na assinatura")
+        }
+        outro => titanc::checker::type_name(outro),
+    }
+}
+
+/// `checker.assinatura_legivel`: `(integer, {string}) -> integer`.
+fn assinatura_legivel(params: &[titanc::types::Type], rettypes: &[titanc::types::Type]) -> String {
+    format!(
+        "({}) -> {}",
+        juntar(params, tipo_semantico_para_texto),
+        juntar(rettypes, tipo_semantico_para_texto)
+    )
+}
+
+/// O que `main.titan` imprime sob `-- tipos --`.
+///
+/// Percorre o programa **não-tipado** e consulta o `CheckedProgram` para
+/// cada nome, e não o contrário. A razão é a ordem: `TypedTopLevel` não
+/// tem variante para `import`, então percorrer só ele perderia as linhas
+/// `import x: module y`; e a ordem que o lado Titan usa é a do fonte.
+fn tipos_do_titanc(programa: &Program, checado: &titanc::checker::CheckedProgram) -> Vec<String> {
+    let mut linhas = Vec::new();
+    for t in programa {
+        match t {
+            TopLevel::TopLevelFunc { name, .. } => {
+                let assinatura = checado
+                    .program
+                    .iter()
+                    .find_map(|tt| match tt {
+                        titanc::checker::TypedTopLevel::Func {
+                            name: n,
+                            params,
+                            rettypes,
+                            ..
+                        } if n == name => Some((params.clone(), rettypes.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("o checker do titanc não tipou '{name}'"));
+                let (params, rettypes) = assinatura;
+                let tipos: Vec<_> = params.into_iter().map(|(_, t)| t).collect();
+                linhas.push(format!(
+                    "{name}: {}",
+                    assinatura_legivel(&tipos, &rettypes)
+                ));
+            }
+            TopLevel::TopLevelRecord { name, .. } => {
+                let campos = checado
+                    .program
+                    .iter()
+                    .find_map(|tt| match tt {
+                        titanc::checker::TypedTopLevel::Record {
+                            name: n, fields, ..
+                        } if n == name => Some(fields.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("o checker do titanc não tipou o record '{name}'"));
+                linhas.push(format!("record {name}"));
+                for (campo, tipo) in campos {
+                    linhas.push(format!("  {campo}: {}", tipo_semantico_para_texto(&tipo)));
+                }
+            }
+            TopLevel::TopLevelImport {
+                localname, modname, ..
+            } => linhas.push(format!("import {localname}: module {modname}")),
+            _ => {}
+        }
+    }
+    linhas
+}
+
+/// A saída inteira que o `titanself` imprime para um fonte que tipa — as
+/// duas seções, na ordem, com a quebra final.
+fn saida_do_oraculo(fonte: &str) -> Result<String, String> {
+    let tokens = titanc::lexer::lex(fonte).map_err(|e| format!("o titanc não lexou: {e:?}"))?;
+    let programa =
+        titanc::parser::parse(&tokens).map_err(|e| format!("o titanc não parseou: {e:?}"))?;
+    let checado = titanc::checker::check(&programa)
+        .map_err(|erros| format!("o titanc não tipou: {erros:?}"))?;
+
+    let mut s = String::from("-- tipos --\n");
+    for linha in tipos_do_titanc(&programa, &checado) {
+        s.push_str(&linha);
+        s.push('\n');
+    }
+    s.push_str("-- arvore --\n");
+    s.push_str(&arvore_do_titanc(&programa));
+    Ok(s)
+}
+
+// ---- Os testes da T88 -------------------------------------------------
+
+/// Critério de aceite da T88, primeira parte: `titanc selfhost/main.titan
+/// && ./main examples/nucleo.titan` imprime a AST tipada e sai com 0.
+///
+/// A saída é conferida inteira, e não por amostragem: as duas seções na
+/// ordem, as três assinaturas que o checker resolveu, e a árvore que a
+/// T86 já imprimia. Um pipeline que não rodasse também sairia com 0.
+#[test]
+fn t88_o_pipeline_auto_hospedado_imprime_a_ast_tipada() {
+    let (dir, titanself) = compila_selfhost("t88-ast-tipada");
+
+    let saida = Command::new(&titanself)
+        .arg(examples_dir().join("nucleo.titan"))
+        .output()
+        .expect("compila examples/nucleo.titan com o pipeline auto-hospedado");
+    assert_never_panics(&saida);
+    assert_eq!(
+        saida.status.code(),
+        Some(0),
+        "nucleo.titan passa nas três etapas: {}{}",
+        String::from_utf8_lossy(&saida.stdout),
+        String::from_utf8_lossy(&saida.stderr)
+    );
+
+    let texto = String::from_utf8_lossy(&saida.stdout);
+    assert_eq!(
+        texto,
+        "-- tipos --\n\
+         fatorial: (integer) -> integer\n\
+         fibonacci: (integer) -> integer\n\
+         main: ({string}) -> integer\n\
+         -- arvore --\n\
+         function fatorial(n: integer): integer\n\
+         \x20 if (n <= 1)\n\
+         \x20   return 1\n\
+         \x20 local resultado: integer = 1\n\
+         \x20 local i: integer = 2\n\
+         \x20 while (i <= n)\n\
+         \x20   assign resultado = (resultado * i)\n\
+         \x20   assign i = (i + 1)\n\
+         \x20 return resultado\n\
+         function fibonacci(n: integer): integer\n\
+         \x20 if (n <= 1)\n\
+         \x20   return n\n\
+         \x20 local a: integer = 0\n\
+         \x20 local b: integer = 1\n\
+         \x20 for j: ? = 2, n\n\
+         \x20   local prox: integer = (a + b)\n\
+         \x20   assign a = b\n\
+         \x20   assign b = prox\n\
+         \x20 return b\n\
+         function main(args: {string}): integer\n\
+         \x20 call print(...)\n\
+         \x20 call print(...)\n\
+         \x20 return 0\n",
+        "a AST tipada de nucleo.titan"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A prova da fase**: o pipeline auto-hospedado e o do `titanc`
+/// produzem a mesma lista de tokens e a mesma árvore tipada sobre os
+/// mesmos fontes.
+///
+/// O `titanc` entra como **lib** (ADR 0018) e não como processo: as
+/// funções puras `lex`, `parse` e `check` são exatamente as que o
+/// compilador de verdade usa, e o formatador acima as traduz para o
+/// texto que o `ast.titan` escreve. Divergência é falha de teste — é o
+/// que impede o self-hosting de ser uma demonstração superficial.
+///
+/// Os fontes são os que o critério nomeia (`hello.titan` e
+/// `nucleo.titan`), mais `examples/lexer.titan`: 282 linhas com record,
+/// array, `while`, `if` encadeado, chamadas e concatenação — o maior
+/// programa do repositório dentro do subconjunto, e o que de fato
+/// exercita o formatador.
+#[test]
+fn t88_o_oraculo_confere_tokens_e_arvore_tipada_contra_o_titanc() {
+    let (dir, titanself) = compila_selfhost("t88-oraculo");
+
+    for nome in ["hello.titan", "nucleo.titan", "lexer.titan"] {
+        let caminho = examples_dir().join(nome);
+        let fonte = std::fs::read_to_string(&caminho).expect("lê o fonte de exemplo");
+
+        // Antes de comparar, saber que a comparação faz sentido.
+        let tokens = titanc::lexer::lex(&fonte).expect("o titanc lexa o exemplo");
+        assert!(
+            fora_do_subconjunto(&tokens).is_none(),
+            "{nome} saiu do subconjunto comparável: {:?}",
+            fora_do_subconjunto(&tokens)
+        );
+
+        // 1. A lista de tokens.
+        let do_titanself = Command::new(&titanself)
+            .arg("--tokens")
+            .arg(&caminho)
+            .output()
+            .expect("tokeniza com o lexer auto-hospedado");
+        assert_never_panics(&do_titanself);
+        let esperado: String = tokens
+            .iter()
+            .map(|t| format!("{}\n", token_para_texto_do_rust(t)))
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&do_titanself.stdout),
+            esperado,
+            "os dois lexers divergiram em {nome}"
+        );
+
+        // 2. A AST tipada — as assinaturas e a forma da árvore.
+        let do_titanself = Command::new(&titanself)
+            .arg(&caminho)
+            .output()
+            .expect("compila com o pipeline auto-hospedado");
+        assert_never_panics(&do_titanself);
+        assert_eq!(
+            do_titanself.status.code(),
+            Some(0),
+            "{nome} tem de passar nas três etapas: {}",
+            String::from_utf8_lossy(&do_titanself.stdout)
+        );
+        let esperado = saida_do_oraculo(&fonte)
+            .unwrap_or_else(|e| panic!("o oráculo não processou {nome}: {e}"));
+        assert_eq!(
+            String::from_utf8_lossy(&do_titanself.stdout),
+            esperado,
+            "as duas árvores tipadas divergiram em {nome}"
+        );
+        // Sem isto, dois pipelines que não rodassem passariam comparando
+        // duas saídas vazias.
+        assert!(
+            esperado.lines().count() > 3,
+            "esperava uma árvore de verdade para {nome}, veio: {esperado}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Critério de aceite da T88, última parte: os erros de tipo de um
+/// `.titan` inválido **batem** com os do `titanc`.
+///
+/// "Batem" quer dizer o que o cabeçalho de `selfhost/checker.titan`
+/// documenta: o conjunto de erros do checker em Titan é um
+/// **subconjunto** do do `titanc` — mesma mensagem, mesma linha, mesma
+/// coluna — e nunca um erro que lá não exista. A divergência conhecida
+/// (uma declaração que erra o tipo entra no escopo aqui e é descartada
+/// lá) só pode produzir erros **a menos**, e é isso que a asserção
+/// afirma, em vez de exigir igualdade e ser afrouxada depois.
+#[test]
+fn t88_os_erros_de_tipo_batem_com_os_do_titanc() {
+    let (dir, titanself) = compila_selfhost("t88-erros");
+    let fontes = temp_dir("t88-erros-fontes");
+
+    let casos: &[(&str, &str)] = &[
+        (
+            "tipos.titan",
+            "function soma(a: integer, b: integer): integer\n\
+             \x20   return a + b\n\
+             end\n\
+             \n\
+             function main(args: {string}): integer\n\
+             \x20   print(soma(1))\n\
+             \x20   print(soma(\"a\", 2))\n\
+             \x20   if 1 then\n\
+             \x20       return 0\n\
+             \x20   end\n\
+             \x20   nao_existe(3)\n\
+             \x20   return \"nada\"\n\
+             end\n",
+        ),
+        (
+            "campo.titan",
+            "record P\n\x20   x: integer\nend\n\
+             function main(args: {string}): integer\n\
+             \x20   local p: P = {x = 1}\n\
+             \x20   return p.z\n\
+             end\n",
+        ),
+        (
+            "concat.titan",
+            "function main(args: {string}): integer\n\
+             \x20   print(\"n = \" .. true)\n\
+             \x20   return 0\n\
+             end\n",
+        ),
+    ];
+
+    for (nome, fonte_txt) in casos {
+        let fonte = write_source(&fontes, nome, fonte_txt);
+
+        let saida = Command::new(&titanself)
+            .arg(&fonte)
+            .output()
+            .expect("compila o fonte inválido com o pipeline auto-hospedado");
+        assert_never_panics(&saida);
+        assert_eq!(
+            saida.status.code(),
+            Some(1),
+            "{nome} tem erro de tipo e tem de sair com 1"
+        );
+        let daqui: Vec<String> = String::from_utf8_lossy(&saida.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(!daqui.is_empty(), "{nome} não reportou erro nenhum");
+
+        // O mesmo fonte pelo `titanc` como lib.
+        let tokens = titanc::lexer::lex(fonte_txt).expect("o titanc lexa o fonte inválido");
+        let programa = titanc::parser::parse(&tokens).expect("o fonte é sintaticamente válido");
+        let erros = titanc::checker::check(&programa)
+            .expect_err("o titanc também tem de recusar este fonte");
+        let de_la: Vec<String> = erros.iter().map(|e| e.to_string()).collect();
+
+        for erro in &daqui {
+            assert!(
+                de_la.contains(erro),
+                "{nome}: o checker em Titan deu um erro que o titanc não dá.\n\
+                 daqui: {erro}\nde lá:\n  {}",
+                de_la.join("\n  ")
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&fontes);
+}
+
+/// A guarda do oráculo não é decoração: um fonte fora do subconjunto
+/// **é recusado**, e com o motivo.
+///
+/// Sem este teste, `fora_do_subconjunto` poderia passar a devolver
+/// `None` para tudo — por um `_ => continue` mal colocado — e o teste
+/// acima continuaria verde, comparando saídas que não têm por que
+/// coincidir. É o teste do teste.
+#[test]
+fn t88_o_oraculo_recusa_fonte_fora_do_subconjunto() {
+    let casos: &[(&str, &str)] = &[
+        ("enum Cor Verde end\n", "enum"),
+        ("function f(): float return 1.5 end\n", "float"),
+        ("function f(): nil for x in v do end end\n", "in"),
+    ];
+
+    for (fonte, esperado) in casos {
+        let tokens = titanc::lexer::lex(fonte).expect("o titanc lexa o fonte");
+        let motivo = fora_do_subconjunto(&tokens)
+            .unwrap_or_else(|| panic!("`{fonte}` tinha de ser recusado pela guarda"));
+        assert!(
+            motivo.contains(esperado),
+            "o motivo tem de nomear o que saiu do subconjunto: {motivo}"
+        );
+    }
+
+    // E o contrário: o que está dentro passa.
+    let dentro = std::fs::read_to_string(examples_dir().join("nucleo.titan")).expect("lê nucleo");
+    let tokens = titanc::lexer::lex(&dentro).expect("o titanc lexa nucleo.titan");
+    assert_eq!(fora_do_subconjunto(&tokens), None);
 }

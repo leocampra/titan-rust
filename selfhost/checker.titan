@@ -39,6 +39,14 @@ import ast
 -- compara o conjunto de erros dos dois pipelines sobre o mesmo fonte, e uma
 -- mensagem diferente e uma divergencia de teste.
 --
+-- A T88 acrescentou `checa_e_anota`, que faz o que `checa_programa` faz e
+-- ainda devolve uma linha por declaracao de topo com o tipo resolvido — o que
+-- o driver imprime como "a AST tipada". Sao as **assinaturas**, e nao o tipo
+-- de cada expressao: `checa_exp` devolve um `T` que quem a chamou consome e
+-- descarta, e faze-la guarda-lo exigiria uma arvore paralela que so o driver
+-- leria. `checa_programa` continua existindo, e agora chama `checa_e_anota`
+-- descartando as anotacoes — os testes da T87 nao mudaram uma linha.
+--
 -- A UNICA DIVERGENCIA DE CONTEUDO, e a T88 precisa sabe-la: uma declaracao
 -- que erra o tipo **entra no escopo assim mesmo** aqui, com o tipo anotado,
 -- enquanto o `titanc` a descarta e reporta um segundo erro em cada uso
@@ -1991,6 +1999,67 @@ end
 -- um modulo importado (que nao precisa), como o campo de mesmo nome do
 -- `Contexto` do compilador em Rust.
 function checa_programa(topos: {ast.TopLevel}, erros: {ErroDeTipo}, principal: boolean): nil
+    local anotacoes: {string} = {}
+    checa_e_anota(topos, erros, anotacoes, principal)
+end
+
+-- A assinatura de uma funcao como a linha de anotacao a escreve:
+-- `(integer, {string}) -> integer`.
+--
+-- Nao e `tipo_para_texto`, que escreve toda funcao como `function` porque e o
+-- que `type_name` (checker.rs:5790) escreve **nas mensagens de erro**; nem e
+-- `assinatura_do_tipo`, cujo texto e chave de identidade e nao foi feito para
+-- ser lido. Esta terceira forma existe porque a anotacao tem um leitor humano
+-- e nenhuma das outras duas o serve: uma esconde a assinatura, a outra a
+-- escreve com virgula sobrando e dois-pontos no meio.
+function assinatura_legivel(t: T): string
+    match t with
+        TFuncao(params, retornos) then
+            local ps: string = ""
+            local primeiro: boolean = true
+            for p in params do
+                local pt: string = tipo_para_texto(p)
+                if primeiro then
+                    ps = ps .. pt
+                    primeiro = false
+                else
+                    ps = ps .. ", " .. pt
+                end
+            end
+            local rs: string = ""
+            local primeiro_r: boolean = true
+            for r in retornos do
+                local rt: string = tipo_para_texto(r)
+                if primeiro_r then
+                    rs = rs .. rt
+                    primeiro_r = false
+                else
+                    rs = rs .. ", " .. rt
+                end
+            end
+            return "(" .. ps .. ") -> " .. rs
+        _ then
+            return tipo_para_texto(t)
+    end
+end
+
+-- Checa o programa **e** devolve, em `anotacoes`, uma linha por declaracao de
+-- topo com o tipo que a analise resolveu para ela — o que a T88 imprime como
+-- "a AST tipada".
+--
+-- E a assinatura de cada funcao e o tipo de cada campo de record, e nao o tipo
+-- de cada expressao: o checker da T87 confere os tipos dos nos internos mas
+-- nao os guarda (`checa_exp` devolve um `T` que quem o chamou consome e
+-- descarta), e faze-lo guardar exigiria uma arvore paralela que so este
+-- ponto leria. As assinaturas sao o que o `titanc` tambem expoe sem
+-- reescrita (`CheckedProgram`), e portanto o que o oraculo pode comparar.
+--
+-- Uma declaracao que nao chegou a ser tipada — porque o nome colidiu, ou
+-- porque a forma de topo esta fora do subconjunto — sai como `<invalido>`,
+-- que e o que `tipo_do_simbolo` devolve para um nome ausente. Nao ha braco
+-- especial para isso: um programa com erro ja imprime os erros e sai com 1,
+-- e a anotacao so e impressa quando nao ha nenhum.
+function checa_e_anota(topos: {ast.TopLevel}, erros: {ErroDeTipo}, anotacoes: {string}, principal: boolean): nil
     local ctx: Contexto = contexto_novo()
     declara_builtins(ctx)
     coleta_nomes_de_records(ctx, topos)
@@ -2001,7 +2070,41 @@ function checa_programa(topos: {ast.TopLevel}, erros: {ErroDeTipo}, principal: b
         confere_main(ctx, topos)
     end
     checa_corpos(ctx, topos)
+    anota_topos(ctx, topos, anotacoes)
     for e in ctx.erros do
         erros[#erros + 1] = e
+    end
+end
+
+-- Uma linha por declaracao de topo, na ordem do fonte.
+--
+-- A ordem e a do fonte, e nao a da symtab, porque e a ordem que o `titanc`
+-- tambem percorre ao montar o `CheckedProgram` — e o oraculo compara as duas
+-- listas linha a linha.
+function anota_topos(ctx: Contexto, topos: {ast.TopLevel}, anotacoes: {string}): nil
+    for t in topos do
+        match t with
+            TopLevelFunc(l, islocal, n, params, retornos, bloco) then
+                local assinatura: T = tipo_do_simbolo(ctx, n)
+                local txt: string = assinatura_legivel(assinatura)
+                anotacoes[#anotacoes + 1] = n .. ": " .. txt
+            TopLevelRecord(l, n, campos) then
+                anotacoes[#anotacoes + 1] = "record " .. n
+                for c in campos do
+                    local nome_do_campo: string = "" .. c.nome
+                    local i: integer = indice_do_campo(ctx, n, nome_do_campo)
+                    local tct: string = "<invalido>"
+                    if i > 0 then
+                        local tc: T = ctx.campo_tipos[i]
+                        tct = tipo_para_texto(tc)
+                    end
+                    anotacoes[#anotacoes + 1] = "  " .. nome_do_campo .. ": " .. tct
+                end
+            TopLevelImport(l, nomelocal, nomemodulo) then
+                anotacoes[#anotacoes + 1] = "import " .. nomelocal .. ": module " .. nomemodulo
+            -- As formas que `coleta_assinaturas` recusa nao ganham linha: elas
+            -- ja produziram um erro, e o programa nao chega a ser impresso.
+            _ then
+        end
     end
 end

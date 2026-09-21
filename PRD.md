@@ -3281,6 +3281,57 @@ imprime a AST tipada e sai com 0; o teste de oráculo passa para `hello.titan` e
 `nucleo.titan`; os erros de tipo de um `.titan` inválido **batem** com os do
 `titanc`.
 
+**Nota de execução (o que "AST tipada" virou):** as **assinaturas** que a
+análise resolveu, e não o tipo de cada expressão. `checa_exp` devolve um `T`
+que quem a chamou consome e descarta, e fazê-la guardá-lo exigiria uma árvore
+paralela cujo único leitor seria o driver; as assinaturas, por outro lado, são
+o que o `titanc` também expõe sem reescrita (`CheckedProgram`), e portanto o
+que o oráculo pode comparar. A saída são duas seções — `-- tipos --` e
+`-- arvore --` —, e não os tipos intercalados na árvore, porque a árvore já é
+comparada byte a byte desde a T86: separadas, uma divergência de tipo e uma
+divergência de forma apontam para lugares diferentes do pipeline. O checker
+ganhou `checa_e_anota`; `checa_programa` continua existindo e a chama
+descartando as anotações, de modo que nenhum teste da T87 mudou.
+
+**Nota de execução (o argumento nu, pela última vez):** ele passa a ser o
+pipeline inteiro, e o que significava na T86 (parseia e imprime a árvore) virou
+`--arvore` — pela mesma porta que a T86 usou ao mover a lista de tokens da T85
+para `--tokens`. É a troca que a T87 deixou para cá de propósito, e as onze
+invocações dos testes da T86 ganharam a flag no mesmo commit.
+
+**Nota de execução (o oráculo é um formatador, não uma flag nova):** o teste
+chama `titanc::lexer::lex`, `parser::parse` e `checker::check` — as funções
+puras que o compilador de verdade usa — e traduz a AST em Rust para exatamente
+o texto que `selfhost/ast.titan` imprime. A alternativa, uma flag `--arvore` no
+próprio `titanc`, carregaria para sempre o formato de impressão de um módulo do
+`selfhost/` dentro do compilador. O formatador mora no teste, que é quem tem
+interesse nele, e a referência é o arquivo Titan: divergência entre os dois é
+bug do lado Rust até prova em contrário.
+
+**Nota de execução (a guarda do subconjunto):** o oráculo **recusa** um fonte
+que saia do subconjunto comum antes de comparar — `float`, `enum`/`match`,
+`continue`, `repeat`/`until`, `for`-in e os símbolos da T59, que o lexer em
+Titan herdou da Fase 4 sem conhecer (`eh_palavra_chave`,
+`selfhost/lexer.titan:207`). Sem ela, um fonte com `enum` produziria árvores
+diferentes por construção e o teste ou falharia sem informar nada ou seria
+afrouxado até passar. `t88_o_oraculo_recusa_fonte_fora_do_subconjunto` é o
+teste do teste: ele impede que a guarda passe a devolver "está dentro" para
+tudo.
+
+**Nota de execução (como os erros "batem"):** a asserção é de **subconjunto**,
+e não de igualdade, porque é o que o cabeçalho de `selfhost/checker.titan` já
+documentava: uma declaração que erra o tipo entra no escopo lá e é descartada
+no `titanc`, o que só pode produzir erros **a menos**. Cada erro do checker em
+Titan tem de existir, palavra por palavra e na mesma linha e coluna, na lista
+do `titanc`; um erro que lá não exista é falha de teste. Afirmar o subconjunto
+desde o início vale mais que exigir igualdade e afrouxar depois.
+
+**Nota de execução (o terceiro fonte do oráculo):** além de `hello.titan` e
+`nucleo.titan`, que o critério nomeia, o oráculo roda sobre
+`examples/lexer.titan` — 282 linhas com record, array, `while`, `if`
+encadeado, chamadas e concatenação. É o maior programa do repositório dentro do
+subconjunto, e o único dos três que de fato exercita o formatador inteiro.
+
 **Depende de:** T87.
 
 **Skills:** `test-automator` · `verification-before-completion` · `find-bugs` ·
