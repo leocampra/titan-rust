@@ -688,9 +688,18 @@ function parse_sufixada(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, 
             acc = ast.exp_de_var(l, v)
             cur = fecha
         elseif eh_simbolo(ts, cur, ".") and eh_nome(ts, cur + 1) then
+            -- A posicao do **nome do campo**, e nao a do `.` — o parser.rs
+            -- diz isso com todas as letras no mesmo ponto (parser.rs:1473:
+            -- "`loc` do nome do campo, nao do `.`"), porque e o range que o
+            -- hover do LSP aponta. A T86 usava o `l` do `.`; quem encontrou
+            -- foi a T87, cujo "o record 'P' nao tem campo 'z'" saia uma
+            -- coluna antes do mesmo erro no `titanc`. Mesma classe da
+            -- posicao de `parse_funcao`, e o mesmo motivo de consertar aqui:
+            -- a T88 compara a forma das duas arvores.
+            local l_campo: ast.Loc = loc_em(ts, cur + 1)
             local apos_campo: integer, campo: string = espera_nome(ts, cur + 1, erros)
-            local v: ast.Var = ast.var_ponto(l, acc, campo)
-            acc = ast.exp_de_var(l, v)
+            local v: ast.Var = ast.var_ponto(l_campo, acc, campo)
+            acc = ast.exp_de_var(l_campo, v)
             cur = apos_campo
         else
             break
@@ -1063,7 +1072,17 @@ end
 -- esta fora do escopo, e o nome qualificado que o abriria e recusado aqui com
 -- mensagem propria em vez de um erro generico tres tokens adiante.
 function parse_funcao(ts: {lexer.Token}, i: integer, erros: {Erro}, islocal: boolean): integer, ast.TopLevel
-    local l: ast.Loc = loc_em(ts, i)
+    -- A posicao do **nome**, e nao a da palavra-chave `function`.
+    --
+    -- E o que `parse_toplevel_func` (parser.rs:351) faz — `let (name, loc) =
+    -- self.expect_name(...)` — e a T86 escrevia `loc_em(ts, i)` aqui, a
+    -- posicao do `function`. A diferenca nao aparece na arvore impressa, que
+    -- nao mostra `Loc`, e por isso passou: quem a encontrou foi a T87, cujo
+    -- erro de assinatura de `main` saia na coluna 1 onde o `titanc` o da na
+    -- coluna do nome. Como a T88 compara a forma das duas arvores, uma
+    -- divergencia de posicao e uma divergencia de teste — o lugar de
+    -- consertar e aqui, na producao, e nao em quem a consome.
+    local l: ast.Loc = loc_em(ts, i + 1)
     local apos_nome: integer, n: string = espera_nome(ts, i + 1, erros)
     if eh_simbolo(ts, apos_nome, ".") then
         registra(erros, l, "metodo de topo ('function " .. n .. ".algo') esta fora do subconjunto desta fase")
@@ -1112,8 +1131,14 @@ function parse_import(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, as
 end
 
 -- Variavel de topo: `x: T = e` ou `local x: T = e`.
-function parse_var_de_topo(ts: {lexer.Token}, i: integer, erros: {Erro}, islocal: boolean): integer, ast.TopLevel
-    local l: ast.Loc = loc_em(ts, i)
+-- `l_do_no` e a posicao que o no carrega, e ela vem de quem chamou porque
+-- **nao** e a do nome: em `local x = 1` o `titanc` guarda a do `local`
+-- (`parse_toplevel_var` recebe o `loc` de fora, parser.rs:382), e aqui `i`
+-- ja aponta o nome. Passa-la e o que faz as duas arvores concordarem — a
+-- terceira posicao que a T87 encontrou desalinhada, com `parse_funcao` e o
+-- campo de `parse_sufixada`.
+function parse_var_de_topo(ts: {lexer.Token}, i: integer, erros: {Erro}, islocal: boolean, l_do_no: ast.Loc): integer, ast.TopLevel
+    local l: ast.Loc = l_do_no
     local apos_nome: integer, n: string = espera_nome(ts, i, erros)
     local cur: integer = apos_nome
     local tipo: ast.Tipo = ast.tipo_ausente()
@@ -1150,11 +1175,11 @@ function parse_toplevel(ts: {lexer.Token}, i: integer, erros: {Erro}): integer, 
             local depois: integer, t: ast.TopLevel = parse_funcao(ts, i + 1, erros, true)
             return depois, t
         end
-        local depois: integer, t: ast.TopLevel = parse_var_de_topo(ts, i + 1, erros, true)
+        local depois: integer, t: ast.TopLevel = parse_var_de_topo(ts, i + 1, erros, true, l)
         return depois, t
     end
     if eh_nome(ts, i) then
-        local depois: integer, t: ast.TopLevel = parse_var_de_topo(ts, i, erros, false)
+        local depois: integer, t: ast.TopLevel = parse_var_de_topo(ts, i, erros, false, l)
         return depois, t
     end
     -- Nada de topo comeca aqui. Consome e devolve um `import` de nome vazio

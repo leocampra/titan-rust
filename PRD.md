@@ -3221,6 +3221,42 @@ divergência estrutural artificial justamente no nó que a T88 vai comparar.
 **Critério de aceite:** aceita `examples/nucleo.titan`; rejeita um programa com
 erro de tipo, com mensagem e posição.
 
+**Nota de execução (a flag `--checar`):** o driver ganhou `--checar <arquivo>`
+em vez de o argumento nu passar a significar "checa". A T86 pôde trocar o
+significado do argumento nu porque o que ela substituiu (a lista de tokens da
+T85) virou `--tokens` no mesmo commit, com um teste só olhando; aqui meia dúzia
+de testes da T86 leem a árvore do argumento nu, e a amarração definitiva do
+pipeline é tarefa da T88 — trocar na T87 seria mexer duas vezes no mesmo lugar,
+a segunda para desfazer parte da primeira.
+
+**Nota de execução (três posições de nó corrigidas no parser da T86):** o
+`loc` de `TopLevelFunc`, de `VarDot` e de `TopLevelVar` não batia com o do
+`parser.rs` — o da função era o do `function` e não o do nome (`parser.rs:351`),
+o do campo era o do `.` e não o do nome (`:1473`, que o diz com todas as
+letras), e o da variável de topo era o do nome e não o do `local` (`:382`).
+Nenhuma aparecia na árvore impressa, que não mostra `Loc`; o que as revelou foi
+o erro de tipo saindo numa coluna diferente da do mesmo erro no `titanc`. Como
+a T88 compara a forma das duas árvores, a correção é na produção (o parser), e
+não em quem as consome; o teste `t87_as_posicoes_dos_nos_batem_com_as_do_parser_
+em_rust` as trava.
+
+**Nota de execução (a única divergência de conteúdo):** uma declaração que erra
+o tipo **entra no escopo assim mesmo** neste checker, com o tipo anotado,
+enquanto o `titanc` a descarta e reporta um segundo erro em cada uso posterior
+do nome. O conjunto de erros do checker em Titan é, por isso, um **subconjunto**
+do de lá — nunca um erro que lá não exista —, e a T88 precisa da distinção ao
+comparar. A exceção é a variável de topo, que é recusada e **não** entra no
+escopo, porque ali os dois erros são a mesma notícia.
+
+**Nota de execução (limites do codegen encontrados):** dois, os dois já
+conhecidos de outras tarefas e contornados do mesmo jeito. `c.itens[1].campo` —
+indexar um array que é campo de outro record e pegar um campo do elemento —
+perde os campos do tipo e o compilador recusa com "o record 'X' não tem campo
+'y'"; por isso a symtab é de arrays paralelos de primitivos, e não um
+`{Simbolo}`. E ler duas vezes um campo `string` de um record vindo por parâmetro
+é um *move* no Rust emitido (ADR 0007), contornado com o `"" ..` que
+`parser.titan` já documenta.
+
 **Depende de:** T86.
 
 **Skills:** `test-driven-development` · `architecture` · `clean-code`

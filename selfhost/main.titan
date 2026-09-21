@@ -1,4 +1,5 @@
 import ast
+import checker
 import io
 import lexer
 import parser
@@ -13,6 +14,7 @@ import texto
 --   /tmp/x/titanself                                -> a demonstracao da ast (T84)
 --   /tmp/x/titanself --tokens examples/nucleo.titan -> a lista de tokens (T85)
 --   /tmp/x/titanself examples/nucleo.titan          -> a arvore sintatica (T86)
+--   /tmp/x/titanself --checar examples/nucleo.titan -> a analise semantica (T87)
 --
 -- Sem argumento ele monta a `Exp` recursiva de `1 + 2 * 3` com o `enum` da ast
 -- e a percorre com `match`, imprimindo a arvore reparentizada e o numero de
@@ -30,7 +32,13 @@ import texto
 -- imprime a arvore — ou os erros de sintaxe, um por linha, saindo com 1. E o
 -- criterio de aceite da T86.
 --
--- A tarefa seguinte encadeia o resto: o checker (T87).
+-- Com `--checar` e um arquivo, lexa, parseia e checa com selfhost/
+-- checker.titan — imprimindo "ok: <arquivo>" e saindo com 0, ou os erros de
+-- tipo (linha, coluna e mensagem, um por linha) e saindo com 1. E o criterio
+-- de aceite da T87.
+--
+-- A tarefa seguinte amarra as tres pecas numa so saida — a AST **tipada** — e
+-- compara o resultado com o do `titanc` sobre os mesmos fontes (T88).
 
 function exemplo(): ast.Exp
     -- 1 + 2 * 3, com a precedencia ja resolvida na forma da arvore: o `*`
@@ -100,6 +108,43 @@ function parsear_arquivo(caminho: string): integer
     return 0
 end
 
+-- A demonstracao da T87: lexa, parseia e **checa** o arquivo.
+--
+-- Uma flag nova, e nao o significado novo do arquivo sozinho: a T86 pode
+-- trocar o significado do argumento nu porque o que ela substituiu (a lista de
+-- tokens da T85) virou `--tokens` no mesmo commit, e um teste so olhava. Aqui
+-- meia duzia de testes da T86 leem a arvore do argumento nu, e a amarracao
+-- definitiva do pipeline e tarefa da T88 — trocar agora seria mexer duas
+-- vezes no mesmo lugar, a segunda para desfazer parte da primeira.
+--
+-- O codigo de saida segue a convencao do `parsear_arquivo`: 0 quando o
+-- programa passa nas duas analises, 1 quando ha erro — de sintaxe ou de tipo.
+-- Erro de sintaxe **para** antes da checagem, e nao por economia: o parser
+-- devolve uma arvore parcial com nos de escape (`ast.nil_exp` no lugar de uma
+-- expressao que nao parseou), e checar isso produziria erros de tipo sobre
+-- codigo que o autor nao escreveu.
+function checar_arquivo(caminho: string): integer
+    local fonte: string = io.ler_arquivo(caminho)
+    local erros_de_sintaxe: {parser.Erro} = {}
+    local topos: {ast.TopLevel} = parser.parse_fonte(fonte, erros_de_sintaxe)
+    if #erros_de_sintaxe > 0 then
+        for e in erros_de_sintaxe do
+            print(parser.erro_para_texto(e))
+        end
+        return 1
+    end
+    local erros_de_tipo: {checker.ErroDeTipo} = {}
+    checker.checa_programa(topos, erros_de_tipo, true)
+    if #erros_de_tipo > 0 then
+        for e in erros_de_tipo do
+            print(checker.erro_para_texto(e))
+        end
+        return 1
+    end
+    print("ok: " .. caminho)
+    return 0
+end
+
 -- O texto sem o `\n` final, para o `print` nao dobrar a quebra de linha.
 function texto_sem_quebra_final(s: string): string
     local n: integer = texto.tamanho(s)
@@ -121,6 +166,13 @@ function main(args: {string}): integer
         end
         tokenizar_arquivo(args[2])
         return 0
+    end
+    if args[1] == "--checar" then
+        if #args < 2 then
+            print("uso: titanself --checar <arquivo.titan>")
+            return 1
+        end
+        return checar_arquivo(args[2])
     end
     return parsear_arquivo(args[1])
 end
